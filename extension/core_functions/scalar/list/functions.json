@@ -109,6 +109,14 @@
         "aliases": ["array_transform", "list_apply", "array_apply", "apply"]
     },
     {
+        "name": "list_transform_filter",
+        "parameters": "list,lambda(x)",
+        "description": "Returns a list that is the result of applying the `lambda` function to each element of the input `list`. The return type is defined by the return type of the `lambda` function.",
+        "example": "list_transform([1, 2, 3], lambda x : x + 1)",
+        "categories": ["list", "lambda"],
+        "type": "scalar_function"
+    },
+    {
         "name": "list_filter",
         "parameters": "list,lambda(x)",
         "description": "Constructs a list from those elements of the input `list` for which the `lambda` function returns `true`. DuckDB must be able to cast the `lambda` function's return type to `BOOL`. The return type of `list_filter` is the same as the input list's.",

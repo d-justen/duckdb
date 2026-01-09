@@ -72,6 +72,8 @@ public:
 	static void ListTransformFunction(DataChunk &args, ExpressionState &state, Vector &result);
 	//! Internally executes list_filter
 	static void ListFilterFunction(DataChunk &args, ExpressionState &state, Vector &result);
+	//! Internally executes list_transform_filter
+	static void ListTransformFilterFunction(DataChunk &args, ExpressionState &state, Vector &result);
 	//! Internally executes list_reduce
 	static void ListReduceFunction(DataChunk &args, ExpressionState &state, Vector &result);
 

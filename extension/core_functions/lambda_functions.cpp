@@ -107,15 +107,89 @@ struct ListFilterFunctor {
 		UnifiedVectorFormat lambda_data;
 		lambda_vector.ToUnifiedFormat(elem_cnt, lambda_data);
 
-		auto lambda_values = UnifiedVectorFormat::GetData<bool>(lambda_data);
-		auto &lambda_validity = lambda_data.validity;
+		auto *lambda_values = UnifiedVectorFormat::GetData<bool>(lambda_data);
+		const auto &lambda_validity = lambda_data.validity;
 
 		// compute the new lengths and offsets, and create a selection vector
 		for (idx_t i = 0; i < elem_cnt; i++) {
-			auto entry_idx = lambda_data.sel->get_index(i);
+			const auto entry_idx = lambda_data.sel->get_index(i);
 
 			// set length and offset of empty lists
-			while (info.row_idx < info.entry_lengths.size() && !info.entry_lengths[info.row_idx]) {
+			while (info.row_idx < info.entry_lengths.size() && info.entry_lengths[info.row_idx] == 0) {
+				result_entries[info.row_idx].offset = info.offset;
+				result_entries[info.row_idx].length = 0;
+				info.row_idx++;
+			}
+
+			// found a true value
+			if (lambda_validity.RowIsValid(entry_idx) && lambda_values[entry_idx]) {
+				sel.set_index(count++, i);
+				info.length++;
+			}
+
+			info.src_length++;
+
+			// we traversed the entire source list
+			if (info.entry_lengths[info.row_idx] == info.src_length) {
+				// set the offset and length of the result entry
+				result_entries[info.row_idx].offset = info.offset;
+				result_entries[info.row_idx].length = info.length;
+
+				// reset all other fields
+				info.offset += info.length;
+				info.row_idx++;
+				info.length = 0;
+				info.src_length = 0;
+			}
+		}
+
+		// set length and offset of all remaining empty lists
+		while (info.row_idx < info.entry_lengths.size() && !info.entry_lengths[info.row_idx]) {
+			result_entries[info.row_idx].offset = info.offset;
+			result_entries[info.row_idx].length = 0;
+			info.row_idx++;
+		}
+
+		// slice the input chunk's corresponding vector to get the new lists
+		// and append them to the result
+		idx_t source_list_idx = execute_info.has_index ? 1 : 0;
+		Vector result_lists(execute_info.input_chunk.data[source_list_idx], sel, count);
+		ListVector::Append(result, result_lists, count, 0);
+	}
+};
+
+//! ListTransformFilterFunctor contains list_transform_filter specific functionality
+struct ListTransformFilterFunctor {
+	//! Initializes the entry_lengths vector
+	static void ReserveNewLengths(vector<idx_t> &entry_lengths, const idx_t row_count) {
+		entry_lengths.reserve(row_count);
+	}
+	//! Pushes an empty list to the entry_lengths vector
+	static void PushEmptyList(vector<idx_t> &entry_lengths) {
+		entry_lengths.emplace_back(0);
+	}
+	//! Pushes the length of the original list to the entry_lengths vector
+	static void SetResultEntry(list_entry_t *, idx_t &, const list_entry_t &entry, const idx_t,
+	                           vector<idx_t> &entry_lengths) {
+		entry_lengths.push_back(entry.length);
+	}
+	//! Uses the lambda vector to filter the incoming list and to append the filtered list to the result vector
+	static void AppendResult(Vector &result, Vector &lambda_vector, const idx_t elem_cnt, list_entry_t *result_entries,
+	                         ListFilterInfo &info, LambdaExecuteInfo &execute_info) {
+		idx_t count = 0;
+		SelectionVector sel(elem_cnt);
+		UnifiedVectorFormat lambda_data;
+		lambda_vector.ToUnifiedFormat(elem_cnt, lambda_data);
+
+		auto *lambda_values = UnifiedVectorFormat::GetData<bool>(lambda_data);
+		const auto &lambda_validity = lambda_data.validity;
+
+		// compute the new lengths and offsets, and create a selection vector
+		for (idx_t i = 0; i < elem_cnt; i++) {
+			const auto entry_idx = lambda_data.sel->get_index(i);
+
+			// set length and offset of empty lists
+			while (info.row_idx < info.entry_lengths.size() && info.entry_lengths[info.row_idx] == 0) {
 				result_entries[info.row_idx].offset = info.offset;
 				result_entries[info.row_idx].length = 0;
 				info.row_idx++;
@@ -396,4 +470,7 @@ void LambdaFunctions::ListFilterFunction(DataChunk &args, ExpressionState &state
 	ExecuteLambda<ListFilterFunctor>(args, state, result);
 }
 
+void LambdaFunctions::ListTransformFilterFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	ExecuteLambda<ListTransformFilterFunctor>(args, state, result);
+}
 } // namespace duckdb

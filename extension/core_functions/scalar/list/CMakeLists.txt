@@ -3,6 +3,7 @@ add_library_unity(
   OBJECT
   flatten.cpp
   list_transform.cpp
+  list_transform_filter.cpp
   range.cpp
   list_value.cpp
   list_filter.cpp
