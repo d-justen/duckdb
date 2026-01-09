@@ -31,16 +31,17 @@ static unique_ptr<FunctionData> ListTransformFilterBind(ClientContext &context, 
 	return LambdaFunctions::ListLambdaBind(context, bound_function, arguments, has_index);
 }
 
-static LogicalType ListTransformFilterBindLambda(ClientContext &context, const vector<LogicalType> &function_child_types,
+static LogicalType ListTransformFilterBindLambda(ClientContext &context,
+                                                 const vector<LogicalType> &function_child_types,
                                                  const idx_t parameter_idx) {
 	return LambdaFunctions::BindBinaryChildren(function_child_types, parameter_idx);
 }
 
-}
+} // namespace
 
 ScalarFunction ListTransformFilterFun::GetFunction() {
 	ScalarFunction fun({LogicalType::LIST(LogicalType::ANY), LogicalType::LAMBDA}, LogicalType::LIST(LogicalType::ANY),
-					   LambdaFunctions::ListFilterFunction, ListTransformFilterBind, nullptr, nullptr);
+	                   LambdaFunctions::ListTransformFilterFunction, ListTransformFilterBind, nullptr, nullptr);
 
 	fun.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 	fun.SetSerializeCallback(ListLambdaBindData::Serialize);

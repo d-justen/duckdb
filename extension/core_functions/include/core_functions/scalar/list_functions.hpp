@@ -213,9 +213,9 @@ struct ApplyFun {
 
 struct ListTransformFilterFun {
 	static constexpr const char *Name = "list_transform_filter";
-	static constexpr const char *Parameters = "list,lambda(x)";
-	static constexpr const char *Description = "Returns a list that is the result of applying the `lambda` function to each element of the input `list`. The return type is defined by the return type of the `lambda` function.";
-	static constexpr const char *Example = "list_transform([1, 2, 3], lambda x : x + 1)";
+	static constexpr const char *Parameters = "list,lambda(x),lambda(x)";
+	static constexpr const char *Description = "Returns a list that is the result of applying the first `lambda` function to each element of the input `list`, for which the second `lambda` function returns true. The return type is defined by the return type of the `lambda` function.";
+	static constexpr const char *Example = "list_transform([1, 2, 3], (lambda x, i : i), (lambda x : x > 2))";
 	static constexpr const char *Categories = "list,lambda";
 
 	static ScalarFunction GetFunction();

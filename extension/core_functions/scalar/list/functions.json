@@ -110,9 +110,9 @@
     },
     {
         "name": "list_transform_filter",
-        "parameters": "list,lambda(x)",
-        "description": "Returns a list that is the result of applying the `lambda` function to each element of the input `list`. The return type is defined by the return type of the `lambda` function.",
-        "example": "list_transform([1, 2, 3], lambda x : x + 1)",
+        "parameters": "list,lambda(x),lambda(x)",
+        "description": "Returns a list that is the result of applying the first `lambda` function to each element of the input `list`, for which the second `lambda` function returns true. The return type is defined by the return type of the `lambda` function.",
+        "example": "list_transform([1, 2, 3], (lambda x, i : i), (lambda x : x > 2))",
         "categories": ["list", "lambda"],
         "type": "scalar_function"
     },
