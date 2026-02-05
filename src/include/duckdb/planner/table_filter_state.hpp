@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/vector_size.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -62,6 +64,14 @@ struct BFTableFilterState final : public TableFilterState {
 	explicit BFTableFilterState(const LogicalType &key_logical_type)
 	    : current_capacity(STANDARD_VECTOR_SIZE), hashes_v(LogicalType::HASH), found_v(LogicalType::UBIGINT),
 	      keys_sliced_v(key_logical_type), bf_sel(STANDARD_VECTOR_SIZE) {
+	}
+};
+
+struct PrefixRangeTableFilterState final : public TableFilterState {
+	idx_t current_capacity;
+	SelectionVector sel;
+
+	PrefixRangeTableFilterState() : current_capacity(STANDARD_VECTOR_SIZE), sel(STANDARD_VECTOR_SIZE) {
 	}
 };
 
