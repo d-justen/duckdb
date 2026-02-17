@@ -21,7 +21,6 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include <bitset>
 #include <cstdint>
 
 namespace duckdb {
@@ -59,30 +58,32 @@ public:
 	}
 
 	void InsertKeys(const Vector &keys, idx_t count) const override {
-		auto key_data = FlatVector::GetData<T>(keys);
+		const T *key_data = FlatVector::GetData<T>(keys);
 		for (idx_t i = 0; i < count; i++) {
-			bitmap[key_data[i] >> word_shift] |= 1ULL << ((key_data[i] >> prefix_shift) & 63);
+			T key = key_data[i];
+			bitmap[(idx_t)key >> word_shift] |= 1ULL << (((idx_t)key >> prefix_shift) & 63);
 		}
 	}
 
 	void InsertOne(const Value &key) const override {
 		auto k = key.GetValueUnsafe<T>();
-		bitmap[k >> word_shift] |= 1ULL << ((k >> prefix_shift) & 63);
+		bitmap[(idx_t)k >> word_shift] |= 1ULL << (((idx_t)k >> prefix_shift) & 63);
 	}
 
 	idx_t LookupKeys(const Vector &keys, SelectionVector &result_sel, idx_t count) const override {
-		auto key_data = FlatVector::GetData<T>(keys);
+		const T *key_data = FlatVector::GetData<T>(keys);
 		idx_t found_count = 0;
 		for (idx_t i = 0; i < count; i++) {
 			result_sel.set_index(found_count, i);
-			found_count += (bool)bitmap[key_data[i] >> word_shift] & 1ULL << ((key_data[i] >> prefix_shift) & 63);
+			T key = key_data[i];
+			found_count += (bool)bitmap[(idx_t)key >> word_shift] & 1ULL << (((idx_t)key >> prefix_shift) & 64);
 		}
 		return found_count;
 	}
 
 	bool LookupOne(const Value &key) const override {
 		auto k = key.GetValueUnsafe<T>();
-		return bitmap[k >> word_shift] & 1ULL << ((k >> prefix_shift) & 63);
+		return bitmap[(idx_t)k >> word_shift] & 1ULL << (((idx_t)k >> prefix_shift) & 63);
 	}
 
 	idx_t LookupRange(const Value &lower_bound, const Value &upper_bound) const override {
@@ -93,14 +94,14 @@ public:
 		// Bits to the right: smaller (important to uppper bound)
 		// Shift position in word to last bit to exclude everything to the right
 		// TODO: Test this
-		result_count += __builtin_popcount(bitmap[lb >> word_shift] >> ((ub >> prefix_shift) & 63));
+		result_count += __builtin_popcount(bitmap[(idx_t)lb >> word_shift] >> (((idx_t)ub >> prefix_shift) & 63));
 		// Shift the position in word to first bit to check if any of the following bits in word are 1
 		// TODO: Test this
-		result_count +=
-		    __builtin_popcount(bitmap[ub >> word_shift] << (sizeof(uint64_t) - ((ub >> prefix_shift) & 63)));
+		result_count += __builtin_popcount(bitmap[(idx_t)ub >> word_shift]
+		                                   << (sizeof(uint64_t) - (((idx_t)ub >> prefix_shift) & 63)));
 
-		for (idx_t i = lb + 1; i < ub; i++) {
-			result_count += __builtin_popcount(bitmap[i]);
+		for (auto i = lb + 1; i < ub; i += 1) {
+			result_count += __builtin_popcount(bitmap[(idx_t)i]);
 		}
 		return result_count;
 	}
