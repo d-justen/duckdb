@@ -7,6 +7,7 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
+#include "duckdb/planner/filter/prefix_range_filter.hpp"
 #include "duckdb/storage/data_pointer.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -558,6 +559,11 @@ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, Unifi
 		auto &bloom_filter = filter.Cast<BFTableFilter>();
 		auto &state = filter_state.Cast<BFTableFilterState>();
 		return bloom_filter.Filter(vector, sel, approved_tuple_count, state);
+	}
+	case TableFilterType::PREFIX_RANGE_FILTER: {
+		auto &prefix_filter = filter.Cast<PrefixRangeTableFilter>();
+		auto &state = filter_state.Cast<PrefixRangeTableFilterState>();
+		return prefix_filter.Filter(vector, sel, approved_tuple_count, state);
 	}
 	case TableFilterType::EXPRESSION_FILTER: {
 		auto &state = filter_state.Cast<ExpressionFilterState>();

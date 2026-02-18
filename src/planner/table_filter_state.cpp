@@ -2,6 +2,7 @@
 #include "duckdb/planner/filter/bloom_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/prefix_range_filter.hpp"
 #include "duckdb/planner/filter/selectivity_optional_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 
@@ -16,6 +17,9 @@ unique_ptr<TableFilterState> TableFilterState::Initialize(ClientContext &context
 	case TableFilterType::BLOOM_FILTER: {
 		auto &bf = filter.Cast<BFTableFilter>();
 		return make_uniq<BFTableFilterState>(bf.GetKeyType());
+	}
+	case TableFilterType::PREFIX_RANGE_FILTER: {
+		return make_uniq<PrefixRangeTableFilterState>();
 	}
 	case TableFilterType::OPTIONAL_FILTER: {
 		// the optional filter may be executed if it is a SelectivityOptionalFilter

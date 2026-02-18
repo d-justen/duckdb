@@ -238,6 +238,8 @@ enum class InsertColumnOrder : uint8_t;
 
 enum class InterruptMode : uint8_t;
 
+enum class JoinFilterPushdownFilterType : uint8_t;
+
 enum class JoinRefType : uint8_t;
 
 enum class JoinType : uint8_t;
@@ -801,6 +803,9 @@ const char* EnumUtil::ToChars<InsertColumnOrder>(InsertColumnOrder value);
 
 template<>
 const char* EnumUtil::ToChars<InterruptMode>(InterruptMode value);
+
+template<>
+const char* EnumUtil::ToChars<JoinFilterPushdownFilterType>(JoinFilterPushdownFilterType value);
 
 template<>
 const char* EnumUtil::ToChars<JoinRefType>(JoinRefType value);
@@ -1492,6 +1497,9 @@ InsertColumnOrder EnumUtil::FromString<InsertColumnOrder>(const char *value);
 
 template<>
 InterruptMode EnumUtil::FromString<InterruptMode>(const char *value);
+
+template<>
+JoinFilterPushdownFilterType EnumUtil::FromString<JoinFilterPushdownFilterType>(const char *value);
 
 template<>
 JoinRefType EnumUtil::FromString<JoinRefType>(const char *value);

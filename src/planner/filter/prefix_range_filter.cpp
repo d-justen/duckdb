@@ -1,5 +1,6 @@
 #include "duckdb/planner/filter/prefix_range_filter.hpp"
 #include "duckdb/common/assert.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/unique_ptr.hpp"
@@ -9,9 +10,7 @@
 
 namespace duckdb {
 
-namespace {
-
-unique_ptr<PrefixRangeFilter> CreateFilter(const LogicalType &type) {
+unique_ptr<PrefixRangeFilter> PrefixRangeTableFilter::CreateFilter(const LogicalType &type) {
 	switch (type.InternalType()) {
 	case PhysicalType::UINT8:
 		return make_uniq<NumericPrefixRangeFilter<uint8_t>>();
@@ -34,12 +33,27 @@ unique_ptr<PrefixRangeFilter> CreateFilter(const LogicalType &type) {
 	case PhysicalType::INT128:
 		return make_uniq<NumericPrefixRangeFilter<hugeint_t>>();
 	default:
-		D_ASSERT(false);
-		return nullptr;
+		throw NotImplementedException("Prefix range filter is not implemented for type %s", type.ToString());
 	}
 }
 
-} // namespace
+bool PrefixRangeTableFilter::SupportedType(const LogicalType &type) {
+	switch (type.InternalType()) {
+	case PhysicalType::UINT8:
+	case PhysicalType::UINT16:
+	case PhysicalType::UINT32:
+	case PhysicalType::UINT64:
+	case PhysicalType::UINT128:
+	case PhysicalType::INT8:
+	case PhysicalType::INT16:
+	case PhysicalType::INT32:
+	case PhysicalType::INT64:
+	case PhysicalType::INT128:
+		return true;
+	default:
+		return false;
+	}
+}
 
 PrefixRangeTableFilter::PrefixRangeTableFilter(unique_ptr<PrefixRangeFilter> filter_p, const bool filters_null_values_p,
                                                const string &key_column_name_p, const LogicalType &key_type_p)
@@ -138,8 +152,8 @@ unique_ptr<TableFilter> PrefixRangeTableFilter::Deserialize(Deserializer &deseri
 	auto key_column_name = deserializer.ReadProperty<string>(201, "key_column_name");
 	auto key_type = deserializer.ReadProperty<LogicalType>(202, "key_type");
 
-	auto result =
-	    make_uniq<PrefixRangeTableFilter>(CreateFilter(key_type), filters_null_values, key_column_name, key_type);
+	auto result = make_uniq<PrefixRangeTableFilter>(CreateFilter(key_type), filters_null_values, key_column_name,
+	                                                key_type);
 	return std::move(result);
 }
 } // namespace duckdb

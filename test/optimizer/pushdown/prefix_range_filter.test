@@ -1,0 +1,84 @@
+# name: test/optimizer/pushdown/prefix_range_filter.test
+# description: Test prefix range filter toggling for hash join filter pushdown
+# group: [pushdown]
+
+statement ok
+PRAGMA explain_output='PHYSICAL_ONLY';
+
+statement ok
+SET disabled_optimizers='join_order';
+
+statement ok
+PRAGMA perfect_ht_threshold=0;
+
+statement ok
+SET debug_force_join_probabilistic_filter=true;
+
+statement ok
+PRAGMA enable_profiling='json';
+
+statement ok
+PRAGMA profiling_output='__TEST_DIR__/prefix_range_filter_profile.json';
+
+statement ok
+CREATE TABLE probe AS SELECT i % 10 AS k, i AS v FROM range(10000) tbl(i);
+
+statement ok
+CREATE TABLE build AS SELECT i % 10 AS k, i AS x FROM range(1000) tbl(i);
+
+statement ok
+PRAGMA prefix_range_filter=true;
+
+query I
+SELECT count(*) FROM probe p JOIN build b ON p.k = b.k WHERE (b.x % 2) = 0;
+----
+500000
+
+query I
+SELECT strpos(content, 'IN RF(') > 0 FROM read_text('__TEST_DIR__/prefix_range_filter_profile.json');
+----
+true
+
+statement ok
+PRAGMA prefix_range_filter=false;
+
+query I
+SELECT count(*) FROM probe p JOIN build b ON p.k = b.k WHERE (b.x % 2) = 0;
+----
+500000
+
+query I
+SELECT strpos(content, 'IN BF(') > 0 FROM read_text('__TEST_DIR__/prefix_range_filter_profile.json');
+----
+true
+
+statement ok
+CREATE TABLE probe_s AS SELECT (i % 200)::VARCHAR AS k FROM range(10000) tbl(i);
+
+statement ok
+CREATE TABLE build_s AS SELECT i::VARCHAR AS k, i AS x FROM range(200) tbl(i);
+
+statement ok
+PRAGMA prefix_range_filter=true;
+
+statement error
+SELECT count(*) FROM probe_s p JOIN build_s b ON p.k = b.k WHERE b.x < 20;
+----
+<REGEX>:.*Prefix range filter is enabled but join key type VARCHAR is not supported.*
+
+statement ok
+PRAGMA prefix_range_filter=false;
+
+query I
+SELECT count(*) FROM probe_s p JOIN build_s b ON p.k = b.k WHERE b.x < 20;
+----
+1000
+
+statement ok
+SET debug_force_join_probabilistic_filter=false;
+
+statement ok
+PRAGMA disable_profiling;
+
+statement ok
+SET disabled_optimizers='';

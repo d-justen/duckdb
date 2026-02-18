@@ -21,7 +21,6 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include <cstdint>
 
 namespace duckdb {
 
@@ -76,7 +75,9 @@ public:
 		for (idx_t i = 0; i < count; i++) {
 			result_sel.set_index(found_count, i);
 			T key = key_data[i];
-			found_count += (bool)bitmap[(idx_t)key >> word_shift] & 1ULL << (((idx_t)key >> prefix_shift) & 64);
+			const auto bitset = bitmap[(idx_t)key >> word_shift];
+			const auto bit = 1ULL << (((idx_t)key >> prefix_shift) & 63);
+			found_count += (bitset & bit) != 0;
 		}
 		return found_count;
 	}
@@ -89,19 +90,14 @@ public:
 	idx_t LookupRange(const Value &lower_bound, const Value &upper_bound) const override {
 		auto lb = lower_bound.GetValueUnsafe<T>();
 		auto ub = upper_bound.GetValueUnsafe<T>();
-		idx_t result_count = 0;
-		// Bits to the left: larger (important to lower bound)
-		// Bits to the right: smaller (important to uppper bound)
-		// Shift position in word to last bit to exclude everything to the right
-		// TODO: Test this
-		result_count += __builtin_popcount(bitmap[(idx_t)lb >> word_shift] >> (((idx_t)ub >> prefix_shift) & 63));
-		// Shift the position in word to first bit to check if any of the following bits in word are 1
-		// TODO: Test this
-		result_count += __builtin_popcount(bitmap[(idx_t)ub >> word_shift]
-		                                   << (sizeof(uint64_t) - (((idx_t)ub >> prefix_shift) & 63)));
+		const auto lower_prefix = (idx_t)lb >> prefix_shift;
+		const auto upper_prefix = (idx_t)ub >> prefix_shift;
 
-		for (auto i = lb + 1; i < ub; i += 1) {
-			result_count += __builtin_popcount(bitmap[(idx_t)i]);
+		idx_t result_count = 0;
+		for (idx_t prefix = lower_prefix; prefix <= upper_prefix; prefix++) {
+			const auto word_idx = prefix >> 6;
+			const auto bit = 1ULL << (prefix & 63);
+			result_count += (bitmap[word_idx] & bit) != 0;
 		}
 		return result_count;
 	}
@@ -111,8 +107,21 @@ public:
 	}
 
 	unique_ptr<PrefixRangeFilter> Copy() const override {
-		D_ASSERT(!initialized);
-		return make_uniq<NumericPrefixRangeFilter<T>>();
+		auto result = make_uniq<NumericPrefixRangeFilter<T>>();
+		if (!initialized) {
+			return std::move(result);
+		}
+
+		static constexpr idx_t PREFIX_LENGTH = 18;
+		static constexpr idx_t BITMAP_SIZE = 1 << (PREFIX_LENGTH - 6);
+		result->word_shift = word_shift;
+		result->prefix_shift = prefix_shift;
+		result->buf_ = Allocator::DefaultAllocator().Allocate(64ULL + BITMAP_SIZE * sizeof(uint64_t));
+		result->bitmap =
+		    reinterpret_cast<uint64_t *>((64ULL + reinterpret_cast<uint64_t>(result->buf_.get())) & ~63ULL);
+		memcpy(result->bitmap, bitmap, BITMAP_SIZE * sizeof(uint64_t));
+		result->initialized = true;
+		return std::move(result);
 	}
 
 private:
@@ -134,6 +143,8 @@ private:
 
 public:
 	static constexpr auto TYPE = TableFilterType::PREFIX_RANGE_FILTER;
+	static bool SupportedType(const LogicalType &type);
+	static unique_ptr<PrefixRangeFilter> CreateFilter(const LogicalType &type);
 
 public:
 	explicit PrefixRangeTableFilter(unique_ptr<PrefixRangeFilter> filter_p, const bool filters_null_values_p,

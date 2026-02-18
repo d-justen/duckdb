@@ -247,6 +247,13 @@
         "internal_setting": "force_external"
     },
     {
+        "name": "debug_force_join_probabilistic_filter",
+        "description": "DEBUG SETTING: force probabilistic join filter pushdown when structurally possible",
+        "type": "BOOLEAN",
+        "default_scope": "local",
+        "default_value": "false"
+    },
+    {
         "name": "debug_force_no_cross_product",
         "description": "DEBUG SETTING: Force disable cross product generation when hyper graph isn't connected, used for testing",
         "type": "BOOLEAN",
@@ -866,6 +873,13 @@
     {
         "name": "prefer_range_joins",
         "description": "Force use of range joins with mixed predicates",
+        "type": "BOOLEAN",
+        "default_scope": "local",
+        "default_value": "false"
+    },
+    {
+        "name": "prefix_range_filter",
+        "description": "Enable prefix range filter in join filter pushdown instead of bloom filter",
         "type": "BOOLEAN",
         "default_scope": "local",
         "default_value": "false"

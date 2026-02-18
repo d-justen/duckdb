@@ -20,6 +20,7 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/filter/prefix_range_filter.hpp"
 #include "duckdb/planner/filter/selectivity_optional_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
@@ -905,6 +906,7 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
 	if (!ht) {
 		return false;
 	}
+	const auto force_probabilistic_filter = Settings::Get<DebugForceJoinProbabilisticFilterSetting>(context);
 
 	// with a perfect hashtable we expect good min/max pruning, so we don't want the bloom filter
 	if (is_perfect_hashtable) {
@@ -922,7 +924,19 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, opt
 	const bool probe_larger_then_build = build_to_probe_ratio > 1.0;
 
 	// only use bloom filter if there is no in-filter already
+	if (force_probabilistic_filter) {
+		return can_use_bf;
+	}
 	return can_use_bf && build_side_has_filter && probe_larger_then_build;
+}
+
+bool JoinFilterPushdownInfo::CanUsePrefixRangeFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht,
+                                                     const PhysicalComparisonJoin &op, const ExpressionType &cmp,
+                                                     const bool is_perfect_hashtable) const {
+	if (!CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+		return false;
+	}
+	return PrefixRangeTableFilter::SupportedType(ht->conditions[0].GetLHS().return_type);
 }
 
 void JoinFilterPushdownInfo::PushBloomFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht,
@@ -937,6 +951,35 @@ void JoinFilterPushdownInfo::PushBloomFilter(const JoinFilterPushdownFilter &inf
 	auto opt_bf_filter = make_uniq<SelectivityOptionalFilter>(
 	    std::move(bf_filter), SelectivityOptionalFilter::BF_THRESHOLD, SelectivityOptionalFilter::BF_CHECK_N);
 	info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(opt_bf_filter));
+}
+
+void JoinFilterPushdownInfo::PushPrefixRangeFilter(const JoinFilterPushdownFilter &info, ClientContext &context,
+                                                   JoinHashTable &ht, const PhysicalOperator &op, idx_t filter_col_idx,
+                                                   const Value &min_val, const Value &max_val) const {
+	const auto key_type = ht.conditions[0].GetLHS().return_type;
+	auto prefix_filter = PrefixRangeTableFilter::CreateFilter(key_type);
+	prefix_filter->Initialize(context, ht.Count(), min_val, max_val);
+
+	Vector tuples_addresses(LogicalType::POINTER, ht.Count());
+	Vector build_vector(key_type, ht.Count());
+	auto key_count = ht.ScanKeyColumn(tuples_addresses, build_vector, 0);
+	for (idx_t i = 0; i < key_count; i++) {
+		auto value = build_vector.GetValue(i);
+		if (value.IsNull()) {
+			continue;
+		}
+		prefix_filter->InsertOne(value);
+	}
+
+	// If the nulls are equal, we let nulls pass. If not, we filter them
+	auto filters_null_values = !ht.NullValuesAreEqual(0);
+	const auto key_name = ht.conditions[0].GetRHS().ToString();
+	auto rf_filter =
+	    make_uniq<PrefixRangeTableFilter>(std::move(prefix_filter), filters_null_values, key_name, key_type);
+
+	auto opt_rf_filter = make_uniq<SelectivityOptionalFilter>(
+	    std::move(rf_filter), SelectivityOptionalFilter::BF_THRESHOLD, SelectivityOptionalFilter::BF_CHECK_N);
+	info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(opt_rf_filter));
 }
 
 unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeMinMax(JoinFilterGlobalState &gstate) const {
@@ -1023,7 +1066,19 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(ClientContext &con
 					break;
 				}
 
-				if (ht && CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+				if (!ht) {
+					continue;
+				}
+				if (probabilistic_filter_type == JoinFilterPushdownFilterType::PREFIX_RANGE) {
+					if (CanUsePrefixRangeFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+						PushPrefixRangeFilter(info, context, *ht, op, filter_col_idx, min_val, max_val);
+					} else if (CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
+						const auto key_type = ht->conditions[0].GetLHS().return_type;
+						throw NotImplementedException("Prefix range filter is enabled but join key type %s is not "
+						                              "supported for prefix range filter pushdown",
+						                              key_type.ToString());
+					}
+				} else if (CanUseBloomFilter(context, ht, op, cmp, is_perfect_hashtable)) {
 					PushBloomFilter(info, *ht, op, filter_col_idx);
 				}
 			}

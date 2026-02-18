@@ -870,6 +870,10 @@ bool MultiFileColumnMapper::EvaluateFilterAgainstConstant(TableFilter &filter, c
 		auto &bloom_filter = filter.Cast<BFTableFilter>();
 		return bloom_filter.FilterValue(constant);
 	}
+	case TableFilterType::PREFIX_RANGE_FILTER: {
+		auto &prefix_filter = filter.Cast<PrefixRangeTableFilter>();
+		return prefix_filter.FilterValue(constant);
+	}
 	default:
 		throw NotImplementedException("Can't evaluate TableFilterType (%s) against a constant",
 		                              EnumUtil::ToString(type));
@@ -1026,6 +1030,7 @@ static unique_ptr<TableFilter> TryCastTableFilter(const TableFilter &global_filt
 		return make_uniq<InFilter>(std::move(in_list));
 	}
 	case TableFilterType::EXPRESSION_FILTER:
+	case TableFilterType::PREFIX_RANGE_FILTER:
 		// unsupported
 		return nullptr;
 	default:

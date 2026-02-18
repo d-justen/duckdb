@@ -4,6 +4,7 @@
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -284,6 +285,9 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
 		} else {
 			pushdown_info->build_side_has_filter = IsFiltering(join.children[1]);
 		}
+	}
+	if (Settings::Get<PrefixRangeFilterSetting>(optimizer.GetContext())) {
+		pushdown_info->probabilistic_filter_type = JoinFilterPushdownFilterType::PREFIX_RANGE;
 	}
 	// set up the filter pushdown in the join itself
 	join.filter_pushdown = std::move(pushdown_info);

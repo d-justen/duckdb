@@ -109,6 +109,7 @@
 #include "duckdb/execution/index/unbound_index.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_option.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_state.hpp"
+#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_table_scan_enum.hpp"
 #include "duckdb/execution/reservoir_sample.hpp"
@@ -2494,6 +2495,24 @@ InterruptMode EnumUtil::FromString<InterruptMode>(const char *value) {
 	return static_cast<InterruptMode>(StringUtil::StringToEnum(GetInterruptModeValues(), 3, "InterruptMode", value));
 }
 
+const StringUtil::EnumStringLiteral *GetJoinFilterPushdownFilterTypeValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(JoinFilterPushdownFilterType::BLOOM), "BLOOM" },
+		{ static_cast<uint32_t>(JoinFilterPushdownFilterType::PREFIX_RANGE), "PREFIX_RANGE" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<JoinFilterPushdownFilterType>(JoinFilterPushdownFilterType value) {
+	return StringUtil::EnumToString(GetJoinFilterPushdownFilterTypeValues(), 2, "JoinFilterPushdownFilterType", static_cast<uint32_t>(value));
+}
+
+template<>
+JoinFilterPushdownFilterType EnumUtil::FromString<JoinFilterPushdownFilterType>(const char *value) {
+	return static_cast<JoinFilterPushdownFilterType>(StringUtil::StringToEnum(GetJoinFilterPushdownFilterTypeValues(), 2, "JoinFilterPushdownFilterType", value));
+}
+
 const StringUtil::EnumStringLiteral *GetJoinRefTypeValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(JoinRefType::REGULAR), "REGULAR" },
@@ -4830,19 +4849,20 @@ const StringUtil::EnumStringLiteral *GetTableFilterTypeValues() {
 		{ static_cast<uint32_t>(TableFilterType::IN_FILTER), "IN_FILTER" },
 		{ static_cast<uint32_t>(TableFilterType::DYNAMIC_FILTER), "DYNAMIC_FILTER" },
 		{ static_cast<uint32_t>(TableFilterType::EXPRESSION_FILTER), "EXPRESSION_FILTER" },
-		{ static_cast<uint32_t>(TableFilterType::BLOOM_FILTER), "BLOOM_FILTER" }
+		{ static_cast<uint32_t>(TableFilterType::BLOOM_FILTER), "BLOOM_FILTER" },
+		{ static_cast<uint32_t>(TableFilterType::PREFIX_RANGE_FILTER), "PREFIX_RANGE_FILTER" }
 	};
 	return values;
 }
 
 template<>
 const char* EnumUtil::ToChars<TableFilterType>(TableFilterType value) {
-	return StringUtil::EnumToString(GetTableFilterTypeValues(), 11, "TableFilterType", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetTableFilterTypeValues(), 12, "TableFilterType", static_cast<uint32_t>(value));
 }
 
 template<>
 TableFilterType EnumUtil::FromString<TableFilterType>(const char *value) {
-	return static_cast<TableFilterType>(StringUtil::StringToEnum(GetTableFilterTypeValues(), 11, "TableFilterType", value));
+	return static_cast<TableFilterType>(StringUtil::StringToEnum(GetTableFilterTypeValues(), 12, "TableFilterType", value));
 }
 
 const StringUtil::EnumStringLiteral *GetTablePartitionInfoValues() {

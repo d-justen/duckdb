@@ -2,6 +2,7 @@
 #include "duckdb/function/compression/compression.hpp"
 #include "duckdb/function/compression_function.hpp"
 #include "duckdb/planner/filter/bloom_filter.hpp"
+#include "duckdb/planner/filter/prefix_range_filter.hpp"
 #include "duckdb/storage/segment/uncompressed.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -168,6 +169,11 @@ void ConstantFun::FiltersNullValues(const LogicalType &type, const TableFilter &
 	case TableFilterType::BLOOM_FILTER: {
 		auto &bf = filter.Cast<BFTableFilter>();
 		filters_nulls = bf.FiltersNullValues();
+		break;
+	}
+	case TableFilterType::PREFIX_RANGE_FILTER: {
+		auto &prefix_filter = filter.Cast<PrefixRangeTableFilter>();
+		filters_nulls = prefix_filter.FiltersNullValues();
 		break;
 	}
 	default:
