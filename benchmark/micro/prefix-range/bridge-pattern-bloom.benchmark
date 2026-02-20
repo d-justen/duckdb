@@ -1,0 +1,14 @@
+# name: benchmark/micro/prefix-range/bridge-pattern-bloom.benchmark
+# description: Execute "bridge pattern" query with BF
+# group: [prefix-range]
+
+name Bridge Pattern BLOOM
+group micro
+subgroup prefix-range
+
+load
+CREATE TABLE build AS SELECT CAST (i AS UINTEGER) k, CAST (random() AS VARCHAR) a, CAST (random() AS VARCHAR) b, CAST (random() AS VARCHAR) c FROM range(10000000) _(i);
+CREATE TABLE probe AS SELECT CAST (i // 10 AS UINTEGER) k, CAST (random() AS VARCHAR) a, CAST (random() AS VARCHAR) b, CAST (random() AS VARCHAR) c FROM range(100000000) _(i);
+
+run
+SELECT any_value(b.a), any_value(b.b), any_value(b.c), any_value(p.a), any_value(p.b), any_value(p.c) FROM build b, probe p WHERE b.k = p.k AND (b.rowid <=10000 OR b.rowid >= 9990000);

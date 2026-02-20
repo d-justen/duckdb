@@ -8,8 +8,6 @@
 
 #pragma once
 
-#include "duckdb.h"
-#include "duckdb/common/assert.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -21,6 +19,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
+#include <cstdint>
 
 namespace duckdb {
 
@@ -35,16 +34,30 @@ public:
 	virtual idx_t LookupRange(const Value &lower_bound, const Value &upper_bound) const = 0;
 	virtual bool IsInitialized() const = 0;
 	virtual unique_ptr<PrefixRangeFilter> Copy() const = 0;
+	virtual void Print() const = 0;
 };
 
 template <typename T>
 class NumericPrefixRangeFilter : public PrefixRangeFilter {
 public:
+	static constexpr idx_t KEY_BIT_SIZE = sizeof(T) * 8;
+	static constexpr idx_t PREFIX_LENGTH = 18;
+	static constexpr idx_t BITMAP_SIZE = 1 << (PREFIX_LENGTH - 6); // = 2^PREFIX_LENGTH / sizeof(uint64_t)
+public:
 	void Initialize(ClientContext &context, idx_t number_of_rows, Value min, Value max) override {
-		static constexpr idx_t KEY_BIT_SIZE = sizeof(T) * 8;
-		static constexpr idx_t PREFIX_LENGTH = 18;
-		static constexpr idx_t BITMAP_SIZE = 1 << (PREFIX_LENGTH - 6); // = 2^PREFIX_LENGTH / sizeof(uint64_t)
+		auto min_val = min.GetValueUnsafe<T>();
+		auto max_val = max.GetValueUnsafe<T>();
+		idx_t prefix_overlap = 0;
 
+		for (int i = sizeof(min_val) * 8 - 1; i >= 0; --i) {
+			if ((min_val >> i) == (max_val >> i)) {
+				++prefix_overlap;
+			} else {
+				break;
+			}
+		}
+
+		overlap_shift = prefix_overlap;
 		prefix_shift = KEY_BIT_SIZE - PREFIX_LENGTH;
 		word_shift = prefix_shift + 6;
 
@@ -60,13 +73,15 @@ public:
 		const T *key_data = FlatVector::GetData<T>(keys);
 		for (idx_t i = 0; i < count; i++) {
 			T key = key_data[i];
-			bitmap[(idx_t)key >> word_shift] |= 1ULL << (((idx_t)key >> prefix_shift) & 63);
+			auto stripped = key << overlap_shift;
+			bitmap[(idx_t)(stripped >> word_shift)] |= 1ULL << (((idx_t)(stripped >> prefix_shift)) & 63);
 		}
 	}
 
 	void InsertOne(const Value &key) const override {
 		auto k = key.GetValueUnsafe<T>();
-		bitmap[(idx_t)k >> word_shift] |= 1ULL << (((idx_t)k >> prefix_shift) & 63);
+		auto stripped = k << overlap_shift;
+		bitmap[(idx_t)stripped >> word_shift] |= 1ULL << (((idx_t)stripped >> prefix_shift) & 63);
 	}
 
 	idx_t LookupKeys(const Vector &keys, SelectionVector &result_sel, idx_t count) const override {
@@ -75,8 +90,9 @@ public:
 		for (idx_t i = 0; i < count; i++) {
 			result_sel.set_index(found_count, i);
 			T key = key_data[i];
-			const auto bitset = bitmap[(idx_t)key >> word_shift];
-			const auto bit = 1ULL << (((idx_t)key >> prefix_shift) & 63);
+			auto stripped = key << overlap_shift;
+			const auto bitset = bitmap[(idx_t)(stripped >> word_shift)];
+			const auto bit = 1ULL << (((idx_t)(stripped >> prefix_shift)) & 63);
 			found_count += (bitset & bit) != 0;
 		}
 		return found_count;
@@ -84,22 +100,38 @@ public:
 
 	bool LookupOne(const Value &key) const override {
 		auto k = key.GetValueUnsafe<T>();
-		return bitmap[(idx_t)k >> word_shift] & 1ULL << (((idx_t)k >> prefix_shift) & 63);
+		auto stripped = k << overlap_shift;
+		return bitmap[(idx_t)(stripped >> word_shift)] & 1ULL << (((idx_t)(stripped >> prefix_shift)) & 63);
 	}
 
 	idx_t LookupRange(const Value &lower_bound, const Value &upper_bound) const override {
 		auto lb = lower_bound.GetValueUnsafe<T>();
 		auto ub = upper_bound.GetValueUnsafe<T>();
-		const auto lower_prefix = (idx_t)lb >> prefix_shift;
-		const auto upper_prefix = (idx_t)ub >> prefix_shift;
+		const auto lower_prefix_stripped = lb << overlap_shift;
+		const auto upper_prefix_stripped = ub << overlap_shift;
+		const auto lower_prefix_word_idx = lower_prefix_stripped >> word_shift;
+		const auto upper_prefix_word_idx = upper_prefix_stripped >> word_shift;
+		const auto lower_prefix_bit_idx = (lower_prefix_stripped >> prefix_shift) & 63;
+		const auto upper_prefix_bit_idx = (upper_prefix_stripped >> prefix_shift) & 63;
 
-		idx_t result_count = 0;
-		for (idx_t prefix = lower_prefix; prefix <= upper_prefix; prefix++) {
-			const auto word_idx = prefix >> 6;
-			const auto bit = 1ULL << (prefix & 63);
-			result_count += (bitmap[word_idx] & bit) != 0;
+		auto lb_word = bitmap[(idx_t)lower_prefix_word_idx];
+		auto lb_mask = ~0ULL << (uint64_t)lower_prefix_bit_idx;
+		if (lb_word & lb_mask) {
+			return 1;
 		}
-		return result_count;
+
+		for (idx_t i = (idx_t)lower_prefix_word_idx; i < (idx_t)upper_prefix_word_idx; i++) {
+			if (bitmap[i] > 0) {
+				return 1;
+			}
+		}
+
+		auto ub_word = bitmap[(idx_t)upper_prefix_word_idx];
+		auto ub_mask = (1ULL << (uint64_t)upper_prefix_bit_idx) - 1;
+		if (ub_word & ub_mask) {
+			return 1;
+		}
+		return 0;
 	}
 
 	bool IsInitialized() const override {
@@ -114,6 +146,7 @@ public:
 
 		static constexpr idx_t PREFIX_LENGTH = 18;
 		static constexpr idx_t BITMAP_SIZE = 1 << (PREFIX_LENGTH - 6);
+		result->overlap_shift = overlap_shift;
 		result->word_shift = word_shift;
 		result->prefix_shift = prefix_shift;
 		result->buf_ = Allocator::DefaultAllocator().Allocate(64ULL + BITMAP_SIZE * sizeof(uint64_t));
@@ -124,9 +157,22 @@ public:
 		return std::move(result);
 	}
 
+	void Print() const override {
+		std::cout << "[";
+		for (idx_t i = 0; i < BITMAP_SIZE; i++) {
+			if (bitmap[i] == 0) {
+				std::cout << "0";
+			} else {
+				std::cout << "{" << bitmap[i] << "}";
+			}
+		}
+		std::cout << "]\n";
+	}
+
 private:
 	idx_t word_shift;
 	idx_t prefix_shift;
+	idx_t overlap_shift;
 
 	bool initialized = false;
 	AllocatedData buf_;

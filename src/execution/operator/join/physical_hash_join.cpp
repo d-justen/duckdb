@@ -963,13 +963,7 @@ void JoinFilterPushdownInfo::PushPrefixRangeFilter(const JoinFilterPushdownFilte
 	Vector tuples_addresses(LogicalType::POINTER, ht.Count());
 	Vector build_vector(key_type, ht.Count());
 	auto key_count = ht.ScanKeyColumn(tuples_addresses, build_vector, 0);
-	for (idx_t i = 0; i < key_count; i++) {
-		auto value = build_vector.GetValue(i);
-		if (value.IsNull()) {
-			continue;
-		}
-		prefix_filter->InsertOne(value);
-	}
+	prefix_filter->InsertKeys(build_vector, key_count);
 
 	// If the nulls are equal, we let nulls pass. If not, we filter them
 	auto filters_null_values = !ht.NullValuesAreEqual(0);

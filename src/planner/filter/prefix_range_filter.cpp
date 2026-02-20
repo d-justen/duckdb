@@ -1,5 +1,4 @@
 #include "duckdb/planner/filter/prefix_range_filter.hpp"
-#include "duckdb/common/assert.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/types.hpp"
@@ -152,8 +151,8 @@ unique_ptr<TableFilter> PrefixRangeTableFilter::Deserialize(Deserializer &deseri
 	auto key_column_name = deserializer.ReadProperty<string>(201, "key_column_name");
 	auto key_type = deserializer.ReadProperty<LogicalType>(202, "key_type");
 
-	auto result = make_uniq<PrefixRangeTableFilter>(CreateFilter(key_type), filters_null_values, key_column_name,
-	                                                key_type);
+	auto result =
+	    make_uniq<PrefixRangeTableFilter>(CreateFilter(key_type), filters_null_values, key_column_name, key_type);
 	return std::move(result);
 }
 } // namespace duckdb
