@@ -963,7 +963,13 @@ void JoinFilterPushdownInfo::PushPrefixRangeFilter(const JoinFilterPushdownFilte
 	Vector tuples_addresses(LogicalType::POINTER, ht.Count());
 	Vector build_vector(key_type, ht.Count());
 	auto key_count = ht.ScanKeyColumn(tuples_addresses, build_vector, 0);
+
+	// FIXME: Make this multi-threaded!
 	prefix_filter->InsertKeys(build_vector, key_count);
+	// TODO: Evaluate whether we want this conversion at all
+	// if (auto tiny_filter = prefix_filter->TryConvertToTiny(context)) {
+	// 	prefix_filter = std::move(tiny_filter);
+	// }
 
 	// If the nulls are equal, we let nulls pass. If not, we filter them
 	auto filters_null_values = !ht.NullValuesAreEqual(0);
@@ -971,8 +977,9 @@ void JoinFilterPushdownInfo::PushPrefixRangeFilter(const JoinFilterPushdownFilte
 	auto rf_filter =
 	    make_uniq<PrefixRangeTableFilter>(std::move(prefix_filter), filters_null_values, key_name, key_type);
 
-	auto opt_rf_filter = make_uniq<SelectivityOptionalFilter>(
-	    std::move(rf_filter), SelectivityOptionalFilter::BF_THRESHOLD, SelectivityOptionalFilter::BF_CHECK_N);
+	// TODO: Check selectivity threshold
+	auto opt_rf_filter =
+	    make_uniq<SelectivityOptionalFilter>(std::move(rf_filter), 0.8f, SelectivityOptionalFilter::BF_CHECK_N);
 	info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(opt_rf_filter));
 }
 

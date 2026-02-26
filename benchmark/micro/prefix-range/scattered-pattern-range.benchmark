@@ -1,0 +1,15 @@
+# name: benchmark/micro/prefix-range/scatter-pattern-range.benchmark
+# description: Execute "scatter pattern" query with RF
+# group: [prefix-range]
+
+name Scatter Pattern RANGE
+group micro
+subgroup prefix-range
+
+load
+CREATE TABLE build AS SELECT CAST (i AS UINTEGER) k, CAST (random() AS VARCHAR) a, CAST (random() AS VARCHAR) b, CAST (random() AS VARCHAR) c FROM range(10000000) _(i);
+CREATE TABLE probe AS SELECT CAST ((i * 81) % 10000000 AS UINTEGER) k, CAST (random() AS VARCHAR) a, CAST (random() AS VARCHAR) b, CAST (random() AS VARCHAR) c FROM range(100000000) _(i);
+PRAGMA prefix_range_filter=true;
+
+run
+SELECT any_value(b.a), any_value(b.b), any_value(b.c), any_value(p.a), any_value(p.b), any_value(p.c) FROM build b, probe p WHERE b.k = p.k AND (b.rowid <= 1000000 OR b.rowid >= 9000000);

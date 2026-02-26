@@ -8,20 +8,33 @@
 
 #pragma once
 
+#include "duckdb/common/allocator.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include <cstdint>
+#include <type_traits>
 
 namespace duckdb {
+
+class PrefixRangeFilter;
+
+template <typename T, unsigned int N>
+class TinyPrefixRangeFilter;
+
+template <typename T>
+unique_ptr<PrefixRangeFilter> TryCreateTinyPrefixRangeFilter(ClientContext &context, const uint64_t *bitmap,
+                                                             idx_t bitmap_length, typename MakeUnsigned<T>::type offset,
+                                                             typename MakeUnsigned<T>::type bucket_size);
 
 class PrefixRangeFilter {
 public:
@@ -35,6 +48,9 @@ public:
 	virtual bool IsInitialized() const = 0;
 	virtual unique_ptr<PrefixRangeFilter> Copy() const = 0;
 	virtual void Print() const = 0;
+	virtual unique_ptr<PrefixRangeFilter> TryConvertToTiny(ClientContext &context) const {
+		return nullptr;
+	}
 };
 
 template <typename T>
@@ -45,8 +61,9 @@ public:
 	static constexpr idx_t BITMAP_SIZE = 1 << (PREFIX_LENGTH - 6); // = 2^PREFIX_LENGTH / sizeof(uint64_t)
 public:
 	void Initialize(ClientContext &context, idx_t number_of_rows, Value min, Value max) override {
-		auto min_val = min.GetValueUnsafe<T>();
-		auto max_val = max.GetValueUnsafe<T>();
+		using UT = typename MakeUnsigned<T>::type;
+		auto min_val = static_cast<UT>(min.GetValueUnsafe<T>());
+		auto max_val = static_cast<UT>(max.GetValueUnsafe<T>());
 		idx_t prefix_overlap = 0;
 
 		for (int i = sizeof(min_val) * 8 - 1; i >= 0; --i) {
@@ -57,9 +74,14 @@ public:
 			}
 		}
 
-		overlap_shift = prefix_overlap;
 		prefix_shift = KEY_BIT_SIZE - PREFIX_LENGTH;
 		word_shift = prefix_shift + 6;
+		overlap_shift = prefix_overlap;
+		if (overlap_shift == 0) {
+			prefix_base = 0;
+		} else {
+			prefix_base = min_val >> (KEY_BIT_SIZE - overlap_shift);
+		}
 
 		BufferManager &buffer_manager = BufferManager::GetBufferManager(context);
 		buf_ = buffer_manager.GetBufferAllocator().Allocate(64ULL + BITMAP_SIZE * sizeof(uint64_t));
@@ -138,6 +160,8 @@ public:
 		return initialized;
 	}
 
+	unique_ptr<PrefixRangeFilter> TryConvertToTiny(ClientContext &context) const override;
+
 	unique_ptr<PrefixRangeFilter> Copy() const override {
 		auto result = make_uniq<NumericPrefixRangeFilter<T>>();
 		if (!initialized) {
@@ -149,6 +173,7 @@ public:
 		result->overlap_shift = overlap_shift;
 		result->word_shift = word_shift;
 		result->prefix_shift = prefix_shift;
+		result->prefix_base = prefix_base;
 		result->buf_ = Allocator::DefaultAllocator().Allocate(64ULL + BITMAP_SIZE * sizeof(uint64_t));
 		result->bitmap =
 		    reinterpret_cast<uint64_t *>((64ULL + reinterpret_cast<uint64_t>(result->buf_.get())) & ~63ULL);
@@ -170,9 +195,35 @@ public:
 	}
 
 private:
+	template <typename U, typename std::enable_if<(sizeof(U) <= sizeof(uint64_t)), int>::type = 0>
+	static unique_ptr<PrefixRangeFilter> TryConvertToTinyInternal(const NumericPrefixRangeFilter<U> &filter,
+	                                                              ClientContext &context) {
+		using UT = typename MakeUnsigned<U>::type;
+		if (!filter.initialized) {
+			return nullptr;
+		}
+		if (KEY_BIT_SIZE <= PREFIX_LENGTH) {
+			return nullptr;
+		}
+		if (filter.overlap_shift > filter.prefix_shift) {
+			return nullptr;
+		}
+		const auto shift = filter.prefix_shift - filter.overlap_shift;
+		const auto bucket_size = static_cast<UT>(UT(1) << shift);
+		const auto offset = static_cast<UT>(filter.prefix_base << (KEY_BIT_SIZE - filter.overlap_shift));
+		return TryCreateTinyPrefixRangeFilter<U>(context, filter.bitmap, BITMAP_SIZE, offset, bucket_size);
+	}
+
+	template <typename U, typename std::enable_if<(sizeof(U) > sizeof(uint64_t)), int>::type = 0>
+	static unique_ptr<PrefixRangeFilter> TryConvertToTinyInternal(const NumericPrefixRangeFilter<U> &filter,
+	                                                              ClientContext &context) {
+		return nullptr;
+	}
+
 	idx_t word_shift;
 	idx_t prefix_shift;
 	idx_t overlap_shift;
+	typename MakeUnsigned<T>::type prefix_base;
 
 	bool initialized = false;
 	AllocatedData buf_;
@@ -222,5 +273,16 @@ private:
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<TableFilter> Deserialize(Deserializer &deserializer);
 };
+
+} // namespace duckdb
+
+#include "duckdb/planner/filter/tiny_prefix_range_filter.hpp"
+
+namespace duckdb {
+
+template <typename T>
+unique_ptr<PrefixRangeFilter> NumericPrefixRangeFilter<T>::TryConvertToTiny(ClientContext &context) const {
+	return TryConvertToTinyInternal(*this, context);
+}
 
 } // namespace duckdb
