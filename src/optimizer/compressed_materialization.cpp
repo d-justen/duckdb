@@ -432,6 +432,9 @@ unique_ptr<CompressExpression> CompressedMaterialization::GetStringCompress(uniq
 	auto compress_stats = BaseStatistics::CreateEmpty(cast_type);
 	compress_stats.CopyBase(stats);
 	if (cast_type.id() == LogicalTypeId::USMALLINT) {
+		if (!StringStats::HasMinMax(stats)) {
+			return nullptr;
+		}
 		auto min_string = StringStats::Min(stats);
 		auto max_string = StringStats::Max(stats);
 

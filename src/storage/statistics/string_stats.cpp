@@ -11,14 +11,50 @@
 
 namespace duckdb {
 
+static void SetMinMaxSentinel(StringStatsData &string_data, data_t min_value, data_t max_value) {
+	for (idx_t i = 0; i < StringStatsData::MAX_STRING_MINMAX_SIZE; i++) {
+		string_data.min[i] = min_value;
+		string_data.max[i] = max_value;
+	}
+}
+
+static bool HasLegacyUnknownMinMaxEncoding(const StringStatsData &string_data) {
+	if (string_data.has_max_string_length || string_data.max_string_length != 0 || !string_data.has_unicode) {
+		return false;
+	}
+	for (idx_t i = 0; i < StringStatsData::MAX_STRING_MINMAX_SIZE; i++) {
+		if (string_data.min[i] != 0 || string_data.max[i] != 0xFF) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static int StringValueComparison(const_data_ptr_t data, idx_t len, const_data_ptr_t comparison) {
+	for (idx_t i = 0; i < len; i++) {
+		if (data[i] < comparison[i]) {
+			return -1;
+		} else if (data[i] > comparison[i]) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static bool IsUnknownMinMaxPlaceholder(const StringStatsData &string_data, const BaseStatistics &stats) {
+	if (HasLegacyUnknownMinMaxEncoding(string_data)) {
+		return true;
+	}
+	return stats.CanHaveNull() && stats.CanHaveNoNull() && string_data.has_unicode && !string_data.has_max_string_length &&
+	       string_data.max_string_length == 0 &&
+	       StringValueComparison(string_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.max) > 0;
+}
+
 BaseStatistics StringStats::CreateUnknown(LogicalType type) {
 	BaseStatistics result(std::move(type));
 	result.InitializeUnknown();
 	auto &string_data = StringStats::GetDataUnsafe(result);
-	for (idx_t i = 0; i < StringStatsData::MAX_STRING_MINMAX_SIZE; i++) {
-		string_data.min[i] = 0;
-		string_data.max[i] = 0xFF;
-	}
+	SetMinMaxSentinel(string_data, 0xFF, 0);
 	string_data.max_string_length = 0;
 	string_data.has_max_string_length = false;
 	string_data.has_unicode = true;
@@ -29,10 +65,7 @@ BaseStatistics StringStats::CreateEmpty(LogicalType type) {
 	BaseStatistics result(std::move(type));
 	result.InitializeEmpty();
 	auto &string_data = StringStats::GetDataUnsafe(result);
-	for (idx_t i = 0; i < StringStatsData::MAX_STRING_MINMAX_SIZE; i++) {
-		string_data.min[i] = 0xFF;
-		string_data.max[i] = 0;
-	}
+	SetMinMaxSentinel(string_data, 0xFF, 0);
 	string_data.max_string_length = 0;
 	string_data.has_max_string_length = true;
 	string_data.has_unicode = false;
@@ -47,6 +80,17 @@ StringStatsData &StringStats::GetDataUnsafe(BaseStatistics &stats) {
 const StringStatsData &StringStats::GetDataUnsafe(const BaseStatistics &stats) {
 	D_ASSERT(stats.GetStatsType() == StatisticsType::STRING_STATS);
 	return stats.stats_union.string_data;
+}
+
+bool StringStats::HasMinMax(const BaseStatistics &stats) {
+	if (stats.GetType().id() == LogicalTypeId::SQLNULL) {
+		return false;
+	}
+	auto &string_data = StringStats::GetDataUnsafe(stats);
+	if (HasLegacyUnknownMinMaxEncoding(string_data)) {
+		return false;
+	}
+	return StringValueComparison(string_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.max) <= 0;
 }
 
 bool StringStats::HasMaxStringLength(const BaseStatistics &stats) {
@@ -118,17 +162,9 @@ void StringStats::Deserialize(Deserializer &deserializer, BaseStatistics &base) 
 	deserializer.ReadProperty(202, "has_unicode", string_data.has_unicode);
 	deserializer.ReadProperty(203, "has_max_string_length", string_data.has_max_string_length);
 	deserializer.ReadProperty(204, "max_string_length", string_data.max_string_length);
-}
-
-static int StringValueComparison(const_data_ptr_t data, idx_t len, const_data_ptr_t comparison) {
-	for (idx_t i = 0; i < len; i++) {
-		if (data[i] < comparison[i]) {
-			return -1;
-		} else if (data[i] > comparison[i]) {
-			return 1;
-		}
+	if (HasLegacyUnknownMinMaxEncoding(string_data)) {
+		SetMinMaxSentinel(string_data, 0xFF, 0);
 	}
-	return 0;
 }
 
 static void ConstructValue(const_data_ptr_t data, idx_t size, data_t target[]) {
@@ -187,11 +223,22 @@ void StringStats::Merge(BaseStatistics &stats, const BaseStatistics &other) {
 	}
 	auto &string_data = StringStats::GetDataUnsafe(stats);
 	auto &other_data = StringStats::GetDataUnsafe(other);
-	if (StringValueComparison(other_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.min) < 0) {
-		memcpy(string_data.min, other_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE);
-	}
-	if (StringValueComparison(other_data.max, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.max) > 0) {
-		memcpy(string_data.max, other_data.max, StringStatsData::MAX_STRING_MINMAX_SIZE);
+	auto has_min_max = StringStats::HasMinMax(stats);
+	auto other_has_min_max = StringStats::HasMinMax(other);
+	if (has_min_max && other_has_min_max) {
+		if (StringValueComparison(other_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.min) < 0) {
+			memcpy(string_data.min, other_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE);
+		}
+		if (StringValueComparison(other_data.max, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.max) > 0) {
+			memcpy(string_data.max, other_data.max, StringStatsData::MAX_STRING_MINMAX_SIZE);
+		}
+	} else if (!has_min_max && (!stats.CanHaveNoNull() || IsUnknownMinMaxPlaceholder(string_data, stats))) {
+		if (other_has_min_max) {
+			memcpy(string_data.min, other_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE);
+			memcpy(string_data.max, other_data.max, StringStatsData::MAX_STRING_MINMAX_SIZE);
+		}
+	} else if (!other_has_min_max && other.CanHaveNoNull() && !IsUnknownMinMaxPlaceholder(other_data, other)) {
+		SetMinMaxSentinel(string_data, 0xFF, 0);
 	}
 	string_data.has_unicode = string_data.has_unicode || other_data.has_unicode;
 	string_data.has_max_string_length = string_data.has_max_string_length && other_data.has_max_string_length;
@@ -200,6 +247,9 @@ void StringStats::Merge(BaseStatistics &stats, const BaseStatistics &other) {
 
 FilterPropagateResult StringStats::CheckZonemap(const BaseStatistics &stats, ExpressionType comparison_type,
                                                 array_ptr<const Value> constants) {
+	if (!StringStats::HasMinMax(stats)) {
+		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+	}
 	auto &string_data = StringStats::GetDataUnsafe(stats);
 	D_ASSERT(stats.CanHaveNoNull());
 	for (auto &constant_value : constants) {
@@ -273,8 +323,7 @@ child_list_t<Value> StringStats::ToStruct(const BaseStatistics &stats) {
 	auto max_len = GetValidMinMaxSubstring(string_data.max);
 	string_t min_str(const_char_ptr_cast(string_data.min), min_len);
 	string_t max_str(const_char_ptr_cast(string_data.max), max_len);
-	// if min > max the stats are empty and min/max is not yet initialized - so don't emit
-	if (min_str <= max_str) {
+	if (StringStats::HasMinMax(stats)) {
 		result.emplace_back("min", Blob::ToString(min_str));
 		result.emplace_back("max", Blob::ToString(max_str));
 	}
@@ -287,6 +336,7 @@ child_list_t<Value> StringStats::ToStruct(const BaseStatistics &stats) {
 
 void StringStats::Verify(const BaseStatistics &stats, Vector &vector, const SelectionVector &sel, idx_t count) {
 	auto &string_data = StringStats::GetDataUnsafe(stats);
+	auto has_min_max = StringStats::HasMinMax(stats);
 
 	UnifiedVectorFormat vdata;
 	vector.ToUnifiedFormat(count, vdata);
@@ -316,15 +366,19 @@ void StringStats::Verify(const BaseStatistics &stats, Vector &vector, const Sele
 				throw InternalException("Invalid unicode detected in vector: %s", vector.ToString(count));
 			}
 		}
-		if (StringValueComparison(const_data_ptr_cast(data),
-		                          MinValue<idx_t>(len, StringStatsData::MAX_STRING_MINMAX_SIZE), string_data.min) < 0) {
-			throw InternalException("Statistics mismatch: value is smaller than min.\nStatistics: %s\nVector: %s",
-			                        stats.ToString(), vector.ToString(count));
-		}
-		if (StringValueComparison(const_data_ptr_cast(data),
-		                          MinValue<idx_t>(len, StringStatsData::MAX_STRING_MINMAX_SIZE), string_data.max) > 0) {
-			throw InternalException("Statistics mismatch: value is bigger than max.\nStatistics: %s\nVector: %s",
-			                        stats.ToString(), vector.ToString(count));
+		if (has_min_max) {
+			if (StringValueComparison(const_data_ptr_cast(data),
+			                          MinValue<idx_t>(len, StringStatsData::MAX_STRING_MINMAX_SIZE), string_data.min) <
+			    0) {
+				throw InternalException("Statistics mismatch: value is smaller than min.\nStatistics: %s\nVector: %s",
+				                        stats.ToString(), vector.ToString(count));
+			}
+			if (StringValueComparison(const_data_ptr_cast(data),
+			                          MinValue<idx_t>(len, StringStatsData::MAX_STRING_MINMAX_SIZE), string_data.max) >
+			    0) {
+				throw InternalException("Statistics mismatch: value is bigger than max.\nStatistics: %s\nVector: %s",
+				                        stats.ToString(), vector.ToString(count));
+			}
 		}
 		// LCOV_EXCL_STOP
 	}

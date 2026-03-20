@@ -32,8 +32,10 @@ idx_t GetQualifyingTupleCount(RowGroup &row_group, BaseStatistics &stats, const 
 		}
 		return 2;
 	}
-	// We cannot check if the min/max for StringStats have actually been set. As the strings may be truncated, we
-	// also cannot assume that min and max are the same
+	if (!StringStats::HasMinMax(stats)) {
+		return 0;
+	}
+	// As string min/max values may be truncated, we cannot infer constancy from equality here.
 	return 0;
 }
 
@@ -75,6 +77,9 @@ void AddRowGroups(multimap<Value, RowGroupSegmentNodeEntry> &row_group_map, It i
 			// Row groups do not overlap: we can guarantee that the tuples qualify
 			qualifying_tuples = last_unresolved_row_group_sum;
 			++last_unresolved_entry;
+			if (last_unresolved_entry == end) {
+				break;
+			}
 			auto &upcoming_row_group = last_unresolved_entry->second.row_group.get().GetNode();
 			auto &upcoming_stats = *last_unresolved_entry->second.stats;
 
@@ -164,6 +169,9 @@ OffsetPruningResult FindOffsetPrunableChunks(It it, End end, const OrderByStatis
 			new_row_offset -= last_unresolved_entry->second.count;
 
 			++last_unresolved_entry;
+			if (last_unresolved_entry == end) {
+				break;
+			}
 			auto &upcoming_stats = *last_unresolved_entry->second.stats;
 			last_unresolved_boundary = RowGroupReorderer::RetrieveStat(upcoming_stats, opposite_stat_type, column_type);
 		}
@@ -208,6 +216,9 @@ Value RowGroupReorderer::RetrieveStat(const BaseStatistics &stats, OrderByStatis
 	if (column_type == OrderByColumnType::STRING) {
 		if (!stats.CanHaveNoNull()) {
 			// No non-null values exist in this row group - stats are meaningless for ordering
+			return Value();
+		}
+		if (!StringStats::HasMinMax(stats)) {
 			return Value();
 		}
 		switch (order_by) {
@@ -311,6 +322,9 @@ optional_ptr<SegmentNode<RowGroup>> RowGroupReorderer::GetRootSegment(RowGroupSe
 		}
 	}
 
+	if (ordered_row_groups.empty()) {
+		return nullptr;
+	}
 	return ordered_row_groups[0].get();
 }
 
