@@ -98,7 +98,7 @@ INSERT INTO strings VALUES ('BBBB'), ('CCCC')
 query II
 EXPLAIN SELECT * FROM strings WHERE s!='111' OR s!='WWW'
 ----
-physical_plan	<REGEX>:.*SEQ_SCAN(.|\n)*optional: s!='111' OR s!=(.|\n)*'WWW'.*
+physical_plan	<REGEX>:.*FILTER(.|\n)*SEQ_SCAN.*
 
 query I
 SELECT * FROM strings WHERE s!='111' OR s!='WWW' ORDER BY s

@@ -45,8 +45,13 @@ static bool IsUnknownMinMaxPlaceholder(const StringStatsData &string_data, const
 	if (HasLegacyUnknownMinMaxEncoding(string_data)) {
 		return true;
 	}
-	return stats.CanHaveNull() && stats.CanHaveNoNull() && string_data.has_unicode && !string_data.has_max_string_length &&
-	       string_data.max_string_length == 0 &&
+	return stats.CanHaveNull() && stats.CanHaveNoNull() && string_data.has_unicode &&
+	       !string_data.has_max_string_length && string_data.max_string_length == 0 &&
+	       StringValueComparison(string_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.max) > 0;
+}
+
+static bool IsEmptyMinMaxPlaceholder(const StringStatsData &string_data) {
+	return !string_data.has_unicode && string_data.has_max_string_length && string_data.max_string_length == 0 &&
 	       StringValueComparison(string_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.max) > 0;
 }
 
@@ -225,6 +230,8 @@ void StringStats::Merge(BaseStatistics &stats, const BaseStatistics &other) {
 	auto &other_data = StringStats::GetDataUnsafe(other);
 	auto has_min_max = StringStats::HasMinMax(stats);
 	auto other_has_min_max = StringStats::HasMinMax(other);
+	auto is_empty = IsEmptyMinMaxPlaceholder(string_data);
+	auto other_is_empty = IsEmptyMinMaxPlaceholder(other_data);
 	if (has_min_max && other_has_min_max) {
 		if (StringValueComparison(other_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.min) < 0) {
 			memcpy(string_data.min, other_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE);
@@ -232,12 +239,12 @@ void StringStats::Merge(BaseStatistics &stats, const BaseStatistics &other) {
 		if (StringValueComparison(other_data.max, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.max) > 0) {
 			memcpy(string_data.max, other_data.max, StringStatsData::MAX_STRING_MINMAX_SIZE);
 		}
-	} else if (!has_min_max && (!stats.CanHaveNoNull() || IsUnknownMinMaxPlaceholder(string_data, stats))) {
+	} else if (is_empty) {
 		if (other_has_min_max) {
 			memcpy(string_data.min, other_data.min, StringStatsData::MAX_STRING_MINMAX_SIZE);
 			memcpy(string_data.max, other_data.max, StringStatsData::MAX_STRING_MINMAX_SIZE);
 		}
-	} else if (!other_has_min_max && other.CanHaveNoNull() && !IsUnknownMinMaxPlaceholder(other_data, other)) {
+	} else if (!other_has_min_max && !other_is_empty) {
 		SetMinMaxSentinel(string_data, 0xFF, 0);
 	}
 	string_data.has_unicode = string_data.has_unicode || other_data.has_unicode;
@@ -368,14 +375,14 @@ void StringStats::Verify(const BaseStatistics &stats, Vector &vector, const Sele
 		}
 		if (has_min_max) {
 			if (StringValueComparison(const_data_ptr_cast(data),
-			                          MinValue<idx_t>(len, StringStatsData::MAX_STRING_MINMAX_SIZE), string_data.min) <
-			    0) {
+			                          MinValue<idx_t>(len, StringStatsData::MAX_STRING_MINMAX_SIZE),
+			                          string_data.min) < 0) {
 				throw InternalException("Statistics mismatch: value is smaller than min.\nStatistics: %s\nVector: %s",
 				                        stats.ToString(), vector.ToString(count));
 			}
 			if (StringValueComparison(const_data_ptr_cast(data),
-			                          MinValue<idx_t>(len, StringStatsData::MAX_STRING_MINMAX_SIZE), string_data.max) >
-			    0) {
+			                          MinValue<idx_t>(len, StringStatsData::MAX_STRING_MINMAX_SIZE),
+			                          string_data.max) > 0) {
 				throw InternalException("Statistics mismatch: value is bigger than max.\nStatistics: %s\nVector: %s",
 				                        stats.ToString(), vector.ToString(count));
 			}

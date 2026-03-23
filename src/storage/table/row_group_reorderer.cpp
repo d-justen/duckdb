@@ -247,6 +247,9 @@ OffsetPruningResult RowGroupReorderer::GetOffsetAfterPruning(const OrderByStatis
 		}
 
 		auto column_stats = partition_stats.partition_row_group->GetColumnStatistics(storage_index);
+		if (!column_stats) {
+			return {row_offset, 0};
+		}
 		Value comparison_value = RetrieveStat(*column_stats, order_by, column_type);
 		if (comparison_value.IsNull()) {
 			if (null_order == OrderByNullType::NULLS_LAST) {
@@ -260,6 +263,9 @@ OffsetPruningResult RowGroupReorderer::GetOffsetAfterPruning(const OrderByStatis
 		}
 		auto entry = RowGroupOffsetEntry {partition_stats.count, std::move(column_stats)};
 		ordered_row_groups.emplace(comparison_value, std::move(entry));
+	}
+	if (ordered_row_groups.empty()) {
+		return {row_offset, 0};
 	}
 
 	switch (order_type) {
@@ -288,6 +294,10 @@ optional_ptr<SegmentNode<RowGroup>> RowGroupReorderer::GetRootSegment(RowGroupSe
 	multimap<Value, RowGroupSegmentNodeEntry> row_group_map;
 	for (auto &row_group : row_groups.SegmentNodes()) {
 		auto stats = row_group.GetNode().GetStatistics(options.column_idx);
+		if (!stats) {
+			remaining_row_groups.push_back(row_group);
+			continue;
+		}
 		Value comparison_value = RetrieveStat(*stats, options.order_by, options.column_type);
 		if (comparison_value.IsNull()) {
 			// no stats for this row group - push to remaining
