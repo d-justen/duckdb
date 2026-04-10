@@ -1121,6 +1121,10 @@ bool JoinFilterPushdownInfo::TryPlanPrefixRangeFilter(ClientContext &context, op
                                                       const PhysicalComparisonJoin &op, const ExpressionType &cmp,
                                                       const Value &min, const Value &max,
                                                       PrefixRangeFilter::Sizing &sizing) const {
+	if (!Settings::Get<EnablePrefixRangeFilterSetting>(context)) {
+		return false;
+	}
+
 	if (!CanUseBloomFilter(context, op, cmp, ht)) {
 		return false;
 	}

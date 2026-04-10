@@ -903,6 +903,16 @@ struct EnableObjectCacheSetting {
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
+struct EnablePrefixRangeFilterSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_prefix_range_filter";
+	static constexpr const char *Description = "Whether dynamic prefix range filters may be generated from hash joins";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
 struct EnableProfilingSetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "enable_profiling";

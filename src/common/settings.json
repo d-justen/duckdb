@@ -596,6 +596,13 @@
         "default_value": "false"
     },
     {
+        "name": "enable_prefix_range_filter",
+        "description": "Whether dynamic prefix range filters may be generated from hash joins",
+        "type": "BOOLEAN",
+        "default_scope": "local",
+        "default_value": "true"
+    },
+    {
         "name": "enable_profiling",
         "description": "Enables profiling, and sets the output format (JSON, QUERY_TREE, QUERY_TREE_OPTIMIZER)",
         "type": "VARCHAR",
