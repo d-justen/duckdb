@@ -13,6 +13,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/column_binding.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "duckdb/planner/filter/prefix_range_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
 namespace duckdb {
@@ -102,14 +103,14 @@ private:
 	                               const JoinFilterPushdownFilter &info, ProjectionIndex filter_col_idx) const;
 	void RegisterPrefixRangeFilter(const JoinFilterPushdownFilter &info, ClientContext &context, JoinHashTable &ht,
 	                               const PhysicalOperator &op, ProjectionIndex filter_col_idx, const Value &min_val,
-	                               const Value &max_val) const;
+	                               const Value &max_val, const PrefixRangeFilter::Sizing &sizing) const;
 
 	bool CanUseInFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht, const ExpressionType &cmp) const;
 	bool CanUseBloomFilter(const ClientContext &context, const PhysicalComparisonJoin &op, const ExpressionType &cmp,
 	                       optional_ptr<JoinHashTable> ht = nullptr) const;
-	bool CanUsePrefixRangeFilter(ClientContext &context, optional_ptr<JoinHashTable> ht,
-	                             const PhysicalComparisonJoin &op, const ExpressionType &cmp, const Value &min,
-	                             const Value &max) const;
+	bool TryPlanPrefixRangeFilter(ClientContext &context, optional_ptr<JoinHashTable> ht,
+	                              const PhysicalComparisonJoin &op, const ExpressionType &cmp, const Value &min,
+	                              const Value &max, PrefixRangeFilter::Sizing &sizing) const;
 };
 
 } // namespace duckdb

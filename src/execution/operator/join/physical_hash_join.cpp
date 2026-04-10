@@ -1117,9 +1117,10 @@ bool JoinFilterPushdownInfo::CanUseBloomFilter(const ClientContext &context, con
 	return true;
 }
 
-bool JoinFilterPushdownInfo::CanUsePrefixRangeFilter(ClientContext &context, optional_ptr<JoinHashTable> ht,
-                                                     const PhysicalComparisonJoin &op, const ExpressionType &cmp,
-                                                     const Value &min, const Value &max) const {
+bool JoinFilterPushdownInfo::TryPlanPrefixRangeFilter(ClientContext &context, optional_ptr<JoinHashTable> ht,
+                                                      const PhysicalComparisonJoin &op, const ExpressionType &cmp,
+                                                      const Value &min, const Value &max,
+                                                      PrefixRangeFilter::Sizing &sizing) const {
 	if (!CanUseBloomFilter(context, op, cmp, ht)) {
 		return false;
 	}
@@ -1129,28 +1130,29 @@ bool JoinFilterPushdownInfo::CanUsePrefixRangeFilter(ClientContext &context, opt
 		return false;
 	}
 
-	static constexpr idx_t BUILD_SIZE_THRESHOLD = 524288;
-	bool ht_is_small = ht->Count() <= BUILD_SIZE_THRESHOLD;
-	bool span_is_small = false;
-
-	uhugeint_t span;
-	if (PrefixRangeFilter::TryComputeSpan(min, max, span)) {
-		if (span == 0) {
-			// Filter will not be more expressive than min/max, bail
-			return false;
-		}
-		static const auto SPAN_THRESHOLD = Uhugeint::Convert(1048576);
-		span_is_small = span <= SPAN_THRESHOLD;
-	} else {
-		return false;
-	}
-
-	if (!ht_is_small && !span_is_small) {
-		return false;
-	}
-
 	const auto &key_type = ht->conditions[0].GetLHS().GetReturnType();
-	return PrefixRangeFilter::SupportedType(key_type);
+	if (!PrefixRangeTableFilter::SupportedType(key_type)) {
+		return false;
+	}
+
+	if (!PrefixRangeFilter::TryComputeSizing(min, max, ht->Count(), sizing)) {
+		return false;
+	}
+
+	idx_t bucket_count;
+	if (!PrefixRangeFilter::TryComputeBucketCount(sizing.span, sizing.shift, bucket_count)) {
+		return false;
+	}
+
+	static constexpr idx_t BUCKET_COUNT_THRESHOLD = 1 << 23;
+	if (bucket_count <= BUCKET_COUNT_THRESHOLD) {
+		return true;
+	}
+
+	static constexpr double BITS_PER_VALUE_THRESHOLD = 12;
+	static constexpr idx_t BITMAP_BIT_THRESHOLD = idx_t(1) << 32;
+	const auto bits_per_value = static_cast<double>(bucket_count) / static_cast<double>(ht->Count());
+	return bits_per_value <= BITS_PER_VALUE_THRESHOLD && bucket_count < BITMAP_BIT_THRESHOLD;
 }
 
 static unique_ptr<ExpressionFilter> CreateSelectivityOptionalExpressionFilter(unique_ptr<Expression> child_expr,
@@ -1202,11 +1204,12 @@ void JoinFilterPushdownInfo::PushPerfectHashJoinFilter(const PhysicalOperator &o
 void JoinFilterPushdownInfo::RegisterPrefixRangeFilter(const JoinFilterPushdownFilter &info, ClientContext &context,
                                                        JoinHashTable &ht, const PhysicalOperator &op,
                                                        ProjectionIndex filter_col_idx, const Value &min_val,
-                                                       const Value &max_val) const {
+                                                       const Value &max_val,
+                                                       const PrefixRangeFilter::Sizing &sizing) const {
 	const auto key_type = ht.conditions[0].GetLHS().GetReturnType();
 	if (!ht.GetPrefixRangeFilter()) {
 		auto prefix_filter = PrefixRangeFilter::CreatePrefixRangeFilter(key_type);
-		prefix_filter->Initialize(context, ht.Count(), min_val, max_val);
+		prefix_filter->Initialize(context, ht.Count(), min_val, max_val, sizing);
 		ht.SetPrefixRangeFilter(std::move(prefix_filter));
 		ht.SetBuildPrefixRangeFilter();
 	}
@@ -1362,13 +1365,16 @@ JoinFilterPushdownInfo::FinalizeFilters(ClientContext &context, const PhysicalCo
 
 				if (runtime_filter_type_matches && perfect_join_executor) {
 					PushPerfectHashJoinFilter(op, *perfect_join_executor, info, filter_col_idx);
-				} else if (runtime_filter_type_matches &&
-				           CanUsePrefixRangeFilter(context, ht, op, cmp, min_val_before_cast, max_val_before_cast)) {
-					// It's important that these get the min/max val before casting
-					RegisterPrefixRangeFilter(info, context, *ht, op, filter_col_idx, min_val_before_cast,
-					                          max_val_before_cast);
-				} else if (runtime_filter_type_matches && ht && CanUseBloomFilter(context, op, cmp, ht)) {
-					PushBloomFilter(op, *ht, info, filter_col_idx);
+				} else if (runtime_filter_type_matches) {
+					PrefixRangeFilter::Sizing prefix_range_sizing;
+					if (TryPlanPrefixRangeFilter(context, ht, op, cmp, min_val_before_cast, max_val_before_cast,
+					                             prefix_range_sizing)) {
+						// It's important that these get the min/max val before casting
+						RegisterPrefixRangeFilter(info, context, *ht, op, filter_col_idx, min_val_before_cast,
+						                          max_val_before_cast, prefix_range_sizing);
+					} else if (ht && CanUseBloomFilter(context, op, cmp, ht)) {
+						PushBloomFilter(op, *ht, info, filter_col_idx);
+					}
 				}
 			}
 		}
