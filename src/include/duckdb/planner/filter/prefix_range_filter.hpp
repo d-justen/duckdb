@@ -53,7 +53,7 @@ public:
 	virtual bool IsInitialized() const = 0;
 	static unique_ptr<PrefixRangeFilter> CreatePrefixRangeFilter(const LogicalType &key_type);
 	static bool TryComputeSpan(const Value &lower_bound, const Value &upper_bound, uhugeint_t &result);
-	static bool TryComputeSizing(const Value &min, const Value &max, idx_t count, Sizing &sizing, double fpr = 0.01);
+	static bool TryComputeSizing(const Value &min, const Value &max, idx_t count, Sizing &sizing, double fpr = 0.001);
 	static bool TryComputeBucketCount(const uhugeint_t &span, idx_t shift, idx_t &bucket_count);
 	static double ComputeFalsePositiveRateUpperBound(const uhugeint_t &span, idx_t count, idx_t shift);
 };
