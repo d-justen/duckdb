@@ -63,6 +63,21 @@ struct PushdownFilterTarget {
 	vector<JoinFilterPushdownColumn> columns;
 };
 
+enum class PrefixRangeFilterPlanType : uint8_t { NONE, EXACT, FIXED_SIZE_APPROXIMATE };
+
+struct PrefixRangeFilterPlan {
+	PrefixRangeFilterPlanType type = PrefixRangeFilterPlanType::NONE;
+	PrefixRangeFilter::Sizing sizing;
+
+	bool HasFilter() const {
+		return type != PrefixRangeFilterPlanType::NONE;
+	}
+
+	bool NeedsPostBuildAnalysis() const {
+		return type == PrefixRangeFilterPlanType::FIXED_SIZE_APPROXIMATE;
+	}
+};
+
 struct JoinFilterPushdownUtil {
 	static bool PushdownJoinFilterExpression(const Expression &expr, JoinFilterPushdownColumn &filter);
 	static bool JoinTypeIsSupported(JoinType join_type);
@@ -98,19 +113,19 @@ private:
 	                  idx_t filter_idx, ProjectionIndex filter_col_idx) const;
 
 	void PushBloomFilter(const PhysicalOperator &op, JoinHashTable &ht, const JoinFilterPushdownFilter &info,
-	                     ProjectionIndex filter_col_idx) const;
+	                     ProjectionIndex filter_col_idx, bool build_immediately = true) const;
 	void PushPerfectHashJoinFilter(const PhysicalOperator &op, PerfectHashJoinExecutor &perfect_join_executor,
 	                               const JoinFilterPushdownFilter &info, ProjectionIndex filter_col_idx) const;
 	void RegisterPrefixRangeFilter(const JoinFilterPushdownFilter &info, ClientContext &context, JoinHashTable &ht,
 	                               const PhysicalOperator &op, ProjectionIndex filter_col_idx, const Value &min_val,
-	                               const Value &max_val, const PrefixRangeFilter::Sizing &sizing) const;
+	                               const Value &max_val, const PrefixRangeFilterPlan &plan) const;
 
 	bool CanUseInFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht, const ExpressionType &cmp) const;
 	bool CanUseBloomFilter(const ClientContext &context, const PhysicalComparisonJoin &op, const ExpressionType &cmp,
 	                       optional_ptr<JoinHashTable> ht = nullptr) const;
-	bool TryPlanPrefixRangeFilter(ClientContext &context, optional_ptr<JoinHashTable> ht,
-	                              const PhysicalComparisonJoin &op, const ExpressionType &cmp, const Value &min,
-	                              const Value &max, PrefixRangeFilter::Sizing &sizing) const;
+	PrefixRangeFilterPlan PlanPrefixRangeFilter(ClientContext &context, optional_ptr<JoinHashTable> ht,
+	                                            const PhysicalComparisonJoin &op, const ExpressionType &cmp,
+	                                            const Value &min, const Value &max) const;
 };
 
 } // namespace duckdb

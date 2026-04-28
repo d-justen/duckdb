@@ -164,6 +164,15 @@ public:
 		return initialized;
 	}
 
+	PrefixRangeFilter::Analysis Analyze(idx_t key_count) const {
+		idx_t active_buckets = 0;
+		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
+			active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(bitmap[word_idx]));
+		}
+		return {active_buckets, PrefixRangeFilter::EstimateFalsePositiveRate(Uhugeint::Convert(span), key_count,
+		                                                                     active_buckets, shift)};
+	}
+
 	U Min() const {
 		return min;
 	}
@@ -274,6 +283,10 @@ public:
 		return bitmap.IsInitialized();
 	}
 
+	Analysis Analyze(idx_t key_count) const override {
+		return bitmap.Analyze(key_count);
+	}
+
 private:
 	PrefixRangeBitmap<Comparable> bitmap;
 };
@@ -330,6 +343,10 @@ public:
 
 	bool IsInitialized() const override {
 		return bitmap.IsInitialized();
+	}
+
+	Analysis Analyze(idx_t key_count) const override {
+		return bitmap.Analyze(key_count);
 	}
 
 private:
@@ -389,6 +406,30 @@ double PrefixRangeFilter::ComputeFalsePositiveRateUpperBound(const uhugeint_t &s
 	const auto denominator = Uhugeint::Cast<double>(span - Uhugeint::Convert(count));
 	D_ASSERT(denominator > 0);
 	return numerator / denominator;
+}
+
+double PrefixRangeFilter::EstimateFalsePositiveRate(const uhugeint_t &span, idx_t key_count, idx_t active_buckets,
+                                                    idx_t shift) {
+	if (key_count == 0) {
+		return 0;
+	}
+	const auto total_values = span + 1;
+	if (Uhugeint::LessThanEquals(total_values, Uhugeint::Convert(key_count))) {
+		return 0;
+	}
+	D_ASSERT(shift >= 0);
+	const auto bucket_width = uhugeint_t(1) << uhugeint_t(UnsafeNumericCast<uint64_t>(shift));
+	auto covered_values = Uhugeint::Convert(active_buckets) * bucket_width;
+	if (Uhugeint::GreaterThan(covered_values, total_values)) {
+		covered_values = total_values;
+	}
+	if (Uhugeint::LessThanEquals(covered_values, Uhugeint::Convert(key_count))) {
+		return 0;
+	}
+	// TODO: Adjust this estimate for duplicate build-side keys.
+	const auto false_positives = covered_values - Uhugeint::Convert(key_count);
+	const auto negative_values = total_values - Uhugeint::Convert(key_count);
+	return Uhugeint::Cast<double>(false_positives) / Uhugeint::Cast<double>(negative_values);
 }
 
 unique_ptr<PrefixRangeFilter> PrefixRangeFilter::CreatePrefixRangeFilter(const LogicalType &key_type) {
@@ -479,6 +520,25 @@ bool PrefixRangeFilter::TryComputeSizing(const Value &min, const Value &max, idx
 	return true;
 }
 
+bool PrefixRangeFilter::TryComputeFixedSizeSizing(const Value &min, const Value &max, idx_t bucket_count_limit,
+                                                  Sizing &sizing) {
+	if (bucket_count_limit == 0) {
+		return false;
+	}
+	if (!TryComputeSpan(min, max, sizing.span)) {
+		return false;
+	}
+	if (sizing.span == 0) {
+		return false;
+	}
+	sizing.shift = 0;
+	idx_t bucket_count;
+	while (TryComputeBucketCount(sizing.span, sizing.shift, bucket_count) && bucket_count > bucket_count_limit) {
+		sizing.shift++;
+	}
+	return TryComputeBucketCount(sizing.span, sizing.shift, bucket_count) && bucket_count <= bucket_count_limit;
+}
+
 bool PrefixRangeTableFilter::SupportedType(const LogicalType &type) {
 	switch (type.InternalType()) {
 	case PhysicalType::UINT8:
@@ -514,7 +574,7 @@ string PrefixRangeTableFilter::ToString(const string &column_name) const {
 
 idx_t PrefixRangeTableFilter::Filter(Vector &keys, SelectionVector &sel, idx_t &approved_tuple_count,
                                      JoinFilterTableFilterState &state) const {
-	if (!filter || !filter->IsInitialized()) {
+	if (!filter || !filter->IsInitialized() || !filter->AllowsTupleFiltering()) {
 		return approved_tuple_count;
 	}
 
@@ -543,7 +603,7 @@ idx_t PrefixRangeTableFilter::Filter(Vector &keys, SelectionVector &sel, idx_t &
 }
 
 bool PrefixRangeTableFilter::FilterValue(const Value &value) const {
-	if (!filter || !filter->IsInitialized()) {
+	if (!filter || !filter->IsInitialized() || !filter->AllowsTupleFiltering()) {
 		return true;
 	}
 

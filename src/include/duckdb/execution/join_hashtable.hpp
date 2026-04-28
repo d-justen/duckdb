@@ -219,6 +219,7 @@ public:
 	//! ever called.
 	void Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel,
 	              optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state = nullptr);
+	void BuildBloomFilter(idx_t chunk_idx_from, idx_t chunk_idx_to);
 	//! Probe the HT with the given input chunk, resulting in the given result
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
 	           optional_ptr<Vector> precomputed_hashes = nullptr);
@@ -425,6 +426,8 @@ private:
 
 	unique_ptr<PrefixRangeFilter> prefix_range_filter;
 	bool should_build_prefix_range_filter = false;
+	bool should_analyze_prefix_range_filter = false;
+	double prefix_range_filter_false_positive_rate_threshold = 0.0;
 
 	//! Copying not allowed
 	JoinHashTable(const JoinHashTable &) = delete;
@@ -519,6 +522,11 @@ public:
 		should_build_prefix_range_filter = true;
 	}
 
+	void SetAnalyzePrefixRangeFilter(double false_positive_rate_threshold) {
+		should_analyze_prefix_range_filter = true;
+		prefix_range_filter_false_positive_rate_threshold = false_positive_rate_threshold;
+	}
+
 	optional_ptr<PrefixRangeFilter> GetPrefixRangeFilter() {
 		return prefix_range_filter;
 	}
@@ -526,6 +534,12 @@ public:
 	bool ShouldBuildPrefixRangeFilter() const {
 		return should_build_prefix_range_filter && prefix_range_filter;
 	}
+
+	bool ShouldAnalyzePrefixRangeFilter() const {
+		return should_analyze_prefix_range_filter && prefix_range_filter;
+	}
+
+	bool AnalyzePrefixRangeFilter();
 
 	unique_ptr<PrefixRangeFilter::BuildState> InitializePrefixRangeBuildState();
 	void InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx_t count, PrefixRangeFilter::BuildState &state);

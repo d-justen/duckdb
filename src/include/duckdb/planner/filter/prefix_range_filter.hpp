@@ -28,6 +28,11 @@ public:
 		idx_t shift;
 	};
 
+	struct Analysis {
+		idx_t active_buckets;
+		double false_positive_rate;
+	};
+
 	struct BuildState {
 		virtual ~BuildState() = default;
 		template <class TARGET>
@@ -51,11 +56,25 @@ public:
 	virtual idx_t LookupKeys(Vector &keys, SelectionVector &result_sel, idx_t count) const = 0;
 	virtual FilterPropagateResult LookupRange(const Value &lower_bound, const Value &upper_bound) const = 0;
 	virtual bool IsInitialized() const = 0;
+	virtual Analysis Analyze(idx_t key_count) const = 0;
 	static unique_ptr<PrefixRangeFilter> CreatePrefixRangeFilter(const LogicalType &key_type);
 	static bool TryComputeSpan(const Value &lower_bound, const Value &upper_bound, uhugeint_t &result);
 	static bool TryComputeSizing(const Value &min, const Value &max, idx_t count, Sizing &sizing, double fpr = 0.001);
+	static bool TryComputeFixedSizeSizing(const Value &min, const Value &max, idx_t bucket_count_limit, Sizing &sizing);
 	static bool TryComputeBucketCount(const uhugeint_t &span, idx_t shift, idx_t &bucket_count);
 	static double ComputeFalsePositiveRateUpperBound(const uhugeint_t &span, idx_t count, idx_t shift);
+	static double EstimateFalsePositiveRate(const uhugeint_t &span, idx_t key_count, idx_t active_buckets, idx_t shift);
+
+	void SetAllowsTupleFiltering(bool enabled) {
+		allows_tuple_filtering = enabled;
+	}
+
+	bool AllowsTupleFiltering() const {
+		return allows_tuple_filtering;
+	}
+
+protected:
+	bool allows_tuple_filtering = true;
 };
 
 class PrefixRangeTableFilter final : public TableFilter {

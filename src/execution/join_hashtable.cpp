@@ -741,6 +741,26 @@ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataC
 	}
 }
 
+void JoinHashTable::BuildBloomFilter(idx_t chunk_idx_from, idx_t chunk_idx_to) {
+	if (!bloom_filter.IsInitialized()) {
+		bloom_filter.Initialize(context, Count());
+	}
+	Vector hashes(LogicalType::HASH);
+
+	TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, chunk_idx_from,
+	                                chunk_idx_to, false);
+	const auto row_locations = iterator.GetRowLocations();
+
+	do {
+		const auto count = iterator.GetCurrentChunkCount();
+		auto hash_data = FlatVector::GetDataMutable<hash_t>(hashes);
+		for (idx_t i = 0; i < count; i++) {
+			hash_data[i] = Load<hash_t>(row_locations[i] + pointer_offset);
+		}
+		bloom_filter.InsertHashes(hashes, count);
+	} while (iterator.Next());
+}
+
 unique_ptr<PrefixRangeFilter::BuildState> JoinHashTable::InitializePrefixRangeBuildState() {
 	D_ASSERT(prefix_range_filter);
 	return prefix_range_filter->InitializeBuildState(context);
@@ -759,6 +779,18 @@ void JoinHashTable::InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx
 void JoinHashTable::MergePrefixRangeBuildState(PrefixRangeFilter::BuildState &state) {
 	D_ASSERT(prefix_range_filter);
 	prefix_range_filter->MergeBuildState(state);
+}
+
+bool JoinHashTable::AnalyzePrefixRangeFilter() {
+	if (!ShouldAnalyzePrefixRangeFilter()) {
+		return false;
+	}
+	D_ASSERT(prefix_range_filter);
+	const auto analysis = prefix_range_filter->Analyze(Count());
+	const bool exceeds_threshold = analysis.false_positive_rate > prefix_range_filter_false_positive_rate_threshold;
+	prefix_range_filter->SetAllowsTupleFiltering(!exceeds_threshold);
+	should_analyze_prefix_range_filter = false;
+	return exceeds_threshold;
 }
 
 void JoinHashTable::AllocatePointerTable() {

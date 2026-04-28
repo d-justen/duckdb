@@ -118,6 +118,7 @@
 #include "duckdb/execution/index/unbound_index.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_option.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_state.hpp"
+#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte_state.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_table_scan_enum.hpp"
@@ -4161,6 +4162,25 @@ PragmaType EnumUtil::FromString<PragmaType>(const char *value) {
 	return static_cast<PragmaType>(StringUtil::StringToEnum(GetPragmaTypeValues(), 2, "PragmaType", value));
 }
 
+const StringUtil::EnumStringLiteral *GetPrefixRangeFilterPlanTypeValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(PrefixRangeFilterPlanType::NONE), "NONE" },
+		{ static_cast<uint32_t>(PrefixRangeFilterPlanType::EXACT), "EXACT" },
+		{ static_cast<uint32_t>(PrefixRangeFilterPlanType::FIXED_SIZE_APPROXIMATE), "FIXED_SIZE_APPROXIMATE" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<PrefixRangeFilterPlanType>(PrefixRangeFilterPlanType value) {
+	return StringUtil::EnumToString(GetPrefixRangeFilterPlanTypeValues(), 3, "PrefixRangeFilterPlanType", static_cast<uint32_t>(value));
+}
+
+template<>
+PrefixRangeFilterPlanType EnumUtil::FromString<PrefixRangeFilterPlanType>(const char *value) {
+	return static_cast<PrefixRangeFilterPlanType>(StringUtil::StringToEnum(GetPrefixRangeFilterPlanTypeValues(), 3, "PrefixRangeFilterPlanType", value));
+}
+
 const StringUtil::EnumStringLiteral *GetPreparedParamTypeValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(PreparedParamType::AUTO_INCREMENT), "AUTO_INCREMENT" },
@@ -6081,4 +6101,3 @@ WindowMergeSortStage EnumUtil::FromString<WindowMergeSortStage>(const char *valu
 }
 
 }
-

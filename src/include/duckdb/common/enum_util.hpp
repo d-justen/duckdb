@@ -366,6 +366,8 @@ enum class PhysicalType : uint8_t;
 
 enum class PragmaType : uint8_t;
 
+enum class PrefixRangeFilterPlanType : uint8_t;
+
 enum class PreparedParamType : uint8_t;
 
 enum class PreparedStatementMode : uint8_t;
@@ -1041,6 +1043,9 @@ const char* EnumUtil::ToChars<PhysicalType>(PhysicalType value);
 
 template<>
 const char* EnumUtil::ToChars<PragmaType>(PragmaType value);
+
+template<>
+const char* EnumUtil::ToChars<PrefixRangeFilterPlanType>(PrefixRangeFilterPlanType value);
 
 template<>
 const char* EnumUtil::ToChars<PreparedParamType>(PreparedParamType value);
@@ -1804,6 +1809,9 @@ PhysicalType EnumUtil::FromString<PhysicalType>(const char *value);
 
 template<>
 PragmaType EnumUtil::FromString<PragmaType>(const char *value);
+
+template<>
+PrefixRangeFilterPlanType EnumUtil::FromString<PrefixRangeFilterPlanType>(const char *value);
 
 template<>
 PreparedParamType EnumUtil::FromString<PreparedParamType>(const char *value);
