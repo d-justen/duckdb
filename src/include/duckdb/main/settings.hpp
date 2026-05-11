@@ -872,6 +872,26 @@ struct EnableHTTPMetadataCacheSetting {
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
+struct EnableJoinBloomFilterPushdownSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_join_bloom_filter_pushdown";
+	static constexpr const char *Description = "Whether bloom filters may be pushed down from hash joins";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
+struct EnableJoinMinMaxFilterPushdownSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_join_min_max_filter_pushdown";
+	static constexpr const char *Description = "Whether min/max filters may be pushed down from hash joins";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
 struct EnableLogging {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "enable_logging";
@@ -900,6 +920,16 @@ struct EnableObjectCacheSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "false";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
+struct EnablePerfectHashJoinFilterPushdownSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_perfect_hash_join_filter_pushdown";
+	static constexpr const char *Description = "Whether perfect hash join filters may be pushed down from hash joins";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 

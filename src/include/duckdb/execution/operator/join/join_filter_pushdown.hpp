@@ -83,6 +83,29 @@ struct JoinFilterPushdownUtil {
 	static bool JoinTypeIsSupported(JoinType join_type);
 };
 
+struct JoinFilterPushdownSettings {
+	bool enable_min_max_filter_pushdown = true;
+	bool enable_bloom_filter_pushdown = true;
+	bool enable_prefix_range_filter_pushdown = true;
+	bool enable_perfect_hash_join_filter_pushdown = true;
+};
+
+enum class JoinFilterSummaryPlanType : uint8_t {
+	NONE,
+	SINGLE_VALUE,
+	MIN_MAX,
+	MIN_MAX_AND_BLOOM,
+	IN_FILTER,
+	PERFECT_HASH_JOIN,
+	PREFIX_RANGE,
+	PREFIX_RANGE_WITH_FALLBACKS
+};
+
+struct JoinFilterSummaryPlan {
+	JoinFilterSummaryPlanType type = JoinFilterSummaryPlanType::NONE;
+	PrefixRangeFilterPlan prefix_range_plan;
+};
+
 struct JoinFilterPushdownInfo {
 	//! The join condition indexes for which we compute the min/max aggregates
 	vector<idx_t> join_condition;
@@ -109,6 +132,7 @@ public:
 	                                      optional_ptr<PerfectHashJoinExecutor> perfect_join_executor = nullptr) const;
 
 private:
+	JoinFilterPushdownSettings GetSettings(const ClientContext &context) const;
 	void PushInFilter(const JoinFilterPushdownFilter &info, JoinHashTable &ht, const PhysicalOperator &op,
 	                  idx_t filter_idx, ProjectionIndex filter_col_idx) const;
 
@@ -126,6 +150,10 @@ private:
 	PrefixRangeFilterPlan PlanPrefixRangeFilter(ClientContext &context, optional_ptr<JoinHashTable> ht,
 	                                            const PhysicalComparisonJoin &op, const ExpressionType &cmp,
 	                                            const Value &min, const Value &max) const;
+	JoinFilterSummaryPlan PlanSummaryFilters(const JoinFilterPushdownSettings &settings, ClientContext &context,
+	                                         const PhysicalComparisonJoin &op, const ExpressionType &cmp,
+	                                         const Value &min, const Value &max, optional_ptr<JoinHashTable> ht,
+	                                         optional_ptr<PerfectHashJoinExecutor> perfect_join_executor) const;
 };
 
 } // namespace duckdb

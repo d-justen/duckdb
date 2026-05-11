@@ -1,0 +1,223 @@
+# name: test/sql/join/inner/test_join_filter_pushdown_summary_selection.test
+# description: Test join filter pushdown summary selection and per-filter settings
+# group: [inner]
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+SET disabled_optimizers = 'join_order,build_side_probe_side';
+
+statement ok
+CREATE OR REPLACE TABLE probe_numeric AS
+SELECT i::BIGINT AS k, (i % 7)::INTEGER AS g
+FROM range(0, 100000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE build_numeric AS
+SELECT (i * 2)::BIGINT AS k, (i % 7)::INTEGER AS g
+FROM range(0, 30000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE probe_timestamp_summary AS
+SELECT make_timestamp(i * 1000) AS k, (i % 7)::INTEGER AS g
+FROM range(0, 100000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE build_timestamp_summary AS
+SELECT make_timestamp(i * 2000) AS k, (i % 7)::INTEGER AS g
+FROM range(0, 30000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE probe_in_summary AS
+SELECT i::BIGINT AS k, (i % 5)::INTEGER AS g
+FROM range(0, 1000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE build_in_summary AS
+SELECT * FROM (VALUES (11::BIGINT, 0), (19::BIGINT, 1), (27::BIGINT, 2)) AS t(k, g);
+
+statement ok
+CREATE OR REPLACE TABLE probe_phj_summary AS
+SELECT i::INTEGER AS k
+FROM range(0, 100000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE build_phj_summary AS
+SELECT i::INTEGER AS k
+FROM range(0, 5000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE probe_prf_approx_summary AS
+SELECT (i * 1000000000)::BIGINT AS k, (i % 7)::INTEGER AS g
+FROM range(0, 100000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE build_prf_approx_summary AS
+SELECT (i * 2000000000)::BIGINT AS k, (i % 7)::INTEGER AS g
+FROM range(0, 30000) t(i);
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_in_summary p
+JOIN build_in_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*optional: k IN \(.*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_in_summary p
+JOIN build_in_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*IN BF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_in_summary p
+JOIN build_in_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*IN PRF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_timestamp_summary p
+JOIN build_timestamp_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN BF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_numeric p
+JOIN build_numeric b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN PRF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_phj_summary p
+JOIN build_phj_summary b
+  ON p.k = b.k;
+----
+analyzed_plan	<REGEX>:.*IN PHJ\(k\).*
+
+statement ok
+SET enable_join_min_max_filter_pushdown=false
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_timestamp_summary p
+JOIN build_timestamp_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN BF\(k\).*
+
+statement ok
+RESET enable_join_min_max_filter_pushdown
+
+statement ok
+SET enable_join_bloom_filter_pushdown=false
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_timestamp_summary p
+JOIN build_timestamp_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*IN BF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_numeric p
+JOIN build_numeric b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN PRF\(k\).*
+
+statement ok
+RESET enable_join_bloom_filter_pushdown
+
+statement ok
+SET enable_prefix_range_filter=false
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_numeric p
+JOIN build_numeric b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*IN PRF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_timestamp_summary p
+JOIN build_timestamp_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN BF\(k\).*
+
+statement ok
+RESET enable_prefix_range_filter
+
+statement ok
+SET enable_perfect_hash_join_filter_pushdown=false
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_phj_summary p
+JOIN build_phj_summary b
+  ON p.k = b.k;
+----
+analyzed_plan	<!REGEX>:.*IN PHJ\(k\).*
+
+statement ok
+RESET enable_perfect_hash_join_filter_pushdown
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_prf_approx_summary p
+JOIN build_prf_approx_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN PRF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_prf_approx_summary p
+JOIN build_prf_approx_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN BF\(k\).*
+
+statement ok
+SET disabled_optimizers = '';
