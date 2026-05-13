@@ -196,6 +196,15 @@ JOIN build_phj_summary b
 ----
 analyzed_plan	<!REGEX>:.*IN PHJ\(k\).*
 
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_phj_summary p
+JOIN build_phj_summary b
+  ON p.k = b.k;
+----
+analyzed_plan	<REGEX>:.*IN PRF\(k\).*
+
 statement ok
 RESET enable_perfect_hash_join_filter_pushdown
 

@@ -38,6 +38,8 @@
 
 namespace duckdb {
 
+static constexpr idx_t HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK = 64;
+
 PhysicalHashJoin::PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator &op, PhysicalOperator &left,
                                    PhysicalOperator &right, vector<JoinCondition> conds, JoinType join_type,
                                    const vector<ProjectionIndex> &left_projection_map,
@@ -822,6 +824,92 @@ private:
 	optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state;
 };
 
+static bool NeedsRuntimeJoinFilterBuild(const JoinHashTable &ht) {
+	return ht.ShouldBuildPrefixRangeFilter() || ht.ShouldBuildBloomFilter();
+}
+
+class HashJoinRuntimeFilterTask : public ExecutorTask {
+public:
+	HashJoinRuntimeFilterTask(HashJoinGlobalSinkState &sink_p, shared_ptr<Event> event_p, idx_t chunk_idx_from_p,
+	                          idx_t chunk_idx_to_p, optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state_p,
+	                          bool build_bloom_filter_p)
+	    : ExecutorTask(sink_p.context, std::move(event_p), sink_p.op), sink(sink_p), chunk_idx_from(chunk_idx_from_p),
+	      chunk_idx_to(chunk_idx_to_p), prefix_range_state(prefix_range_state_p),
+	      build_bloom_filter(build_bloom_filter_p) {
+	}
+
+	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		sink.hash_table->BuildRuntimeJoinFilters(chunk_idx_from, chunk_idx_to, prefix_range_state, build_bloom_filter);
+		event->FinishTask();
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+	string TaskType() const override {
+		return "HashJoinRuntimeFilterTask";
+	}
+
+private:
+	HashJoinGlobalSinkState &sink;
+	idx_t chunk_idx_from;
+	idx_t chunk_idx_to;
+	optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state;
+	bool build_bloom_filter;
+};
+
+class HashJoinRuntimeFilterEvent : public BasePipelineEvent {
+public:
+	HashJoinRuntimeFilterEvent(Pipeline &pipeline_p, HashJoinGlobalSinkState &sink_p, bool build_bloom_filter_p = false)
+	    : BasePipelineEvent(pipeline_p), sink(sink_p), build_bloom_filter(build_bloom_filter_p) {
+	}
+
+	void Schedule() override {
+		auto &ht = *sink.hash_table;
+		const auto build_prefix_range_filter = !build_bloom_filter && ht.ShouldBuildPrefixRangeFilter();
+		const auto chunk_count = ht.GetDataCollection().ChunkCount();
+
+		if (build_bloom_filter) {
+			ht.EnsureBloomFilterInitialized();
+		}
+
+		vector<shared_ptr<Task>> filter_tasks;
+		if (FinalizeSingleThreaded(sink, false) || chunk_count <= HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK) {
+			auto prefix_range_state = build_prefix_range_filter ? RegisterPrefixRangeState(ht) : nullptr;
+			filter_tasks.push_back(make_uniq<HashJoinRuntimeFilterTask>(sink, shared_from_this(), 0U, chunk_count,
+			                                                            prefix_range_state, build_bloom_filter));
+		} else {
+			for (idx_t chunk_idx = 0; chunk_idx < chunk_count; chunk_idx += HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK) {
+				auto chunk_idx_to = MinValue<idx_t>(chunk_idx + HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK, chunk_count);
+				auto prefix_range_state = build_prefix_range_filter ? RegisterPrefixRangeState(ht) : nullptr;
+				filter_tasks.push_back(make_uniq<HashJoinRuntimeFilterTask>(
+				    sink, shared_from_this(), chunk_idx, chunk_idx_to, prefix_range_state, build_bloom_filter));
+			}
+		}
+		SetTasks(std::move(filter_tasks));
+	}
+
+	void FinishEvent() override {
+		for (auto &prefix_range_state : prefix_range_states) {
+			sink.hash_table->MergePrefixRangeBuildState(*prefix_range_state);
+		}
+		if (!build_bloom_filter && sink.hash_table->AnalyzePrefixRangeFilter()) {
+			auto bloom_filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(*pipeline, sink, true);
+			this->InsertEvent(std::move(bloom_filter_event));
+			return;
+		}
+		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
+		sink.hash_table->finalized = true;
+	}
+
+private:
+	optional_ptr<PrefixRangeFilter::BuildState> RegisterPrefixRangeState(JoinHashTable &ht) {
+		prefix_range_states.push_back(ht.InitializePrefixRangeBuildState());
+		return *prefix_range_states.back();
+	}
+
+	HashJoinGlobalSinkState &sink;
+	bool build_bloom_filter;
+	vector<unique_ptr<PrefixRangeFilter::BuildState>> prefix_range_states;
+};
+
 class HashJoinFinalizeEvent : public BasePipelineEvent {
 public:
 	HashJoinFinalizeEvent(Pipeline &pipeline_p, HashJoinGlobalSinkState &sink)
@@ -1579,6 +1667,9 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	// In case of a large build side or duplicates, use regular hash join
 	if (!use_perfect_hash) {
 		sink.ScheduleFinalize(pipeline, event);
+	} else if (NeedsRuntimeJoinFilterBuild(ht)) {
+		auto runtime_filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(pipeline, sink);
+		event.InsertEvent(std::move(runtime_filter_event));
 	}
 	sink.finalized = true;
 	if (ht.Count() == 0 && EmptyResultIfRHSIsEmpty()) {
@@ -1992,8 +2083,8 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 		if (KeysAreSkewed(sink)) {
 			build_chunks_per_thread = build_chunk_count; // This forces single-threaded building
 		} else {
-			build_chunks_per_thread = // Same task size as in HashJoinFinalizeEvent
-			    MaxValue<idx_t>(MinValue(build_chunk_count, HashJoinFinalizeEvent::CHUNKS_PER_TASK), 1);
+			build_chunks_per_thread =
+			    MaxValue<idx_t>(MinValue(build_chunk_count, HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK), 1);
 		}
 	}
 

@@ -219,6 +219,9 @@ public:
 	//! ever called.
 	void Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel,
 	              optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state = nullptr);
+	void BuildRuntimeJoinFilters(idx_t chunk_idx_from, idx_t chunk_idx_to,
+	                             optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state = nullptr,
+	                             bool build_bloom_filter = false);
 	void BuildBloomFilter(idx_t chunk_idx_from, idx_t chunk_idx_to);
 	//! Probe the HT with the given input chunk, resulting in the given result
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
@@ -508,6 +511,14 @@ public:
 
 	void SetBuildBloomFilter(const bool should_build) {
 		this->should_build_bloom_filter = should_build;
+	}
+	bool ShouldBuildBloomFilter() const {
+		return should_build_bloom_filter;
+	}
+	void EnsureBloomFilterInitialized() {
+		if (!bloom_filter.IsInitialized()) {
+			bloom_filter.Initialize(context, Count());
+		}
 	}
 
 	BloomFilter &GetBloomFilter() {

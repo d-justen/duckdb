@@ -742,22 +742,38 @@ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataC
 }
 
 void JoinHashTable::BuildBloomFilter(idx_t chunk_idx_from, idx_t chunk_idx_to) {
-	if (!bloom_filter.IsInitialized()) {
+	BuildRuntimeJoinFilters(chunk_idx_from, chunk_idx_to, nullptr, true);
+}
+
+void JoinHashTable::BuildRuntimeJoinFilters(idx_t chunk_idx_from, idx_t chunk_idx_to,
+                                            optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state,
+                                            bool build_bloom_filter) {
+	if (build_bloom_filter && !bloom_filter.IsInitialized()) {
 		bloom_filter.Initialize(context, Count());
 	}
 	Vector hashes(LogicalType::HASH);
 
+	TupleDataChunkState chunk_state;
 	TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, chunk_idx_from,
 	                                chunk_idx_to, false);
 	const auto row_locations = iterator.GetRowLocations();
 
 	do {
 		const auto count = iterator.GetCurrentChunkCount();
-		auto hash_data = FlatVector::GetDataMutable<hash_t>(hashes);
+		auto chunk_row_locations = FlatVector::GetDataMutable<data_ptr_t>(chunk_state.row_locations);
 		for (idx_t i = 0; i < count; i++) {
-			hash_data[i] = Load<hash_t>(row_locations[i] + pointer_offset);
+			chunk_row_locations[i] = row_locations[i];
 		}
-		bloom_filter.InsertHashes(hashes, count);
+		if (prefix_range_state) {
+			InsertPrefixRangeChunk(chunk_state, count, *prefix_range_state);
+		}
+		if (build_bloom_filter) {
+			auto hash_data = FlatVector::GetDataMutable<hash_t>(hashes);
+			for (idx_t i = 0; i < count; i++) {
+				hash_data[i] = Load<hash_t>(row_locations[i] + pointer_offset);
+			}
+			bloom_filter.InsertHashes(hashes, count);
+		}
 	} while (iterator.Next());
 }
 
@@ -800,10 +816,6 @@ void JoinHashTable::AllocatePointerTable() {
 	constexpr uint64_t MAX_HASHTABLE_CAPACITY = (1ULL << 48) - 1;
 	if (capacity >= MAX_HASHTABLE_CAPACITY) {
 		throw InternalException("Hashtable capacity exceeds 48-bit limit (2^48 - 1)");
-	}
-
-	if (should_build_bloom_filter) {
-		bloom_filter.Initialize(context, Count());
 	}
 
 	if (hash_map.get()) {
