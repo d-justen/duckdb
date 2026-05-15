@@ -1,0 +1,202 @@
+# name: test/sql/join/inner/test_join_filter_pushdown_precedence.test
+# description: Test dynamic join filter precedence and min/max fallback behavior
+# group: [inner]
+
+statement ok
+SET disabled_optimizers = 'join_order,build_side_probe_side';
+
+statement ok
+CREATE OR REPLACE TABLE precedence_probe AS
+SELECT i::INTEGER AS k
+FROM range(0, 100000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE precedence_build AS
+SELECT i::INTEGER AS k, 'v' || i::VARCHAR AS payload
+FROM range(0, 30000) t(i);
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_probe p
+JOIN precedence_build b
+  ON p.k = b.k;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*IN PRF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_probe p
+JOIN precedence_build b
+  ON p.k = b.k;
+----
+analyzed_plan	<!REGEX>:.*Dynamic Filters:.*IN PHJ\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_probe p
+JOIN precedence_build b
+  ON p.k = b.k;
+----
+analyzed_plan	<!REGEX>:.*Dynamic Filters:.*k >= 0.*
+
+statement ok
+CREATE OR REPLACE TABLE precedence_probe_huge AS
+SELECT i::HUGEINT AS k
+FROM range(0, 100000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE precedence_build_huge AS
+SELECT i::HUGEINT AS k, 'v' || i::VARCHAR AS payload
+FROM range(0, 30000) t(i);
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_probe_huge p
+JOIN precedence_build_huge b
+  ON p.k = b.k;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*IN PHJ\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_probe_huge p
+JOIN precedence_build_huge b
+  ON p.k = b.k;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*k >= 0.*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_probe_huge p
+JOIN precedence_build_huge b
+  ON p.k = b.k;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*k <= 29999.*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_probe_huge p
+JOIN precedence_build_huge b
+  ON p.k = b.k;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*IN PHJ\(k\).*(k >= 0).*(k <= 29999).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_probe_huge p
+JOIN precedence_build_huge b
+  ON p.k = b.k;
+----
+analyzed_plan	<!REGEX>:.*Dynamic Filters:.*IN PRF\(k\).*
+
+statement ok
+CREATE OR REPLACE TABLE precedence_singleton_build AS
+SELECT 42::INTEGER AS k, 'only' AS payload;
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_probe p
+JOIN precedence_singleton_build b
+  ON p.k = b.k;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*\(k = 42\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_probe p
+JOIN precedence_singleton_build b
+  ON p.k = b.k;
+----
+analyzed_plan	<!REGEX>:.*Dynamic Filters:.*k >= 42.*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_probe p
+JOIN precedence_singleton_build b
+  ON p.k = b.k;
+----
+analyzed_plan	<!REGEX>:.*Dynamic Filters:.*IN PRF\(k\).*
+
+statement ok
+CREATE OR REPLACE TABLE precedence_bloom_probe AS
+SELECT i::HUGEINT AS k, (i % 7)::INTEGER AS g
+FROM range(0, 100000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE precedence_bloom_build AS
+SELECT (i * 2)::HUGEINT AS k, (i % 7)::INTEGER AS g
+FROM range(0, 30000) t(i);
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_bloom_probe p
+JOIN precedence_bloom_build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*IN BF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_bloom_probe p
+JOIN precedence_bloom_build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*k >= 0.*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_bloom_probe p
+JOIN precedence_bloom_build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*k <= 59998.*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_bloom_probe p
+JOIN precedence_bloom_build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*IN BF\(k\).*(k >= 0).*(k <= 59998).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_bloom_probe p
+JOIN precedence_bloom_build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*Dynamic Filters:.*IN PHJ\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM precedence_bloom_probe p
+JOIN precedence_bloom_build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*Dynamic Filters:.*IN PRF\(k\).*
+
+statement ok
+SET disabled_optimizers = '';

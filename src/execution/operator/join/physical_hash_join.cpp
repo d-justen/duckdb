@@ -1272,6 +1272,8 @@ unique_ptr<DataChunk>
 JoinFilterPushdownInfo::FinalizeFilters(ClientContext &context, const PhysicalComparisonJoin &op,
                                         unique_ptr<DataChunk> final_min_max, optional_ptr<JoinHashTable> ht,
                                         optional_ptr<PerfectHashJoinExecutor> perfect_join_executor) const {
+	enum class SelectedFilterType : uint8_t { NONE, IN, PREFIX_RANGE, PERFECT_HASH_JOIN, BLOOM };
+
 	if (probe_info.empty()) {
 		return final_min_max; // There are no table sources in which we can push down filters
 	}
@@ -1316,11 +1318,6 @@ JoinFilterPushdownInfo::FinalizeFilters(ClientContext &context, const PhysicalCo
 				runtime_filter_type_matches = condition_type == ht->conditions[0].GetLHS().GetReturnType();
 			}
 
-			// if the HT is small we can generate a complete "OR" filter
-			// but only if the join condition is equality.
-			if (ht && CanUseInFilter(context, ht, cmp)) {
-				PushInFilter(info, *ht, op, filter_idx, filter_col_idx);
-			}
 			if (Value::NotDistinctFrom(min_val, max_val)) {
 				// min = max - single value
 				// generate a "one-sided" comparison filter for the LHS
@@ -1329,46 +1326,60 @@ JoinFilterPushdownInfo::FinalizeFilters(ClientContext &context, const PhysicalCo
 				    op, filter_col_idx,
 				    make_uniq<ExpressionFilter>(CreateComparisonExpressionFilter(cmp, min_val, condition_type)));
 			} else {
-				// min != max - generate a range filter or bloom filter + optional range filter
-				// for non-equalities, the range must be half-open
-				// e.g., for lhs < rhs we can only use lhs <= max
-				switch (cmp) {
-				case ExpressionType::COMPARE_EQUAL:
-				case ExpressionType::COMPARE_GREATERTHAN:
-				case ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
-					CreateDynamicMinMaxFilter(
-					    op, info, filter_col_idx,
-					    CreateComparisonExpressionFilter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, min_val,
-					                                     condition_type),
-					    condition_type);
-					break;
-				}
-				default:
-					break;
-				}
-				switch (cmp) {
-				case ExpressionType::COMPARE_EQUAL:
-				case ExpressionType::COMPARE_LESSTHAN:
-				case ExpressionType::COMPARE_LESSTHANOREQUALTO: {
-					CreateDynamicMinMaxFilter(op, info, filter_col_idx,
-					                          CreateComparisonExpressionFilter(
-					                              ExpressionType::COMPARE_LESSTHANOREQUALTO, max_val, condition_type),
-					                          condition_type);
-					break;
-				}
-				default:
-					break;
-				}
+				SelectedFilterType selected_filter_type = SelectedFilterType::NONE;
 
-				if (runtime_filter_type_matches && perfect_join_executor) {
-					PushPerfectHashJoinFilter(op, *perfect_join_executor, info, filter_col_idx);
+				// if the HT is small we can generate a complete "OR" filter,
+				// but only if the join condition is equality.
+				if (ht && CanUseInFilter(context, ht, cmp)) {
+					PushInFilter(info, *ht, op, filter_idx, filter_col_idx);
+					selected_filter_type = SelectedFilterType::IN;
 				} else if (runtime_filter_type_matches &&
 				           CanUsePrefixRangeFilter(context, ht, op, cmp, min_val_before_cast, max_val_before_cast)) {
 					// It's important that these get the min/max val before casting
 					RegisterPrefixRangeFilter(info, context, *ht, op, filter_col_idx, min_val_before_cast,
 					                          max_val_before_cast);
+					selected_filter_type = SelectedFilterType::PREFIX_RANGE;
+				} else if (runtime_filter_type_matches && perfect_join_executor) {
+					PushPerfectHashJoinFilter(op, *perfect_join_executor, info, filter_col_idx);
+					selected_filter_type = SelectedFilterType::PERFECT_HASH_JOIN;
 				} else if (runtime_filter_type_matches && ht && CanUseBloomFilter(context, op, cmp, ht)) {
 					PushBloomFilter(op, *ht, info, filter_col_idx);
+					selected_filter_type = SelectedFilterType::BLOOM;
+				}
+
+				if (selected_filter_type == SelectedFilterType::NONE ||
+				    selected_filter_type == SelectedFilterType::PERFECT_HASH_JOIN ||
+				    selected_filter_type == SelectedFilterType::BLOOM) {
+					// for non-equalities, the range must be half-open
+					// e.g., for lhs < rhs we can only use lhs <= max
+					switch (cmp) {
+					case ExpressionType::COMPARE_EQUAL:
+					case ExpressionType::COMPARE_GREATERTHAN:
+					case ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
+						CreateDynamicMinMaxFilter(
+						    op, info, filter_col_idx,
+						    CreateComparisonExpressionFilter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, min_val,
+						                                     condition_type),
+						    condition_type);
+						break;
+					}
+					default:
+						break;
+					}
+					switch (cmp) {
+					case ExpressionType::COMPARE_EQUAL:
+					case ExpressionType::COMPARE_LESSTHAN:
+					case ExpressionType::COMPARE_LESSTHANOREQUALTO: {
+						CreateDynamicMinMaxFilter(
+						    op, info, filter_col_idx,
+						    CreateComparisonExpressionFilter(ExpressionType::COMPARE_LESSTHANOREQUALTO, max_val,
+						                                     condition_type),
+						    condition_type);
+						break;
+					}
+					default:
+						break;
+					}
 				}
 			}
 		}
