@@ -65,7 +65,7 @@ JOIN build_in_summary b
   ON p.k = b.k
  AND p.g >= b.g;
 ----
-analyzed_plan	<REGEX>:.*optional: k IN \(.*
+analyzed_plan	<REGEX>:.*optional: \(?k IN \(.*
 
 query II
 EXPLAIN ANALYZE

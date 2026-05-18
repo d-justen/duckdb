@@ -13,7 +13,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/column_binding.hpp"
 #include "duckdb/planner/expression.hpp"
-#include "duckdb/planner/filter/prefix_range_filter.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
 namespace duckdb {

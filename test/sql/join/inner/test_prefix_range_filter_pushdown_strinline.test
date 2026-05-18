@@ -63,7 +63,7 @@ JOIN prf_build_string b
   ON p.k = b.k
  AND p.g >= b.g;
 ----
-analyzed_plan	<REGEX>:.*optional: k IN \(.*
+analyzed_plan	<REGEX>:.*optional: \(?k IN \(.*
 
 query II
 EXPLAIN ANALYZE
@@ -103,7 +103,7 @@ JOIN prf_build_string_long b
   ON p.k = b.k
  AND p.g >= b.g;
 ----
-analyzed_plan	<REGEX>:.*optional: k IN \(.*
+analyzed_plan	<REGEX>:.*optional: \(?k IN \(.*
 
 query II
 EXPLAIN ANALYZE
@@ -216,7 +216,7 @@ JOIN prf_build_string_nul_stats b
   ON p.k = b.k
  AND p.g >= b.g;
 ----
-analyzed_plan	<REGEX>:.*optional: k IN \(.*
+analyzed_plan	<REGEX>:.*optional: \(?k IN \(.*
 
 query II
 EXPLAIN ANALYZE

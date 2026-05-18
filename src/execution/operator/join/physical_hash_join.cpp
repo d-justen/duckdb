@@ -1237,7 +1237,7 @@ PrefixRangeFilterPlan JoinFilterPushdownInfo::PlanPrefixRangeFilter(ClientContex
 	}
 
 	const auto &key_type = ht->conditions[0].GetLHS().GetReturnType();
-	if (!PrefixRangeTableFilter::SupportedType(key_type)) {
+	if (!PrefixRangeFilter::SupportedType(key_type)) {
 		return result;
 	}
 
@@ -1325,10 +1325,18 @@ void JoinFilterPushdownInfo::PushBloomFilter(const PhysicalOperator &op, JoinHas
 	const auto key_name = ht.conditions[0].GetRHS().ToString();
 	const auto key_type = ht.conditions[0].GetLHS().GetReturnType();
 	ht.SetBuildBloomFilter(build_immediately);
-	auto filter =
-	    make_uniq_base<TableFilter, BFTableFilter>(ht.GetBloomFilter(), filters_null_values, key_name, key_type);
-	filter = make_uniq<SelectivityOptionalFilter>(std::move(filter), SelectivityOptionalFilterType::BF);
-	info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(filter));
+	float selectivity_threshold;
+	idx_t n_vectors_to_check;
+	GetThresholdAndVectorsToCheck(SelectivityOptionalFilterType::BF, selectivity_threshold, n_vectors_to_check);
+	vector<unique_ptr<Expression>> children;
+	children.push_back(make_uniq<BoundReferenceExpression>(key_type, idx_t(0)));
+	auto filter_expr = make_uniq<BoundFunctionExpression>(
+	    BoundScalarFunction(BloomFilterScalarFun::GetFunction(key_type)), std::move(children),
+	    make_uniq<BloomFilterFunctionData>(ht.GetBloomFilter(), filters_null_values, key_name, key_type,
+	                                       selectivity_threshold, n_vectors_to_check));
+	info.dynamic_filters->PushFilter(
+	    op, filter_col_idx,
+	    CreateSelectivityOptionalExpressionFilter(std::move(filter_expr), key_type, SelectivityOptionalFilterType::BF));
 }
 
 void JoinFilterPushdownInfo::PushPerfectHashJoinFilter(const PhysicalOperator &op,
@@ -1428,12 +1436,15 @@ static unique_ptr<Expression> CreateComparisonExpressionFilter(ExpressionType co
 static void CreateDynamicMinMaxFilters(const PhysicalComparisonJoin &op, const JoinFilterPushdownFilter &info,
                                        const ProjectionIndex &filter_col_idx, const ExpressionType &cmp,
                                        const Value &min_val, const Value &max_val) {
+	const auto condition_type = min_val.type();
 	switch (cmp) {
 	case ExpressionType::COMPARE_EQUAL:
 	case ExpressionType::COMPARE_GREATERTHAN:
 	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
-		CreateDynamicMinMaxFilter(op, info, filter_col_idx,
-		                          make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, min_val));
+		CreateDynamicMinMaxFilter(
+		    op, info, filter_col_idx,
+		    CreateComparisonExpressionFilter(ExpressionType::COMPARE_GREATERTHANOREQUALTO, min_val, condition_type),
+		    condition_type);
 		break;
 	}
 	default:
@@ -1443,8 +1454,10 @@ static void CreateDynamicMinMaxFilters(const PhysicalComparisonJoin &op, const J
 	case ExpressionType::COMPARE_EQUAL:
 	case ExpressionType::COMPARE_LESSTHAN:
 	case ExpressionType::COMPARE_LESSTHANOREQUALTO: {
-		CreateDynamicMinMaxFilter(op, info, filter_col_idx,
-		                          make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, max_val));
+		CreateDynamicMinMaxFilter(
+		    op, info, filter_col_idx,
+		    CreateComparisonExpressionFilter(ExpressionType::COMPARE_LESSTHANOREQUALTO, max_val, condition_type),
+		    condition_type);
 		break;
 	}
 	default:
@@ -1511,7 +1524,9 @@ JoinFilterPushdownInfo::FinalizeFilters(ClientContext &context, const PhysicalCo
 			case JoinFilterSummaryPlanType::NONE:
 				break;
 			case JoinFilterSummaryPlanType::SINGLE_VALUE:
-				info.dynamic_filters->PushFilter(op, filter_col_idx, make_uniq<ConstantFilter>(cmp, min_val));
+				info.dynamic_filters->PushFilter(
+				    op, filter_col_idx,
+				    make_uniq<ExpressionFilter>(CreateComparisonExpressionFilter(cmp, min_val, min_val.type())));
 				break;
 			case JoinFilterSummaryPlanType::MIN_MAX:
 				CreateDynamicMinMaxFilters(op, info, filter_col_idx, cmp, min_val, max_val);

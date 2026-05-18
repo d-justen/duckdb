@@ -164,7 +164,7 @@ static idx_t BloomFilterSelect(DataChunk &args, ExpressionState &state, optional
 	auto tracking_state = local_state_ptr ? &local_state_ptr->Cast<SelectivityTrackingLocalState>() : nullptr;
 
 	auto count = args.size();
-	if (!func_data.filter) {
+	if (!func_data.filter || !func_data.filter->IsInitialized()) {
 		return SetAllTrueSelection(count, sel, true_sel, false_sel);
 	}
 	if (tracking_state && !tracking_state->IsActive()) {
