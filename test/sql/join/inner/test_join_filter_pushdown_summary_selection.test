@@ -119,6 +119,9 @@ analyzed_plan	<REGEX>:.*IN PHJ\(k\).*
 statement ok
 SET enable_join_min_max_filter_pushdown=false
 
+statement ok
+SET enable_prefix_range_filter=false
+
 query II
 EXPLAIN ANALYZE
 SELECT count(*)
@@ -128,6 +131,39 @@ JOIN build_timestamp_summary b
  AND p.g >= b.g;
 ----
 analyzed_plan	<REGEX>:.*IN BF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_timestamp_summary p
+JOIN build_timestamp_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*optional: .*>=.*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_timestamp_summary p
+JOIN build_timestamp_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*optional: .*<=.*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_timestamp_summary p
+JOIN build_timestamp_summary b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*IN PRF\(k\).*
+
+statement ok
+RESET enable_prefix_range_filter
 
 statement ok
 RESET enable_join_min_max_filter_pushdown

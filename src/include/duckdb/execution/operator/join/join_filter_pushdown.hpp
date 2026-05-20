@@ -94,6 +94,7 @@ enum class JoinFilterSummaryPlanType : uint8_t {
 	NONE,
 	SINGLE_VALUE,
 	MIN_MAX,
+	BLOOM,
 	MIN_MAX_AND_BLOOM,
 	IN_FILTER,
 	PERFECT_HASH_JOIN,

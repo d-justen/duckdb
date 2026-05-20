@@ -1307,7 +1307,7 @@ JoinFilterPushdownInfo::PlanSummaryFilters(const JoinFilterPushdownSettings &set
 
 	if (settings.enable_bloom_filter_pushdown && ht && CanUseBloomFilter(context, op, cmp, ht)) {
 		result.type = settings.enable_min_max_filter_pushdown ? JoinFilterSummaryPlanType::MIN_MAX_AND_BLOOM
-		                                                      : JoinFilterSummaryPlanType::MIN_MAX_AND_BLOOM;
+		                                                      : JoinFilterSummaryPlanType::BLOOM;
 		return result;
 	}
 
@@ -1530,6 +1530,10 @@ JoinFilterPushdownInfo::FinalizeFilters(ClientContext &context, const PhysicalCo
 				break;
 			case JoinFilterSummaryPlanType::MIN_MAX:
 				CreateDynamicMinMaxFilters(op, info, filter_col_idx, cmp, min_val, max_val);
+				break;
+			case JoinFilterSummaryPlanType::BLOOM:
+				D_ASSERT(runtime_filter_ht);
+				PushBloomFilter(op, *runtime_filter_ht, info, filter_col_idx);
 				break;
 			case JoinFilterSummaryPlanType::MIN_MAX_AND_BLOOM:
 				CreateDynamicMinMaxFilters(op, info, filter_col_idx, cmp, min_val, max_val);

@@ -2739,6 +2739,7 @@ const StringUtil::EnumStringLiteral *GetJoinFilterSummaryPlanTypeValues() {
 		{ static_cast<uint32_t>(JoinFilterSummaryPlanType::NONE), "NONE" },
 		{ static_cast<uint32_t>(JoinFilterSummaryPlanType::SINGLE_VALUE), "SINGLE_VALUE" },
 		{ static_cast<uint32_t>(JoinFilterSummaryPlanType::MIN_MAX), "MIN_MAX" },
+		{ static_cast<uint32_t>(JoinFilterSummaryPlanType::BLOOM), "BLOOM" },
 		{ static_cast<uint32_t>(JoinFilterSummaryPlanType::MIN_MAX_AND_BLOOM), "MIN_MAX_AND_BLOOM" },
 		{ static_cast<uint32_t>(JoinFilterSummaryPlanType::IN_FILTER), "IN_FILTER" },
 		{ static_cast<uint32_t>(JoinFilterSummaryPlanType::PERFECT_HASH_JOIN), "PERFECT_HASH_JOIN" },
@@ -2750,12 +2751,12 @@ const StringUtil::EnumStringLiteral *GetJoinFilterSummaryPlanTypeValues() {
 
 template<>
 const char* EnumUtil::ToChars<JoinFilterSummaryPlanType>(JoinFilterSummaryPlanType value) {
-	return StringUtil::EnumToString(GetJoinFilterSummaryPlanTypeValues(), 8, "JoinFilterSummaryPlanType", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetJoinFilterSummaryPlanTypeValues(), 9, "JoinFilterSummaryPlanType", static_cast<uint32_t>(value));
 }
 
 template<>
 JoinFilterSummaryPlanType EnumUtil::FromString<JoinFilterSummaryPlanType>(const char *value) {
-	return static_cast<JoinFilterSummaryPlanType>(StringUtil::StringToEnum(GetJoinFilterSummaryPlanTypeValues(), 8, "JoinFilterSummaryPlanType", value));
+	return static_cast<JoinFilterSummaryPlanType>(StringUtil::StringToEnum(GetJoinFilterSummaryPlanTypeValues(), 9, "JoinFilterSummaryPlanType", value));
 }
 
 const StringUtil::EnumStringLiteral *GetJoinRefTypeValues() {
