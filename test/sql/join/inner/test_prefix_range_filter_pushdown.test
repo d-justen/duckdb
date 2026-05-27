@@ -138,6 +138,78 @@ analyzed_plan	<!REGEX>:.*IN PRF\(k\).*
 statement ok
 SET disabled_optimizers = '';
 
+statement ok
+SET disabled_optimizers = 'join_order,build_side_probe_side,compressed_materialization'
+
+statement ok
+SET threads=1
+
+statement ok
+SET dynamic_or_filter_threshold=0
+
+statement ok
+SET enable_join_bloom_filter_pushdown=false
+
+statement ok
+SET enable_perfect_hash_join_filter_pushdown=false
+
+statement ok
+CREATE OR REPLACE TABLE prf_selectivity_build AS
+SELECT i::INTEGER AS id, (i <= 5000)::BOOLEAN AS keep
+FROM range(1, 100001) t(i)
+
+statement ok
+CREATE OR REPLACE TABLE prf_selectivity_probe AS
+SELECT (((i * 15485863) % 100000) + 1)::INTEGER AS fk
+FROM range(0, 1000000) t(i)
+
+statement ok
+SET enable_join_min_max_filter_pushdown=false
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM prf_selectivity_probe p
+JOIN prf_selectivity_build b
+  ON p.fk = b.id
+WHERE b.keep;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*fk IN PRF\(id\).*50,000 rows.*
+
+statement ok
+RESET enable_join_min_max_filter_pushdown
+
+statement ok
+SET enable_prefix_range_filter=false
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM prf_selectivity_probe p
+JOIN prf_selectivity_build b
+  ON p.fk = b.id
+WHERE b.keep;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*optional: \(fk >= 1\).*optional: \(fk <= 5000\).*50,000 rows.*
+
+statement ok
+RESET enable_prefix_range_filter
+
+statement ok
+RESET enable_join_bloom_filter_pushdown
+
+statement ok
+RESET enable_perfect_hash_join_filter_pushdown
+
+statement ok
+RESET dynamic_or_filter_threshold
+
+statement ok
+RESET threads
+
+statement ok
+SET disabled_optimizers = '';
+
 foreach type TINYINT SMALLINT INTEGER BIGINT
 
 statement ok

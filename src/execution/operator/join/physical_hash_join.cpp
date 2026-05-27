@@ -922,6 +922,9 @@ public:
 	vector<shared_ptr<Task>> GetTasks() {
 		auto &ht = *sink.hash_table;
 		const auto build_prefix_range_filter = ht.ShouldBuildPrefixRangeFilter();
+		if (ht.ShouldBuildBloomFilter()) {
+			ht.EnsureBloomFilterInitialized();
+		}
 		vector<shared_ptr<Task>> finalize_tasks;
 		if (FinalizeSingleThreaded(sink, false)) {
 			auto prefix_range_state = build_prefix_range_filter ? RegisterPrefixRangeState(ht) : nullptr;
@@ -946,6 +949,9 @@ public:
 
 	void ExecuteDirectly() {
 		auto &ht = *sink.hash_table;
+		if (ht.ShouldBuildBloomFilter()) {
+			ht.EnsureBloomFilterInitialized();
+		}
 		auto prefix_range_state = ht.ShouldBuildPrefixRangeFilter() ? RegisterPrefixRangeState(ht) : nullptr;
 		ExecuteHashJoinFinalizeTask(sink, optional_idx(), prefix_range_state);
 		FinishTasks(false);
@@ -1333,7 +1339,7 @@ void JoinFilterPushdownInfo::PushBloomFilter(const PhysicalOperator &op, JoinHas
 	auto filter_expr = make_uniq<BoundFunctionExpression>(
 	    BoundScalarFunction(BloomFilterScalarFun::GetFunction(key_type)), std::move(children),
 	    make_uniq<BloomFilterFunctionData>(ht.GetBloomFilter(), filters_null_values, key_name, key_type,
-	                                       selectivity_threshold, n_vectors_to_check));
+	                                       selectivity_threshold, 0));
 	info.dynamic_filters->PushFilter(
 	    op, filter_col_idx,
 	    CreateSelectivityOptionalExpressionFilter(std::move(filter_expr), key_type, SelectivityOptionalFilterType::BF));
@@ -1382,8 +1388,7 @@ void JoinFilterPushdownInfo::RegisterPrefixRangeFilter(const JoinFilterPushdownF
 	children.push_back(make_uniq<BoundReferenceExpression>(key_type, idx_t(0)));
 	auto filter_expr = make_uniq<BoundFunctionExpression>(
 	    BoundScalarFunction(PrefixRangeScalarFun::GetFunction(key_type)), std::move(children),
-	    make_uniq<PrefixRangeFunctionData>(ht.GetPrefixRangeFilter(), key_name, key_type, selectivity_threshold,
-	                                       n_vectors_to_check));
+	    make_uniq<PrefixRangeFunctionData>(ht.GetPrefixRangeFilter(), key_name, key_type, selectivity_threshold, 0));
 	info.dynamic_filters->PushFilter(op, filter_col_idx,
 	                                 CreateSelectivityOptionalExpressionFilter(std::move(filter_expr), key_type,
 	                                                                           SelectivityOptionalFilterType::PRF));

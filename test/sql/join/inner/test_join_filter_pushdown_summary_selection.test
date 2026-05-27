@@ -57,6 +57,16 @@ CREATE OR REPLACE TABLE build_prf_approx_summary AS
 SELECT (i * 2000000000)::BIGINT AS k, (i % 7)::INTEGER AS g
 FROM range(0, 30000) t(i);
 
+statement ok
+CREATE OR REPLACE TABLE probe_bloom_selectivity_summary AS
+SELECT ('k' || ((((i * 15485863) % 100000) + 1)::VARCHAR)) AS k
+FROM range(0, 1000000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE build_bloom_selectivity_summary AS
+SELECT ('k' || i::VARCHAR) AS k, (i <= 5000)::BOOLEAN AS keep
+FROM range(1, 100001) t(i);
+
 query II
 EXPLAIN ANALYZE
 SELECT count(*)
@@ -193,6 +203,47 @@ analyzed_plan	<REGEX>:.*IN PRF\(k\).*
 
 statement ok
 RESET enable_join_bloom_filter_pushdown
+
+statement ok
+SET enable_prefix_range_filter=false
+
+statement ok
+SET enable_join_min_max_filter_pushdown=false
+
+statement ok
+SET enable_perfect_hash_join_filter_pushdown=false
+
+statement ok
+SET dynamic_or_filter_threshold=0
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_bloom_selectivity_summary p
+JOIN build_bloom_selectivity_summary b
+  ON p.k = b.k
+WHERE b.keep;
+----
+analyzed_plan	<REGEX>:.*optional: k IN BF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_bloom_selectivity_summary p
+JOIN build_bloom_selectivity_summary b
+  ON p.k = b.k
+WHERE b.keep;
+----
+analyzed_plan	<!REGEX>:.*1,000,000 rows.*
+
+statement ok
+RESET dynamic_or_filter_threshold
+
+statement ok
+RESET enable_perfect_hash_join_filter_pushdown
+
+statement ok
+RESET enable_join_min_max_filter_pushdown
 
 statement ok
 SET enable_prefix_range_filter=false

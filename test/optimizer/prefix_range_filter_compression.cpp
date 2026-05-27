@@ -138,3 +138,30 @@ TEST_CASE("Prefix range filter FPR analysis is conservative for duplicate build 
 	REQUIRE(analysis.active_buckets == 4);
 	REQUIRE(analysis.false_positive_rate > 0.9);
 }
+
+TEST_CASE("Prefix range filter optional selectivity threshold is lower than min max", "[optimizer]") {
+	static constexpr idx_t DOMAIN_SIZE = 100000;
+	static constexpr idx_t CONTIGUOUS_RANGE_SIZE = 83886;
+
+	float prf_threshold;
+	idx_t prf_vectors_to_check;
+	GetThresholdAndVectorsToCheck(SelectivityOptionalFilterType::PRF, prf_threshold, prf_vectors_to_check);
+
+	SelectivityOptionalFilterState::SelectivityStats prf_stats(prf_vectors_to_check, prf_threshold);
+	for (idx_t i = 0; i < prf_vectors_to_check; i++) {
+		prf_stats.Update(CONTIGUOUS_RANGE_SIZE, DOMAIN_SIZE);
+	}
+	REQUIRE(prf_stats.GetSelectivity() == Approx(0.83886));
+	REQUIRE(!prf_stats.IsActive());
+
+	float min_max_threshold;
+	idx_t min_max_vectors_to_check;
+	GetThresholdAndVectorsToCheck(SelectivityOptionalFilterType::MIN_MAX, min_max_threshold, min_max_vectors_to_check);
+
+	SelectivityOptionalFilterState::SelectivityStats min_max_stats(min_max_vectors_to_check, min_max_threshold);
+	for (idx_t i = 0; i < min_max_vectors_to_check; i++) {
+		min_max_stats.Update(CONTIGUOUS_RANGE_SIZE, DOMAIN_SIZE);
+	}
+	REQUIRE(min_max_stats.GetSelectivity() == Approx(0.83886));
+	REQUIRE(min_max_stats.IsActive());
+}
