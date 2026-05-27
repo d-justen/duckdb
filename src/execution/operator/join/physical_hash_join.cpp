@@ -1370,10 +1370,8 @@ void JoinFilterPushdownInfo::RegisterPrefixRangeFilter(const JoinFilterPushdownF
 		prefix_filter->Initialize(context, ht.Count(), min_val, max_val, plan.sizing);
 		ht.SetPrefixRangeFilter(std::move(prefix_filter));
 		ht.SetBuildPrefixRangeFilter();
-		if (plan.NeedsPostBuildAnalysis()) {
-			static constexpr double PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD = 0.001;
-			ht.SetAnalyzePrefixRangeFilter(PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD);
-		}
+		static constexpr double PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD = 0.001;
+		ht.SetAnalyzePrefixRangeFilter(PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD);
 	}
 
 	const auto key_name = ht.conditions[0].GetRHS().ToString();

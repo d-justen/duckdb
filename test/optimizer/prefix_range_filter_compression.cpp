@@ -58,6 +58,27 @@ TEST_CASE("Prefix range filter direct compression uses one range for contiguous 
 	}
 }
 
+TEST_CASE("Prefix range filter compresses exact threshold bitmap to one direct range", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	static constexpr int32_t KEY_COUNT = 1 << 23;
+	vector<int32_t> keys;
+	keys.reserve(KEY_COUNT);
+	for (int32_t key = 0; key < KEY_COUNT; key++) {
+		keys.push_back(key);
+	}
+
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, KEY_COUNT - 1, 0, 0.001);
+	auto info = filter->GetCompressionInfo();
+	REQUIRE(info.mode == CompressionMode::DIRECT_RANGES);
+	REQUIRE(info.range_count == 1);
+	REQUIRE(info.false_positive_rate == 0);
+	REQUIRE(ContainsKey(*filter, 0));
+	REQUIRE(ContainsKey(*filter, KEY_COUNT - 1));
+	REQUIRE(!ContainsKey(*filter, KEY_COUNT));
+}
+
 TEST_CASE("Prefix range filter direct compression preserves four sparse value ranges", "[optimizer]") {
 	DuckDB db(nullptr);
 	Connection con(db);
