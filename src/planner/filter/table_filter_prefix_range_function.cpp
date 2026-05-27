@@ -207,8 +207,7 @@ public:
 
 	PrefixRangeFilter::CompressionInfo GetCompressionInfo() const {
 		PrefixRangeFilter::CompressionInfo info;
-		info.mode = mode == Mode::DIRECT_RANGES ? PrefixRangeFilter::CompressionMode::DIRECT_RANGES
-		                                        : PrefixRangeFilter::CompressionMode::BITMAP;
+		info.mode = mode == Mode::DIRECT_RANGES ? CompressionMode::DIRECT_RANGES : CompressionMode::BITMAP;
 		info.shift = shift;
 		info.range_count = range_count;
 		info.active_buckets = mode == Mode::DIRECT_RANGES ? active_buckets : CountActiveBuckets();

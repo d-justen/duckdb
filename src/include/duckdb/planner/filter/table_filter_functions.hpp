@@ -138,6 +138,8 @@ struct PerfectHashJoinFunctionData : public FunctionData {
 	bool Equals(const FunctionData &other) const override;
 };
 
+enum class CompressionMode : uint8_t { BITMAP, DIRECT_RANGES };
+
 //! Runtime prefix-range filter state used by join pushdown and internal tablefilter functions.
 class PrefixRangeFilter {
 public:
@@ -150,8 +152,6 @@ public:
 		idx_t active_buckets;
 		double false_positive_rate;
 	};
-
-	enum class CompressionMode : uint8_t { BITMAP, DIRECT_RANGES };
 
 	struct CompressionInfo {
 		CompressionMode mode = CompressionMode::BITMAP;

@@ -50,7 +50,7 @@ TEST_CASE("Prefix range filter direct compression uses one range for contiguous 
 
 	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 100, 199, 0, 0);
 	auto info = filter->GetCompressionInfo();
-	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::DIRECT_RANGES);
+	REQUIRE(info.mode == CompressionMode::DIRECT_RANGES);
 	REQUIRE(info.range_count == 1);
 	REQUIRE(info.false_positive_rate == 0);
 	for (auto key : keys) {
@@ -71,7 +71,7 @@ TEST_CASE("Prefix range filter direct compression preserves four sparse value ra
 
 	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 709, 0, 0);
 	auto info = filter->GetCompressionInfo();
-	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::DIRECT_RANGES);
+	REQUIRE(info.mode == CompressionMode::DIRECT_RANGES);
 	REQUIRE(info.range_count == 4);
 	REQUIRE(info.false_positive_rate == 0);
 	for (auto key : keys) {
@@ -93,7 +93,7 @@ TEST_CASE("Prefix range filter falls back to dyadic compression when four ranges
 
 	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 64, 0, 0.34);
 	auto info = filter->GetCompressionInfo();
-	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::BITMAP);
+	REQUIRE(info.mode == CompressionMode::BITMAP);
 	REQUIRE(info.shift == 1);
 	REQUIRE(info.false_positive_rate <= 0.34);
 	for (auto key : keys) {
