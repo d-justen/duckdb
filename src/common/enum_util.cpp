@@ -1263,6 +1263,24 @@ CompressedMaterializationDirection EnumUtil::FromString<CompressedMaterializatio
 	return static_cast<CompressedMaterializationDirection>(StringUtil::StringToEnum(GetCompressedMaterializationDirectionValues(), 3, "CompressedMaterializationDirection", value));
 }
 
+const StringUtil::EnumStringLiteral *GetCompressionModeValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(CompressionMode::BITMAP), "BITMAP" },
+		{ static_cast<uint32_t>(CompressionMode::DIRECT_RANGES), "DIRECT_RANGES" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<CompressionMode>(CompressionMode value) {
+	return StringUtil::EnumToString(GetCompressionModeValues(), 2, "CompressionMode", static_cast<uint32_t>(value));
+}
+
+template<>
+CompressionMode EnumUtil::FromString<CompressionMode>(const char *value) {
+	return static_cast<CompressionMode>(StringUtil::StringToEnum(GetCompressionModeValues(), 2, "CompressionMode", value));
+}
+
 const StringUtil::EnumStringLiteral *GetCompressionTypeValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(CompressionType::COMPRESSION_AUTO), "AUTO" },

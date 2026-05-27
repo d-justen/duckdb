@@ -151,6 +151,16 @@ public:
 		double false_positive_rate;
 	};
 
+	enum class CompressionMode : uint8_t { BITMAP, DIRECT_RANGES };
+
+	struct CompressionInfo {
+		CompressionMode mode = CompressionMode::BITMAP;
+		idx_t shift = 0;
+		idx_t range_count = 0;
+		idx_t active_buckets = 0;
+		double false_positive_rate = 0;
+	};
+
 	struct BuildState {
 		virtual ~BuildState() = default;
 		template <class TARGET>
@@ -176,6 +186,8 @@ public:
 	virtual FilterPropagateResult LookupRange(const Value &lower_bound, const Value &upper_bound) const = 0;
 	virtual bool IsInitialized() const = 0;
 	virtual Analysis Analyze(idx_t key_count) const = 0;
+	virtual void Compress(ClientContext &context, double max_false_positive_rate) = 0;
+	virtual CompressionInfo GetCompressionInfo() const = 0;
 	static bool SupportedType(const LogicalType &type);
 	static unique_ptr<PrefixRangeFilter> CreatePrefixRangeFilter(const LogicalType &key_type);
 	static bool TryComputeSpan(const Value &lower_bound, const Value &upper_bound, uhugeint_t &result);

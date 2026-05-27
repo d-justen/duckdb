@@ -13,6 +13,8 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 
+#include <algorithm>
+
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/array.hpp"
 #include "duckdb/common/assert.hpp"
@@ -66,9 +68,12 @@ public:
 		shift = shift_p;
 
 		const idx_t buckets = UnsafeNumericCast<idx_t>((span >> shift) + 1);
+		logical_bucket_count = buckets;
 		word_count = buckets == 0 ? 1 : (buckets + 63) >> WORD_SHIFT;
 
 		buf_ = AllocateBitmap(context, word_count, bitmap);
+		mode = Mode::BITMAP;
+		range_count = 0;
 
 		// Only mark initialized as true when local bitmaps are merged.
 		initialized = false;
@@ -106,8 +111,11 @@ public:
 
 		const U comparable = CONVERTER::Convert(value.GetValueUnsafe<T>());
 		const U y = comparable - min;
-		const U bit_idx = y >> shift;
 		const uint8_t in_range = y <= span;
+		if (mode == Mode::DIRECT_RANGES) {
+			return DirectRangeLookup(comparable) & in_range;
+		}
+		const U bit_idx = ShiftRight(y, shift);
 		const uint32_t word_idx = (bit_idx >> WORD_SHIFT) & (0U - in_range);
 		const uint8_t bit = (bitmap[word_idx] >> (bit_idx & WORD_MASK)) & 1ULL;
 		return bit & in_range;
@@ -115,28 +123,28 @@ public:
 
 	template <typename T, typename CONVERTER>
 	idx_t LookupKeys(Vector &keys, SelectionVector &result_sel, idx_t count) const {
-		idx_t found_count = 0;
-		for (const auto &entry : keys.template ValidValues<T>()) {
-			const U comparable = CONVERTER::Convert(entry.GetValue());
-			const U y = comparable - min;
-			const U bit_idx = y >> shift;
-			const uint8_t in_range = y <= span;
-			const uint32_t word_idx = (bit_idx >> WORD_SHIFT) & (0U - in_range);
-			const uint8_t bit = (bitmap[word_idx] >> (bit_idx & WORD_MASK)) & 1ULL;
-
-			result_sel.set_index(found_count, entry.GetIndex());
-			found_count += bit & in_range;
+		if (mode == Mode::DIRECT_RANGES) {
+			return LookupKeysDirect<T, CONVERTER>(keys, result_sel, count);
 		}
-		return found_count;
+		return LookupKeysBitmap<T, CONVERTER>(keys, result_sel, count);
 	}
 
 	FilterPropagateResult LookupRange(U lower_bound, U upper_bound) const {
+		if (mode == Mode::DIRECT_RANGES) {
+			for (idx_t range_idx = 0; range_idx < range_count; range_idx++) {
+				if (lower_bound <= ranges[range_idx].upper && upper_bound >= ranges[range_idx].lower) {
+					return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+				}
+			}
+			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+		}
+
 		const U lb_y = lower_bound - min;
-		const U lb_bit_idx = lb_y >> shift;
+		const U lb_bit_idx = ShiftRight(lb_y, shift);
 		const auto lb_word_idx = lb_bit_idx >> WORD_SHIFT;
 
 		const U ub_y = upper_bound - min;
-		const U ub_bit_idx = ub_y >> shift;
+		const U ub_bit_idx = ShiftRight(ub_y, shift);
 		const auto ub_word_idx = ub_bit_idx >> WORD_SHIFT;
 
 		const idx_t lb_bit_off = UnsafeNumericCast<idx_t>(lb_bit_idx & UnsafeNumericCast<U>(WORD_MASK));
@@ -175,13 +183,40 @@ public:
 		return initialized;
 	}
 
-	PrefixRangeFilter::Analysis Analyze(idx_t key_count) const {
-		idx_t active_buckets = 0;
-		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
-			active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(bitmap[word_idx]));
+	PrefixRangeFilter::Analysis Analyze(idx_t) const {
+		if (mode == Mode::DIRECT_RANGES) {
+			return {active_buckets, direct_false_positive_rate};
 		}
-		return {active_buckets, PrefixRangeFilter::EstimateFalsePositiveRate(Uhugeint::Convert(span), key_count,
-		                                                                     active_buckets, shift)};
+
+		const auto current_active_buckets = CountActiveBuckets();
+		return {current_active_buckets,
+		        ConservativeFalsePositiveRate(Uhugeint::Convert(current_active_buckets) * BucketWidth(),
+		                                      current_active_buckets)};
+	}
+
+	void Compress(ClientContext &context, double max_false_positive_rate) {
+		if (!initialized || mode != Mode::BITMAP || max_false_positive_rate < 0) {
+			return;
+		}
+		active_buckets = CountActiveBuckets();
+		if (TryCompressToDirectRanges(max_false_positive_rate)) {
+			return;
+		}
+		TryCompressDyadically(context, max_false_positive_rate);
+	}
+
+	PrefixRangeFilter::CompressionInfo GetCompressionInfo() const {
+		PrefixRangeFilter::CompressionInfo info;
+		info.mode = mode == Mode::DIRECT_RANGES ? PrefixRangeFilter::CompressionMode::DIRECT_RANGES
+		                                        : PrefixRangeFilter::CompressionMode::BITMAP;
+		info.shift = shift;
+		info.range_count = range_count;
+		info.active_buckets = mode == Mode::DIRECT_RANGES ? active_buckets : CountActiveBuckets();
+		info.false_positive_rate =
+		    mode == Mode::DIRECT_RANGES
+		        ? direct_false_positive_rate
+		        : ConservativeFalsePositiveRate(Uhugeint::Convert(info.active_buckets) * BucketWidth(), info.active_buckets);
+		return info;
 	}
 
 	U Min() const {
@@ -195,12 +230,388 @@ public:
 private:
 	static constexpr idx_t WORD_SHIFT = 6;
 	static constexpr idx_t WORD_MASK = 63;
+	static constexpr idx_t MAX_DIRECT_RANGES = 4;
+	static constexpr idx_t MAX_DIRECT_GAPS = MAX_DIRECT_RANGES - 1;
+
+	enum class Mode : uint8_t { BITMAP, DIRECT_RANGES };
+
+	struct DirectRange {
+		U lower;
+		U upper;
+	};
+
+	struct Gap {
+		idx_t start;
+		idx_t length;
+	};
+
+	struct BitmapStorage {
+		AllocatedData data;
+		uint64_t *bitmap = nullptr;
+	};
+
+	template <typename T, typename CONVERTER>
+	idx_t LookupKeysBitmap(Vector &keys, SelectionVector &result_sel, idx_t count) const {
+		idx_t found_count = 0;
+		for (const auto &entry : keys.template ValidValues<T>()) {
+			const U comparable = CONVERTER::Convert(entry.GetValue());
+			const U y = comparable - min;
+			const uint8_t in_range = y <= span;
+			const U bit_idx = ShiftRight(y, shift);
+			const uint32_t word_idx = (bit_idx >> WORD_SHIFT) & (0U - in_range);
+			const uint8_t bit = (bitmap[word_idx] >> (bit_idx & WORD_MASK)) & 1ULL;
+
+			result_sel.set_index(found_count, entry.GetIndex());
+			found_count += bit & in_range;
+		}
+		return found_count;
+	}
+
+	template <typename T, typename CONVERTER>
+	idx_t LookupKeysDirect(Vector &keys, SelectionVector &result_sel, idx_t count) const {
+		switch (range_count) {
+		case 1:
+			return LookupKeysDirect<T, CONVERTER, 1>(keys, result_sel, count);
+		case 2:
+			return LookupKeysDirect<T, CONVERTER, 2>(keys, result_sel, count);
+		case 3:
+			return LookupKeysDirect<T, CONVERTER, 3>(keys, result_sel, count);
+		case 4:
+			return LookupKeysDirect<T, CONVERTER, 4>(keys, result_sel, count);
+		default:
+			return 0;
+		}
+	}
+
+	template <typename T, typename CONVERTER, idx_t RANGE_COUNT>
+	idx_t LookupKeysDirect(Vector &keys, SelectionVector &result_sel, idx_t count) const {
+		idx_t found_count = 0;
+		for (const auto &entry : keys.template ValidValues<T>()) {
+			const U comparable = CONVERTER::Convert(entry.GetValue());
+			const U y = comparable - min;
+			const uint8_t in_range = y <= span;
+			const uint8_t bit = DirectRangeLookup<RANGE_COUNT>(comparable);
+
+			result_sel.set_index(found_count, entry.GetIndex());
+			found_count += bit & in_range;
+		}
+		return found_count;
+	}
+
+	static U ShiftRight(U value, idx_t shift_p) {
+		if (shift_p >= UnsafeNumericCast<idx_t>(sizeof(U) * 8)) {
+			return 0;
+		}
+		return value >> shift_p;
+	}
+
+	static bool IsGapLarger(const Gap &lhs, const Gap &rhs) {
+		if (lhs.length != rhs.length) {
+			return lhs.length > rhs.length;
+		}
+		return lhs.start < rhs.start;
+	}
+
+	static uint64_t MaskForValidBits(idx_t valid_bits) {
+		if (valid_bits >= 64) {
+			return ~0ULL;
+		}
+		if (valid_bits == 0) {
+			return 0;
+		}
+		return (1ULL << valid_bits) - 1ULL;
+	}
+
+	static uint64_t PackMergedPairsTo32(uint64_t word) {
+		uint64_t merged = (word | (word >> 1)) & 0x5555555555555555ULL;
+		merged = (merged | (merged >> 1)) & 0x3333333333333333ULL;
+		merged = (merged | (merged >> 2)) & 0x0F0F0F0F0F0F0F0FULL;
+		merged = (merged | (merged >> 4)) & 0x00FF00FF00FF00FFULL;
+		merged = (merged | (merged >> 8)) & 0x0000FFFF0000FFFFULL;
+		merged = (merged | (merged >> 16)) & 0x00000000FFFFFFFFULL;
+		return merged;
+	}
+
+	static void MaybeInsertTopGap(array<Gap, MAX_DIRECT_GAPS> &top_gaps, idx_t &top_gap_count, Gap candidate) {
+		if (candidate.length == 0) {
+			return;
+		}
+		if (top_gap_count < MAX_DIRECT_GAPS) {
+			top_gaps[top_gap_count++] = candidate;
+		} else {
+			idx_t smallest_idx = 0;
+			for (idx_t i = 1; i < top_gap_count; i++) {
+				if (IsGapLarger(top_gaps[smallest_idx], top_gaps[i])) {
+					smallest_idx = i;
+				}
+			}
+			if (!IsGapLarger(candidate, top_gaps[smallest_idx])) {
+				return;
+			}
+			top_gaps[smallest_idx] = candidate;
+		}
+		std::sort(top_gaps.begin(), top_gaps.begin() + top_gap_count,
+		          [](const Gap &lhs, const Gap &rhs) { return IsGapLarger(lhs, rhs); });
+	}
+
+	static idx_t TopGapLengthSum(const array<Gap, MAX_DIRECT_GAPS> &top_gaps, idx_t top_gap_count,
+	                             idx_t keep_count) {
+		const auto limit = MinValue<idx_t>(top_gap_count, keep_count);
+		idx_t sum = 0;
+		for (idx_t i = 0; i < limit; i++) {
+			sum += top_gaps[i].length;
+		}
+		return sum;
+	}
+
+	bool ShouldRejectDirectRangeCompression(const array<Gap, MAX_DIRECT_GAPS> &top_gaps, idx_t top_gap_count,
+	                                       idx_t previous_set_bucket, double max_false_positive_rate) const {
+		array<Gap, MAX_DIRECT_GAPS> optimistic_gaps = top_gaps;
+		auto optimistic_gap_count = top_gap_count;
+		if (previous_set_bucket + 1 < logical_bucket_count - 1) {
+			MaybeInsertTopGap(optimistic_gaps, optimistic_gap_count,
+			                  Gap {previous_set_bucket + 1, logical_bucket_count - previous_set_bucket - 2});
+		}
+		const auto removed_buckets = TopGapLengthSum(optimistic_gaps, optimistic_gap_count, MAX_DIRECT_GAPS);
+		const auto covered_buckets = logical_bucket_count - removed_buckets;
+		const auto optimistic_false_positive_rate =
+		    ConservativeFalsePositiveRate(Uhugeint::Convert(covered_buckets) * BucketWidth(), active_buckets);
+		return optimistic_false_positive_rate > max_false_positive_rate;
+	}
+
+	static BitmapStorage AllocateBitmapStorage(ClientContext &context, idx_t words) {
+		BitmapStorage result;
+		result.data = AllocateBitmap(context, words, result.bitmap);
+		return result;
+	}
+
+	idx_t CountActiveBuckets() const {
+		idx_t result = 0;
+		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
+			result += UnsafeNumericCast<idx_t>(__builtin_popcountll(bitmap[word_idx]));
+		}
+		return result;
+	}
+
+	uhugeint_t BucketWidth() const {
+		return uhugeint_t(1) << uhugeint_t(UnsafeNumericCast<uint64_t>(shift));
+	}
+
+	double ConservativeFalsePositiveRate(uhugeint_t covered_values, idx_t positive_lower_bound_p) const {
+		const auto domain_size = Uhugeint::Convert(span) + 1;
+		if (Uhugeint::GreaterThan(covered_values, domain_size)) {
+			covered_values = domain_size;
+		}
+		const auto positive_lower_bound = Uhugeint::Convert(positive_lower_bound_p);
+		if (Uhugeint::LessThanEquals(domain_size, positive_lower_bound) ||
+		    Uhugeint::LessThanEquals(covered_values, positive_lower_bound)) {
+			return 0;
+		}
+		const auto false_positives = covered_values - positive_lower_bound;
+		const auto negative_values = domain_size - positive_lower_bound;
+		return Uhugeint::Cast<double>(false_positives) / Uhugeint::Cast<double>(negative_values);
+	}
+
+	U BucketLowerBound(idx_t bucket_idx) const {
+		if (shift >= UnsafeNumericCast<idx_t>(sizeof(U) * 8)) {
+			return min;
+		}
+		return min + (UnsafeNumericCast<U>(bucket_idx) << shift);
+	}
+
+	U BucketUpperBound(idx_t bucket_idx) const {
+		if (bucket_idx + 1 >= logical_bucket_count) {
+			return min + span;
+		}
+		if (shift >= UnsafeNumericCast<idx_t>(sizeof(U) * 8)) {
+			return min + span;
+		}
+		return min + ((UnsafeNumericCast<U>(bucket_idx + 1) << shift) - 1);
+	}
+
+	template <idx_t RANGE_COUNT>
+	uint8_t DirectRangeLookup(U value) const {
+		uint8_t result = 0;
+		for (idx_t range_idx = 0; range_idx < RANGE_COUNT; range_idx++) {
+			result |= (value >= ranges[range_idx].lower) & (value <= ranges[range_idx].upper);
+		}
+		return result;
+	}
+
+	bool DirectRangeLookup(U value) const {
+		for (idx_t range_idx = 0; range_idx < range_count; range_idx++) {
+			if (value >= ranges[range_idx].lower && value <= ranges[range_idx].upper) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool TryCompressToDirectRanges(double max_false_positive_rate) {
+		if (logical_bucket_count == 0 || active_buckets == 0 || active_buckets > logical_bucket_count) {
+			return false;
+		}
+
+		array<Gap, MAX_DIRECT_GAPS> top_gaps;
+		top_gaps.fill({0, 0});
+		idx_t top_gap_count = 0;
+		bool have_previous_set = false;
+		idx_t previous_set_bucket = 0;
+
+		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
+			const auto word_base = word_idx << WORD_SHIFT;
+			if (word_base >= logical_bucket_count) {
+				break;
+			}
+			const auto valid_bits = MinValue<idx_t>(64, logical_bucket_count - word_base);
+			const uint64_t word = bitmap[word_idx] & MaskForValidBits(valid_bits);
+
+			uint64_t remaining = word;
+			while (remaining != 0) {
+				const auto bit = UnsafeNumericCast<idx_t>(__builtin_ctzll(remaining));
+				const auto bucket = word_base + bit;
+				if (have_previous_set) {
+					MaybeInsertTopGap(top_gaps, top_gap_count,
+					                  Gap {previous_set_bucket + 1, bucket - previous_set_bucket - 1});
+				}
+				have_previous_set = true;
+				previous_set_bucket = bucket;
+				remaining &= remaining - 1;
+			}
+
+			if (have_previous_set &&
+			    ShouldRejectDirectRangeCompression(top_gaps, top_gap_count, previous_set_bucket,
+			                                      max_false_positive_rate)) {
+				return false;
+			}
+		}
+
+		if (!have_previous_set) {
+			return false;
+		}
+
+		for (idx_t direct_range_count = 1; direct_range_count <= MAX_DIRECT_RANGES; direct_range_count++) {
+			const auto kept_gap_count = direct_range_count - 1;
+			const auto actual_kept_gap_count = MinValue<idx_t>(kept_gap_count, top_gap_count);
+			double false_positive_rate;
+			const auto removed_buckets = TopGapLengthSum(top_gaps, top_gap_count, actual_kept_gap_count);
+			const auto covered_buckets = logical_bucket_count - removed_buckets;
+			false_positive_rate =
+			    ConservativeFalsePositiveRate(Uhugeint::Convert(covered_buckets) * BucketWidth(), active_buckets);
+			if (false_positive_rate > max_false_positive_rate) {
+				continue;
+			}
+
+			array<Gap, MAX_DIRECT_GAPS> selected_gaps = top_gaps;
+			std::sort(selected_gaps.begin(), selected_gaps.begin() + actual_kept_gap_count,
+			          [](const Gap &lhs, const Gap &rhs) { return lhs.start < rhs.start; });
+
+			idx_t next_bucket = 0;
+			range_count = 0;
+			for (idx_t gap_idx = 0; gap_idx < actual_kept_gap_count; gap_idx++) {
+				const auto &gap = selected_gaps[gap_idx];
+				if (next_bucket <= gap.start - 1) {
+					ranges[range_count++] = {BucketLowerBound(next_bucket), BucketUpperBound(gap.start - 1)};
+				}
+				next_bucket = gap.start + gap.length;
+			}
+			if (next_bucket < logical_bucket_count) {
+				ranges[range_count++] = {BucketLowerBound(next_bucket), BucketUpperBound(logical_bucket_count - 1)};
+			}
+			if (range_count == 0 || range_count > MAX_DIRECT_RANGES) {
+				return false;
+			}
+			mode = Mode::DIRECT_RANGES;
+			direct_false_positive_rate = false_positive_rate;
+			return true;
+		}
+		return false;
+	}
+
+	idx_t ReduceBitmapDyadically(const uint64_t *source, idx_t source_word_count, idx_t source_logical_bucket_count,
+	                             uint64_t *destination, idx_t destination_word_count) const {
+		const auto next_logical_bucket_count = (source_logical_bucket_count + 1) >> 1;
+		D_ASSERT(destination_word_count == ((next_logical_bucket_count + 63) >> WORD_SHIFT));
+		idx_t next_active_buckets = 0;
+		idx_t dst_word_idx = 0;
+		for (idx_t src_word_idx = 0; dst_word_idx < destination_word_count; src_word_idx += 2, dst_word_idx++) {
+			const uint64_t low = PackMergedPairsTo32(source[src_word_idx]);
+			const uint64_t high = src_word_idx + 1 < source_word_count ? (PackMergedPairsTo32(source[src_word_idx + 1]) << 32)
+			                                                           : 0ULL;
+			const uint64_t packed = low | high;
+			destination[dst_word_idx] = packed;
+			next_active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(packed));
+		}
+		if ((next_logical_bucket_count & WORD_MASK) != 0) {
+			destination[destination_word_count - 1] &= MaskForValidBits(next_logical_bucket_count & WORD_MASK);
+		}
+		return next_active_buckets;
+	}
+
+	void TryCompressDyadically(ClientContext &context, double max_false_positive_rate) {
+		if (logical_bucket_count <= 1) {
+			return;
+		}
+
+		auto current_words = word_count;
+		auto current_logical_buckets = logical_bucket_count;
+		auto current_shift = shift;
+		auto current_bitmap = bitmap;
+
+		BitmapStorage scratch =
+		    AllocateBitmapStorage(context, MaxValue<idx_t>(1, (((current_logical_buckets + 1) >> 1) + 63) >> WORD_SHIFT));
+		BitmapStorage accepted;
+		bool changed = false;
+
+		while (current_logical_buckets > 1) {
+			const auto next_logical_buckets = (current_logical_buckets + 1) >> 1;
+			const auto next_words = (next_logical_buckets + 63) >> WORD_SHIFT;
+			if (scratch.data.GetSize() < next_words * sizeof(uint64_t)) {
+				scratch = AllocateBitmapStorage(context, next_words);
+			}
+			const auto next_active_buckets =
+			    ReduceBitmapDyadically(current_bitmap, current_words, current_logical_buckets, scratch.bitmap, next_words);
+			const auto next_shift = current_shift + 1;
+			const auto previous_shift = shift;
+			shift = next_shift;
+			const auto false_positive_rate =
+			    ConservativeFalsePositiveRate(Uhugeint::Convert(next_active_buckets) * BucketWidth(), active_buckets);
+			shift = previous_shift;
+			if (false_positive_rate > max_false_positive_rate) {
+				break;
+			}
+
+			accepted = AllocateBitmapStorage(context, next_words);
+			std::copy_n(scratch.bitmap, next_words, accepted.bitmap);
+			current_bitmap = accepted.bitmap;
+			current_words = next_words;
+			current_logical_buckets = next_logical_buckets;
+			current_shift = next_shift;
+			changed = true;
+		}
+
+		if (!changed) {
+			return;
+		}
+
+		buf_ = std::move(accepted.data);
+		bitmap = accepted.bitmap;
+		word_count = current_words;
+		logical_bucket_count = current_logical_buckets;
+		shift = current_shift;
+	}
 
 	bool initialized = false;
+	Mode mode = Mode::BITMAP;
 	U min;
 	U span;
 	idx_t shift;
+	idx_t logical_bucket_count;
 	idx_t word_count;
+	idx_t active_buckets = 0;
+	double direct_false_positive_rate = 0;
+	idx_t range_count = 0;
+	array<DirectRange, MAX_DIRECT_RANGES> ranges;
 	AllocatedData buf_;
 	uint64_t *bitmap;
 };
@@ -298,6 +709,14 @@ public:
 		return bitmap.Analyze(key_count);
 	}
 
+	void Compress(ClientContext &context, double max_false_positive_rate) override {
+		bitmap.Compress(context, max_false_positive_rate);
+	}
+
+	CompressionInfo GetCompressionInfo() const override {
+		return bitmap.GetCompressionInfo();
+	}
+
 private:
 	PrefixRangeBitmap<Comparable> bitmap;
 };
@@ -358,6 +777,14 @@ public:
 
 	Analysis Analyze(idx_t key_count) const override {
 		return bitmap.Analyze(key_count);
+	}
+
+	void Compress(ClientContext &context, double max_false_positive_rate) override {
+		bitmap.Compress(context, max_false_positive_rate);
+	}
+
+	CompressionInfo GetCompressionInfo() const override {
+		return bitmap.GetCompressionInfo();
 	}
 
 private:
