@@ -214,7 +214,8 @@ public:
 		info.false_positive_rate =
 		    mode == Mode::DIRECT_RANGES
 		        ? direct_false_positive_rate
-		        : ConservativeFalsePositiveRate(Uhugeint::Convert(info.active_buckets) * BucketWidth(), info.active_buckets);
+		        : ConservativeFalsePositiveRate(Uhugeint::Convert(info.active_buckets) * BucketWidth(),
+		                                        info.active_buckets);
 		return info;
 	}
 
@@ -353,8 +354,7 @@ private:
 		          [](const Gap &lhs, const Gap &rhs) { return IsGapLarger(lhs, rhs); });
 	}
 
-	static idx_t TopGapLengthSum(const array<Gap, MAX_DIRECT_GAPS> &top_gaps, idx_t top_gap_count,
-	                             idx_t keep_count) {
+	static idx_t TopGapLengthSum(const array<Gap, MAX_DIRECT_GAPS> &top_gaps, idx_t top_gap_count, idx_t keep_count) {
 		const auto limit = MinValue<idx_t>(top_gap_count, keep_count);
 		idx_t sum = 0;
 		for (idx_t i = 0; i < limit; i++) {
@@ -364,7 +364,7 @@ private:
 	}
 
 	bool ShouldRejectDirectRangeCompression(const array<Gap, MAX_DIRECT_GAPS> &top_gaps, idx_t top_gap_count,
-	                                       idx_t previous_set_bucket, double max_false_positive_rate) const {
+	                                        idx_t previous_set_bucket, double max_false_positive_rate) const {
 		array<Gap, MAX_DIRECT_GAPS> optimistic_gaps = top_gaps;
 		auto optimistic_gap_count = top_gap_count;
 		if (previous_set_bucket + 1 < logical_bucket_count - 1) {
@@ -478,9 +478,8 @@ private:
 				remaining &= remaining - 1;
 			}
 
-			if (have_previous_set &&
-			    ShouldRejectDirectRangeCompression(top_gaps, top_gap_count, previous_set_bucket,
-			                                      max_false_positive_rate)) {
+			if (have_previous_set && ShouldRejectDirectRangeCompression(top_gaps, top_gap_count, previous_set_bucket,
+			                                                            max_false_positive_rate)) {
 				return false;
 			}
 		}
@@ -535,8 +534,8 @@ private:
 		idx_t dst_word_idx = 0;
 		for (idx_t src_word_idx = 0; dst_word_idx < destination_word_count; src_word_idx += 2, dst_word_idx++) {
 			const uint64_t low = PackMergedPairsTo32(source[src_word_idx]);
-			const uint64_t high = src_word_idx + 1 < source_word_count ? (PackMergedPairsTo32(source[src_word_idx + 1]) << 32)
-			                                                           : 0ULL;
+			const uint64_t high =
+			    src_word_idx + 1 < source_word_count ? (PackMergedPairsTo32(source[src_word_idx + 1]) << 32) : 0ULL;
 			const uint64_t packed = low | high;
 			destination[dst_word_idx] = packed;
 			next_active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(packed));
@@ -557,8 +556,8 @@ private:
 		auto current_shift = shift;
 		auto current_bitmap = bitmap;
 
-		BitmapStorage scratch =
-		    AllocateBitmapStorage(context, MaxValue<idx_t>(1, (((current_logical_buckets + 1) >> 1) + 63) >> WORD_SHIFT));
+		BitmapStorage scratch = AllocateBitmapStorage(
+		    context, MaxValue<idx_t>(1, (((current_logical_buckets + 1) >> 1) + 63) >> WORD_SHIFT));
 		BitmapStorage accepted;
 		bool changed = false;
 
@@ -568,8 +567,8 @@ private:
 			if (scratch.data.GetSize() < next_words * sizeof(uint64_t)) {
 				scratch = AllocateBitmapStorage(context, next_words);
 			}
-			const auto next_active_buckets =
-			    ReduceBitmapDyadically(current_bitmap, current_words, current_logical_buckets, scratch.bitmap, next_words);
+			const auto next_active_buckets = ReduceBitmapDyadically(
+			    current_bitmap, current_words, current_logical_buckets, scratch.bitmap, next_words);
 			const auto next_shift = current_shift + 1;
 			const auto previous_shift = shift;
 			shift = next_shift;
@@ -631,6 +630,13 @@ struct StringPrefixConverter {
 	}
 };
 
+uint32_t StringPrefixComparable(const string_t &value, char padding) {
+	array<char, string_t::PREFIX_BYTES> padded_prefix;
+	padded_prefix.fill(padding);
+	memcpy(padded_prefix.data(), value.GetData(), MinValue<idx_t>(value.GetSize(), string_t::PREFIX_BYTES));
+	return string_t(padded_prefix.data(), string_t::PREFIX_BYTES).GetPrefixIntegerComparable();
+}
+
 uint32_t StringMinComparable(const Value &value) {
 	return StringPrefixConverter::Convert(value.GetValueUnsafe<string_t>());
 }
@@ -642,12 +648,7 @@ uint32_t StringMaxComparable(const Value &value) {
 	}
 
 	// Pad string prefix with 0xFF to keep correctness if max is truncated at \0 char, e.g., ab\0c -> ab
-	array<char, string_t::PREFIX_BYTES> padded_prefix;
-	padded_prefix.fill(char(0xFF));
-	for (idx_t i = 0; i < max_string.GetSize(); i++) {
-		padded_prefix[i] = max_string.GetData()[i];
-	}
-	return string_t(padded_prefix.data(), string_t::PREFIX_BYTES).GetPrefixIntegerComparable();
+	return StringPrefixComparable(max_string, char(0xFF));
 }
 
 template <typename T>
@@ -698,6 +699,18 @@ public:
 		const auto adjusted_lb = NumericConverter<T>::Convert(MaxValue<T>(lb, bitmap_min));
 		const auto adjusted_ub = NumericConverter<T>::Convert(MinValue<T>(ub, bitmap_max));
 		return bitmap.LookupRange(adjusted_lb, adjusted_ub);
+	}
+
+	FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const override {
+		if (stats.GetStatsType() != StatisticsType::NUMERIC_STATS || !NumericStats::HasMinMax(stats)) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+		const auto min = NumericStats::Min(stats);
+		const auto max = NumericStats::Max(stats);
+		if (min > max) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+		return LookupRange(min, max);
 	}
 
 	bool IsInitialized() const override {
@@ -768,6 +781,30 @@ public:
 		lower_bound_comparable = MaxValue<uint32_t>(lower_bound_comparable, bitmap_min);
 		upper_bound_comparable = MinValue<uint32_t>(upper_bound_comparable, bitmap_max);
 		return bitmap.LookupRange(lower_bound_comparable, upper_bound_comparable);
+	}
+
+	FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const override {
+		if (stats.GetStatsType() != StatisticsType::STRING_STATS || !StringStats::HasMinMax(stats)) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+
+		const auto min_string = StringStats::Min(stats);
+		const auto max_string = StringStats::Max(stats);
+		const auto min =
+		    StringPrefixComparable(string_t(min_string.data(), UnsafeNumericCast<uint32_t>(min_string.size())), '\0');
+		const auto max_padding = StringStats::GetMaxType(stats) == StringStatsType::TRUNCATED_STATS ? char(0xFF) : '\0';
+		const auto max = StringPrefixComparable(
+		    string_t(max_string.data(), UnsafeNumericCast<uint32_t>(max_string.size())), max_padding);
+		if (min > max) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+
+		const auto bitmap_min = bitmap.Min();
+		const auto bitmap_max = bitmap.Min() + bitmap.Span();
+		if (max < bitmap_min || min > bitmap_max) {
+			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+		}
+		return bitmap.LookupRange(MaxValue<uint32_t>(min, bitmap_min), MinValue<uint32_t>(max, bitmap_max));
 	}
 
 	bool IsInitialized() const override {
@@ -1081,19 +1118,7 @@ FilterPropagateResult PrefixRangeScalarFun::FilterPrune(const FunctionStatistics
 	if (!data.filter || !data.filter->IsInitialized()) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
-	if (input.stats.GetStatsType() != StatisticsType::NUMERIC_STATS) {
-		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-	}
-	if (!NumericStats::HasMinMax(input.stats)) {
-		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-	}
-
-	const auto min = NumericStats::Min(input.stats);
-	const auto max = NumericStats::Max(input.stats);
-	if (min > max) {
-		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-	}
-	return data.filter->LookupRange(min, max);
+	return data.filter->LookupStatistics(input.stats);
 }
 
 ScalarFunction TableFilterPrefixRangeFun::GetFunction() {

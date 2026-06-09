@@ -184,6 +184,7 @@ public:
 	virtual void MergeBuildState(BuildState &state) = 0;
 	virtual idx_t LookupKeys(Vector &keys, SelectionVector &result_sel, idx_t count) const = 0;
 	virtual FilterPropagateResult LookupRange(const Value &lower_bound, const Value &upper_bound) const = 0;
+	virtual FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const = 0;
 	virtual bool IsInitialized() const = 0;
 	virtual Analysis Analyze(idx_t key_count) const = 0;
 	virtual void Compress(ClientContext &context, double max_false_positive_rate) = 0;

@@ -2,6 +2,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
 
 using namespace duckdb;
 
@@ -35,6 +36,33 @@ bool ContainsKey(const PrefixRangeFilter &filter, int32_t key) {
 	FlatVector::SetSize(key_vector, 1);
 	SelectionVector result_sel(1);
 	return filter.LookupKeys(key_vector, result_sel, 1) == 1;
+}
+
+unique_ptr<PrefixRangeFilter> BuildStringPrefixRangeFilter(ClientContext &context, const vector<string> &keys,
+                                                           const string &min, const string &max) {
+	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::VARCHAR);
+	PrefixRangeFilter::Sizing sizing;
+	REQUIRE(PrefixRangeFilter::TryComputeFixedSizeSizing(Value(min), Value(max), 1 << 16, sizing));
+	filter->Initialize(context, keys.size(), Value(min), Value(max), sizing);
+
+	auto state = filter->InitializeBuildState(context);
+	Vector key_vector(LogicalType::VARCHAR, keys.size());
+	auto key_data = FlatVector::GetDataMutable<string_t>(key_vector);
+	for (idx_t i = 0; i < keys.size(); i++) {
+		key_data[i] = StringVector::AddString(key_vector, keys[i]);
+	}
+	FlatVector::SetSize(key_vector, count_t(keys.size()));
+	filter->InsertKeys(key_vector, keys.size(), *state);
+	filter->MergeBuildState(*state);
+	return filter;
+}
+
+BaseStatistics StringStatistics(const string &min, StringStatsType min_type, const string &max,
+                                StringStatsType max_type) {
+	auto stats = StringStats::CreateEmpty(LogicalType::VARCHAR);
+	StringStats::SetMin(stats, string_t(min.data(), UnsafeNumericCast<uint32_t>(min.size())), min_type);
+	StringStats::SetMax(stats, string_t(max.data(), UnsafeNumericCast<uint32_t>(max.size())), max_type);
+	return stats;
 }
 
 } // namespace
@@ -164,4 +192,44 @@ TEST_CASE("Prefix range filter optional selectivity threshold is lower than min 
 	}
 	REQUIRE(min_max_stats.GetSelectivity() == Approx(0.83886));
 	REQUIRE(min_max_stats.IsActive());
+}
+
+TEST_CASE("String prefix range filter prunes string statistics", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto filter = BuildStringPrefixRangeFilter(*con.context, {"abz", "acz"}, "abz", "acz");
+
+	auto outside = StringStatistics("aaa", StringStatsType::EXACT_STATS, "aaz", StringStatsType::EXACT_STATS);
+	REQUIRE(filter->LookupStatistics(outside) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
+
+	auto matching = StringStatistics("abz", StringStatsType::EXACT_STATS, "abz", StringStatsType::EXACT_STATS);
+	REQUIRE(filter->LookupStatistics(matching) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
+
+	auto exact_short = StringStatistics("ab", StringStatsType::EXACT_STATS, "ab", StringStatsType::EXACT_STATS);
+	REQUIRE(filter->LookupStatistics(exact_short) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
+
+	auto truncated_short =
+	    StringStatistics("ab", StringStatsType::TRUNCATED_STATS, "ab", StringStatsType::TRUNCATED_STATS);
+	REQUIRE(filter->LookupStatistics(truncated_short) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
+}
+
+TEST_CASE("String prefix range statistics handle null bytes and invalid UTF-8", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	const string null_key("ab\0d", 4);
+	auto filter = BuildStringPrefixRangeFilter(*con.context, {null_key, "zzzz"}, null_key, "zzzz");
+
+	auto null_stats = StringStatistics(null_key, StringStatsType::EXACT_STATS, null_key, StringStatsType::EXACT_STATS);
+	REQUIRE(filter->LookupStatistics(null_stats) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
+
+	auto truncated_null =
+	    StringStatistics("ab", StringStatsType::TRUNCATED_STATS, "ab", StringStatsType::TRUNCATED_STATS);
+	REQUIRE(filter->LookupStatistics(truncated_null) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
+
+	const string invalid_utf8("\xE6\x97", 2);
+	auto invalid_stats = StringStatistics(invalid_utf8, StringStatsType::TRUNCATED_STATS, invalid_utf8,
+	                                      StringStatsType::TRUNCATED_STATS);
+	REQUIRE(filter->LookupStatistics(invalid_stats) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
 }
