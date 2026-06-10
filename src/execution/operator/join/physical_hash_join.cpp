@@ -1690,7 +1690,8 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	if (!use_perfect_hash) {
 		sink.ScheduleFinalize(pipeline, event);
 	} else if (NeedsRuntimeJoinFilterBuild(ht)) {
-		auto runtime_filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(pipeline, sink);
+		const auto build_bloom_filter = !ht.ShouldBuildPrefixRangeFilter() && ht.ShouldBuildBloomFilter();
+		auto runtime_filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(pipeline, sink, build_bloom_filter);
 		event.InsertEvent(std::move(runtime_filter_event));
 	}
 	sink.finalized = true;

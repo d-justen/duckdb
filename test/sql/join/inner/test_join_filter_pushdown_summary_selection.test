@@ -48,6 +48,16 @@ SELECT i::INTEGER AS k
 FROM range(0, 5000) t(i);
 
 statement ok
+CREATE OR REPLACE TABLE probe_phj_runtime_filter AS
+SELECT (i % 9991)::INTEGER AS k
+FROM range(0, 100000) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE build_phj_runtime_filter AS
+SELECT (i * 10)::INTEGER AS k
+FROM range(0, 1000) t(i);
+
+statement ok
 CREATE OR REPLACE TABLE probe_prf_approx_summary AS
 SELECT (i * 1000000000)::BIGINT AS k, (i % 7)::INTEGER AS g
 FROM range(0, 100000) t(i);
@@ -291,6 +301,51 @@ JOIN build_phj_summary b
   ON p.k = b.k;
 ----
 analyzed_plan	<REGEX>:.*IN PRF\(k\).*
+
+statement ok
+SET enable_join_min_max_filter_pushdown=false
+
+statement ok
+SET dynamic_or_filter_threshold=0
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_phj_runtime_filter p
+JOIN build_phj_runtime_filter b
+  ON p.k = b.k;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*k IN PRF\(k\).*10,009 rows.*
+
+statement ok
+SET enable_prefix_range_filter=false
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_phj_runtime_filter p
+JOIN build_phj_runtime_filter b
+  ON p.k = b.k;
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*k IN BF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_phj_runtime_filter p
+JOIN build_phj_runtime_filter b
+  ON p.k = b.k;
+----
+analyzed_plan	<!REGEX>:.*100,000 rows.*
+
+statement ok
+RESET enable_prefix_range_filter
+
+statement ok
+RESET dynamic_or_filter_threshold
+
+statement ok
+RESET enable_join_min_max_filter_pushdown
 
 statement ok
 RESET enable_perfect_hash_join_filter_pushdown
