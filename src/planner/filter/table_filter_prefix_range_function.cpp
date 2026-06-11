@@ -131,12 +131,32 @@ public:
 
 	FilterPropagateResult LookupRange(U lower_bound, U upper_bound) const {
 		if (mode == Mode::DIRECT_RANGES) {
+			auto covered_until = lower_bound;
+			bool found_overlap = false;
 			for (idx_t range_idx = 0; range_idx < range_count; range_idx++) {
-				if (lower_bound <= ranges[range_idx].upper && upper_bound >= ranges[range_idx].lower) {
+				const auto &range = ranges[range_idx];
+				if (range.upper < lower_bound) {
+					continue;
+				}
+				if (range.lower > upper_bound) {
+					break;
+				}
+				if (!found_overlap) {
+					if (range.lower > lower_bound) {
+						return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+					}
+					found_overlap = true;
+				} else if ((covered_until != NumericLimits<U>::Maximum() && range.lower > covered_until + 1) ||
+				           (covered_until == NumericLimits<U>::Maximum() && range.lower > covered_until)) {
 					return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 				}
+				if (range.upper >= upper_bound) {
+					return FilterPropagateResult::FILTER_ALWAYS_TRUE;
+				}
+				covered_until = range.upper;
 			}
-			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+			return found_overlap ? FilterPropagateResult::NO_PRUNING_POSSIBLE
+			                     : FilterPropagateResult::FILTER_ALWAYS_FALSE;
 		}
 
 		const U lb_y = lower_bound - min;
@@ -150,33 +170,35 @@ public:
 		const idx_t lb_bit_off = UnsafeNumericCast<idx_t>(lb_bit_idx & UnsafeNumericCast<U>(WORD_MASK));
 		const idx_t ub_bit_off = UnsafeNumericCast<idx_t>(ub_bit_idx & UnsafeNumericCast<U>(WORD_MASK));
 
-		// TODO: Count the amount of 1's in the range, compare to a threshold, and make a decision if we want to use the
-		// per-row filter for this row group.
+		bool any_set = false;
+		bool all_set = true;
 		if (lb_word_idx == ub_word_idx) {
 			const auto range_mask = ((~0ULL << lb_bit_off) & (~0ULL >> (WORD_MASK - ub_bit_off)));
-			if (bitmap[lb_word_idx] & range_mask) {
-				return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+			const auto word = bitmap[lb_word_idx] & range_mask;
+			any_set = word != 0;
+			all_set = word == range_mask;
+		} else {
+			const auto lb_word_mask = (~0ULL << lb_bit_off);
+			const auto lb_word = bitmap[lb_word_idx] & lb_word_mask;
+			any_set |= lb_word != 0;
+			all_set &= lb_word == lb_word_mask;
+
+			for (idx_t i = UnsafeNumericCast<idx_t>(lb_word_idx) + 1; i < UnsafeNumericCast<idx_t>(ub_word_idx); i++) {
+				const auto word = bitmap[i];
+				any_set |= word != 0;
+				all_set &= word == ~0ULL;
 			}
-			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+
+			const auto ub_word_mask = ~0ULL >> (WORD_MASK - ub_bit_off);
+			const auto ub_word = bitmap[ub_word_idx] & ub_word_mask;
+			any_set |= ub_word != 0;
+			all_set &= ub_word == ub_word_mask;
 		}
 
-		const auto lb_word_mask = (~0ULL << lb_bit_off);
-		if (bitmap[lb_word_idx] & lb_word_mask) {
-			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		if (all_set) {
+			return FilterPropagateResult::FILTER_ALWAYS_TRUE;
 		}
-
-		for (idx_t i = UnsafeNumericCast<idx_t>(lb_word_idx) + 1; i < UnsafeNumericCast<idx_t>(ub_word_idx); i++) {
-			if (bitmap[i]) {
-				return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-			}
-		}
-
-		const auto ub_word_mask = ~0ULL >> (WORD_MASK - ub_bit_off);
-		if (bitmap[ub_word_idx] & ub_word_mask) {
-			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-		}
-
-		return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+		return any_set ? FilterPropagateResult::NO_PRUNING_POSSIBLE : FilterPropagateResult::FILTER_ALWAYS_FALSE;
 	}
 
 	bool IsInitialized() const {
@@ -698,7 +720,11 @@ public:
 
 		const auto adjusted_lb = NumericConverter<T>::Convert(MaxValue<T>(lb, bitmap_min));
 		const auto adjusted_ub = NumericConverter<T>::Convert(MinValue<T>(ub, bitmap_max));
-		return bitmap.LookupRange(adjusted_lb, adjusted_ub);
+		auto result = bitmap.LookupRange(adjusted_lb, adjusted_ub);
+		if (result == FilterPropagateResult::FILTER_ALWAYS_TRUE && (lb < bitmap_min || ub > bitmap_max)) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+		return result;
 	}
 
 	FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const override {
@@ -780,7 +806,12 @@ public:
 
 		lower_bound_comparable = MaxValue<uint32_t>(lower_bound_comparable, bitmap_min);
 		upper_bound_comparable = MinValue<uint32_t>(upper_bound_comparable, bitmap_max);
-		return bitmap.LookupRange(lower_bound_comparable, upper_bound_comparable);
+		auto result = bitmap.LookupRange(lower_bound_comparable, upper_bound_comparable);
+		if (result == FilterPropagateResult::FILTER_ALWAYS_TRUE &&
+		    (StringMinComparable(lower_bound) < bitmap_min || StringMaxComparable(upper_bound) > bitmap_max)) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+		return result;
 	}
 
 	FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const override {

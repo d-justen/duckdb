@@ -2,6 +2,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 
 using namespace duckdb;
@@ -62,6 +63,13 @@ BaseStatistics StringStatistics(const string &min, StringStatsType min_type, con
 	auto stats = StringStats::CreateEmpty(LogicalType::VARCHAR);
 	StringStats::SetMin(stats, string_t(min.data(), UnsafeNumericCast<uint32_t>(min.size())), min_type);
 	StringStats::SetMax(stats, string_t(max.data(), UnsafeNumericCast<uint32_t>(max.size())), max_type);
+	return stats;
+}
+
+BaseStatistics Int32Statistics(int32_t min, int32_t max) {
+	auto stats = NumericStats::CreateEmpty(LogicalType::INTEGER);
+	NumericStats::SetMin(stats, min);
+	NumericStats::SetMax(stats, max);
 	return stats;
 }
 
@@ -167,6 +175,32 @@ TEST_CASE("Prefix range filter FPR analysis is conservative for duplicate build 
 	REQUIRE(analysis.false_positive_rate > 0.9);
 }
 
+TEST_CASE("Prefix range filter bitmap statistics return always true for fully covered range", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, {0, 1, 2, 3}, 0, 7, 1, -1);
+
+	REQUIRE(filter->LookupStatistics(Int32Statistics(0, 1)) == FilterPropagateResult::FILTER_ALWAYS_TRUE);
+	REQUIRE(filter->LookupStatistics(Int32Statistics(4, 5)) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
+	REQUIRE(filter->LookupStatistics(Int32Statistics(1, 4)) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
+	REQUIRE(filter->LookupStatistics(Int32Statistics(-10, 100)) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
+}
+
+TEST_CASE("Prefix range filter direct ranges return always true for fully covered range", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, {0, 1, 2, 3, 8, 9, 10, 11}, 0, 11, 0, 0);
+	auto info = filter->GetCompressionInfo();
+	REQUIRE(info.mode == CompressionMode::DIRECT_RANGES);
+	REQUIRE(info.range_count == 2);
+
+	REQUIRE(filter->LookupStatistics(Int32Statistics(0, 3)) == FilterPropagateResult::FILTER_ALWAYS_TRUE);
+	REQUIRE(filter->LookupStatistics(Int32Statistics(4, 7)) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
+	REQUIRE(filter->LookupStatistics(Int32Statistics(2, 9)) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
+}
+
 TEST_CASE("Prefix range filter optional selectivity threshold is lower than min max", "[optimizer]") {
 	static constexpr idx_t DOMAIN_SIZE = 100000;
 	static constexpr idx_t CONTIGUOUS_RANGE_SIZE = 83886;
@@ -204,7 +238,7 @@ TEST_CASE("String prefix range filter prunes string statistics", "[optimizer]") 
 	REQUIRE(filter->LookupStatistics(outside) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
 
 	auto matching = StringStatistics("abz", StringStatsType::EXACT_STATS, "abz", StringStatsType::EXACT_STATS);
-	REQUIRE(filter->LookupStatistics(matching) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
+	REQUIRE(filter->LookupStatistics(matching) == FilterPropagateResult::FILTER_ALWAYS_TRUE);
 
 	auto exact_short = StringStatistics("ab", StringStatsType::EXACT_STATS, "ab", StringStatsType::EXACT_STATS);
 	REQUIRE(filter->LookupStatistics(exact_short) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
@@ -222,7 +256,11 @@ TEST_CASE("String prefix range statistics handle null bytes and invalid UTF-8", 
 	auto filter = BuildStringPrefixRangeFilter(*con.context, {null_key, "zzzz"}, null_key, "zzzz");
 
 	auto null_stats = StringStatistics(null_key, StringStatsType::EXACT_STATS, null_key, StringStatsType::EXACT_STATS);
-	REQUIRE(filter->LookupStatistics(null_stats) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
+	REQUIRE(filter->LookupStatistics(null_stats) == FilterPropagateResult::FILTER_ALWAYS_TRUE);
+
+	auto outside_covering_stats =
+	    StringStatistics("aa", StringStatsType::EXACT_STATS, "zzzzzz", StringStatsType::TRUNCATED_STATS);
+	REQUIRE(filter->LookupStatistics(outside_covering_stats) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
 
 	auto truncated_null =
 	    StringStatistics("ab", StringStatsType::TRUNCATED_STATS, "ab", StringStatsType::TRUNCATED_STATS);
