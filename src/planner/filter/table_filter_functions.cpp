@@ -108,7 +108,7 @@ void TableFilterFunctionSerialize(Serializer &serializer, const optional_ptr<Fun
 unique_ptr<FunctionData> TableFilterFunctionDeserialize(Deserializer &deserializer, BoundScalarFunction &function) {
 	auto key_type = function.GetArguments().empty() ? LogicalType::ANY : function.GetArguments()[0];
 	if (function.GetName() == BloomFilterScalarFun::NAME) {
-		return make_uniq<BloomFilterFunctionData>(nullptr, false, string(), key_type, 0.0f, idx_t(0));
+		return make_uniq<BloomFilterFunctionData>(nullptr, false, string(), key_type, 0.0f, idx_t(0), true);
 	}
 	if (function.GetName() == PerfectHashJoinScalarFun::NAME) {
 		return make_uniq<PerfectHashJoinFunctionData>(nullptr, string(), 0.0f, idx_t(0));

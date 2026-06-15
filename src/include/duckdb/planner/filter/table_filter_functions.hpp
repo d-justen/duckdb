@@ -111,10 +111,12 @@ private:
 struct BloomFilterFunctionData : public FunctionData {
 	BloomFilterFunctionData(optional_ptr<BloomFilter> filter_p, bool filters_null_values_p,
 	                        const string &key_column_name_p, const LogicalType &key_type_p,
-	                        float selectivity_threshold_p, idx_t n_vectors_to_check_p);
+	                        float selectivity_threshold_p, idx_t n_vectors_to_check_p,
+	                        bool allow_row_group_pruning_p);
 
 	optional_ptr<BloomFilter> filter;
 	bool filters_null_values;
+	bool allow_row_group_pruning;
 	string key_column_name;
 	LogicalType key_type;
 	float selectivity_threshold;

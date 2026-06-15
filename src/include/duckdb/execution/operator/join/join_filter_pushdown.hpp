@@ -86,6 +86,7 @@ struct JoinFilterPushdownUtil {
 struct JoinFilterPushdownSettings {
 	bool enable_min_max_filter_pushdown = true;
 	bool enable_bloom_filter_pushdown = true;
+	bool enable_bloom_filter_row_group_pruning = true;
 	bool enable_prefix_range_filter_pushdown = true;
 	bool enable_perfect_hash_join_filter_pushdown = true;
 };
@@ -138,7 +139,8 @@ private:
 	                  idx_t filter_idx, ProjectionIndex filter_col_idx) const;
 
 	void PushBloomFilter(const PhysicalOperator &op, JoinHashTable &ht, const JoinFilterPushdownFilter &info,
-	                     ProjectionIndex filter_col_idx, bool build_immediately = true) const;
+	                     ProjectionIndex filter_col_idx, bool allow_row_group_pruning,
+	                     bool build_immediately = true) const;
 	void PushPerfectHashJoinFilter(const PhysicalOperator &op, PerfectHashJoinExecutor &perfect_join_executor,
 	                               const JoinFilterPushdownFilter &info, ProjectionIndex filter_col_idx) const;
 	void RegisterPrefixRangeFilter(const JoinFilterPushdownFilter &info, ClientContext &context, JoinHashTable &ht,

@@ -1132,6 +1132,8 @@ JoinFilterPushdownSettings JoinFilterPushdownInfo::GetSettings(const ClientConte
 	JoinFilterPushdownSettings settings;
 	settings.enable_min_max_filter_pushdown = Settings::Get<EnableJoinMinMaxFilterPushdownSetting>(context);
 	settings.enable_bloom_filter_pushdown = Settings::Get<EnableJoinBloomFilterPushdownSetting>(context);
+	settings.enable_bloom_filter_row_group_pruning =
+	    Settings::Get<EnableJoinBloomFilterRowGroupPruningSetting>(context);
 	settings.enable_prefix_range_filter_pushdown = Settings::Get<EnablePrefixRangeFilterSetting>(context);
 	settings.enable_perfect_hash_join_filter_pushdown =
 	    Settings::Get<EnablePerfectHashJoinFilterPushdownSetting>(context);
@@ -1325,7 +1327,7 @@ JoinFilterPushdownInfo::PlanSummaryFilters(const JoinFilterPushdownSettings &set
 
 void JoinFilterPushdownInfo::PushBloomFilter(const PhysicalOperator &op, JoinHashTable &ht,
                                              const JoinFilterPushdownFilter &info, ProjectionIndex filter_col_idx,
-                                             bool build_immediately) const {
+                                             bool allow_row_group_pruning, bool build_immediately) const {
 	// If the nulls are equal, we let nulls pass. If not, we filter them
 	auto filters_null_values = !ht.NullValuesAreEqual(0);
 	const auto key_name = ht.conditions[0].GetRHS().ToString();
@@ -1339,7 +1341,7 @@ void JoinFilterPushdownInfo::PushBloomFilter(const PhysicalOperator &op, JoinHas
 	auto filter_expr = make_uniq<BoundFunctionExpression>(
 	    BoundScalarFunction(BloomFilterScalarFun::GetFunction(key_type)), std::move(children),
 	    make_uniq<BloomFilterFunctionData>(ht.GetBloomFilter(), filters_null_values, key_name, key_type,
-	                                       selectivity_threshold, 0));
+	                                       selectivity_threshold, 0, allow_row_group_pruning));
 	info.dynamic_filters->PushFilter(
 	    op, filter_col_idx,
 	    CreateSelectivityOptionalExpressionFilter(std::move(filter_expr), key_type, SelectivityOptionalFilterType::BF));
@@ -1536,12 +1538,14 @@ JoinFilterPushdownInfo::FinalizeFilters(ClientContext &context, const PhysicalCo
 				break;
 			case JoinFilterSummaryPlanType::BLOOM:
 				D_ASSERT(runtime_filter_ht);
-				PushBloomFilter(op, *runtime_filter_ht, info, filter_col_idx);
+				PushBloomFilter(op, *runtime_filter_ht, info, filter_col_idx,
+				                settings.enable_bloom_filter_row_group_pruning);
 				break;
 			case JoinFilterSummaryPlanType::MIN_MAX_AND_BLOOM:
 				CreateDynamicMinMaxFilters(op, info, filter_col_idx, cmp, min_val, max_val);
 				D_ASSERT(runtime_filter_ht);
-				PushBloomFilter(op, *runtime_filter_ht, info, filter_col_idx);
+				PushBloomFilter(op, *runtime_filter_ht, info, filter_col_idx,
+				                settings.enable_bloom_filter_row_group_pruning);
 				break;
 			case JoinFilterSummaryPlanType::IN_FILTER:
 				D_ASSERT(runtime_filter_ht);
@@ -1561,7 +1565,8 @@ JoinFilterPushdownInfo::FinalizeFilters(ClientContext &context, const PhysicalCo
 				RegisterPrefixRangeFilter(info, context, *runtime_filter_ht, op, filter_col_idx, min_val_before_cast,
 				                          max_val_before_cast, filter_plan.prefix_range_plan);
 				if (settings.enable_bloom_filter_pushdown) {
-					PushBloomFilter(op, *runtime_filter_ht, info, filter_col_idx, false);
+					PushBloomFilter(op, *runtime_filter_ht, info, filter_col_idx,
+					                settings.enable_bloom_filter_row_group_pruning, false);
 				}
 				if (settings.enable_min_max_filter_pushdown) {
 					CreateDynamicMinMaxFilters(op, info, filter_col_idx, cmp, min_val, max_val);

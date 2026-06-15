@@ -6,8 +6,8 @@ namespace duckdb {
 
 unique_ptr<Expression> LegacyBFTableFilter::ToExpression(const Expression &column) const {
 	auto function = BloomFilterScalarFun::GetFunction(column.GetReturnType());
-	auto bind_data =
-	    make_uniq<BloomFilterFunctionData>(filter, filters_null_values, key_column_name, key_type, 0.0f, idx_t(0));
+	auto bind_data = make_uniq<BloomFilterFunctionData>(filter, filters_null_values, key_column_name, key_type, 0.0f,
+	                                                    idx_t(0), true);
 	vector<unique_ptr<Expression>> arguments;
 	arguments.push_back(column.Copy());
 	return make_uniq<BoundFunctionExpression>(BoundScalarFunction(function), std::move(arguments),

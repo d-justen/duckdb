@@ -339,6 +339,36 @@ JOIN build_phj_runtime_filter b
 analyzed_plan	<!REGEX>:.*100,000 rows.*
 
 statement ok
+PRAGMA enable_profiling = 'json';
+
+statement ok
+PRAGMA profiling_output = '{TEST_DIR}/join_filter_pushdown_summary_selection_profile.json';
+
+statement ok
+SELECT count(*)
+FROM probe_phj_runtime_filter p
+JOIN build_phj_runtime_filter b
+  ON p.k = b.k;
+
+statement ok
+PRAGMA disable_profiling;
+
+statement ok
+SET enable_join_bloom_filter_row_group_pruning=false
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe_phj_runtime_filter p
+JOIN build_phj_runtime_filter b
+  ON p.k = b.k;
+----
+analyzed_plan	<REGEX>:.*"Dynamic Filters": "optional: k IN BF\(k\)".*
+
+statement ok
+RESET enable_join_bloom_filter_row_group_pruning
+
+statement ok
 RESET enable_prefix_range_filter
 
 statement ok

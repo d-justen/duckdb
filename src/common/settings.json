@@ -581,6 +581,13 @@
         "default_value": "true"
     },
     {
+        "name": "enable_join_bloom_filter_row_group_pruning",
+        "description": "Whether bloom filters pushed down from hash joins may prune row groups",
+        "type": "BOOLEAN",
+        "default_scope": "local",
+        "default_value": "true"
+    },
+    {
         "name": "enable_join_min_max_filter_pushdown",
         "description": "Whether min/max filters may be pushed down from hash joins",
         "type": "BOOLEAN",

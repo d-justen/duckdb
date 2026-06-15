@@ -57,6 +57,7 @@ OptionValueSet GetValueForOption(const string &name, const LogicalType &type) {
 	    {"disabled_optimizers", {"extension"}},
 	    {"debug_force_external", {Value(true)}},
 	    {"enable_join_bloom_filter_pushdown", {Value(false)}},
+	    {"enable_join_bloom_filter_row_group_pruning", {Value(false)}},
 	    {"enable_join_min_max_filter_pushdown", {Value(false)}},
 	    {"enable_perfect_hash_join_filter_pushdown", {Value(false)}},
 	    {"enable_prefix_range_filter", {Value(false)}},
