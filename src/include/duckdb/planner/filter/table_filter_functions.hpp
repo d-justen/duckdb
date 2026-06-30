@@ -111,8 +111,7 @@ private:
 struct BloomFilterFunctionData : public FunctionData {
 	BloomFilterFunctionData(optional_ptr<BloomFilter> filter_p, bool filters_null_values_p,
 	                        const string &key_column_name_p, const LogicalType &key_type_p,
-	                        float selectivity_threshold_p, idx_t n_vectors_to_check_p,
-	                        bool allow_row_group_pruning_p);
+	                        float selectivity_threshold_p, idx_t n_vectors_to_check_p, bool allow_row_group_pruning_p);
 
 	optional_ptr<BloomFilter> filter;
 	bool filters_null_values;
@@ -188,7 +187,7 @@ public:
 	virtual FilterPropagateResult LookupRange(const Value &lower_bound, const Value &upper_bound) const = 0;
 	virtual FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const = 0;
 	virtual bool IsInitialized() const = 0;
-	virtual Analysis Analyze(idx_t key_count) const = 0;
+	virtual Analysis Analyze() const = 0;
 	virtual void Compress(ClientContext &context, double max_false_positive_rate) = 0;
 	virtual CompressionInfo GetCompressionInfo() const = 0;
 	static bool SupportedType(const LogicalType &type);

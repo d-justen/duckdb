@@ -205,15 +205,14 @@ public:
 		return initialized;
 	}
 
-	PrefixRangeFilter::Analysis Analyze(idx_t) const {
+	PrefixRangeFilter::Analysis Analyze() const {
 		if (mode == Mode::DIRECT_RANGES) {
 			return {active_buckets, direct_false_positive_rate};
 		}
 
 		const auto current_active_buckets = CountActiveBuckets();
-		return {current_active_buckets,
-		        ConservativeFalsePositiveRate(Uhugeint::Convert(current_active_buckets) * BucketWidth(),
-		                                      current_active_buckets)};
+		return {current_active_buckets, ConservativeFalsePositiveRate(
+		                                    Uhugeint::Convert(current_active_buckets) * BucketWidth(), active_buckets)};
 	}
 
 	void Compress(ClientContext &context, double max_false_positive_rate) {
@@ -236,8 +235,7 @@ public:
 		info.false_positive_rate =
 		    mode == Mode::DIRECT_RANGES
 		        ? direct_false_positive_rate
-		        : ConservativeFalsePositiveRate(Uhugeint::Convert(info.active_buckets) * BucketWidth(),
-		                                        info.active_buckets);
+		        : ConservativeFalsePositiveRate(Uhugeint::Convert(info.active_buckets) * BucketWidth(), active_buckets);
 		return info;
 	}
 
@@ -743,8 +741,8 @@ public:
 		return bitmap.IsInitialized();
 	}
 
-	Analysis Analyze(idx_t key_count) const override {
-		return bitmap.Analyze(key_count);
+	Analysis Analyze() const override {
+		return bitmap.Analyze();
 	}
 
 	void Compress(ClientContext &context, double max_false_positive_rate) override {
@@ -842,8 +840,8 @@ public:
 		return bitmap.IsInitialized();
 	}
 
-	Analysis Analyze(idx_t key_count) const override {
-		return bitmap.Analyze(key_count);
+	Analysis Analyze() const override {
+		return bitmap.Analyze();
 	}
 
 	void Compress(ClientContext &context, double max_false_positive_rate) override {

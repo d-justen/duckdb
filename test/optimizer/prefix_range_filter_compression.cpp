@@ -158,6 +158,36 @@ TEST_CASE("Prefix range filter falls back to dyadic compression when four ranges
 	}
 }
 
+TEST_CASE("Prefix range filter dyadic analysis preserves original positive lower bound", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	vector<int32_t> keys;
+	for (int32_t base : {0, 4, 8, 12, 16}) {
+		keys.push_back(base);
+		keys.push_back(base + 1);
+	}
+
+	static constexpr double MAX_FALSE_POSITIVE_RATE = 0.1;
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 17, 0, MAX_FALSE_POSITIVE_RATE);
+	auto info = filter->GetCompressionInfo();
+	auto analysis = filter->Analyze();
+
+	REQUIRE(info.mode == CompressionMode::BITMAP);
+	REQUIRE(info.shift == 1);
+	REQUIRE(info.active_buckets == 5);
+	REQUIRE(info.false_positive_rate == Approx(0.0));
+	REQUIRE(info.false_positive_rate <= MAX_FALSE_POSITIVE_RATE);
+	REQUIRE(analysis.active_buckets == info.active_buckets);
+	REQUIRE(analysis.false_positive_rate == Approx(info.false_positive_rate));
+	REQUIRE(analysis.false_positive_rate <= MAX_FALSE_POSITIVE_RATE);
+	for (auto key : keys) {
+		REQUIRE(ContainsKey(*filter, key));
+	}
+	REQUIRE(!ContainsKey(*filter, 2));
+	REQUIRE(!ContainsKey(*filter, 6));
+}
+
 TEST_CASE("Prefix range filter FPR analysis is conservative for duplicate build keys", "[optimizer]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -170,9 +200,22 @@ TEST_CASE("Prefix range filter FPR analysis is conservative for duplicate build 
 	}
 
 	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 64, 4, 1.0);
-	auto analysis = filter->Analyze(keys.size());
+	auto analysis = filter->Analyze();
 	REQUIRE(analysis.active_buckets == 4);
 	REQUIRE(analysis.false_positive_rate > 0.9);
+}
+
+TEST_CASE("Prefix range filter direct range analysis stays consistent after compression", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, {0, 1, 2, 3, 8, 9, 10, 11}, 0, 11, 0, 0);
+	auto info = filter->GetCompressionInfo();
+	auto analysis = filter->Analyze();
+
+	REQUIRE(info.mode == CompressionMode::DIRECT_RANGES);
+	REQUIRE(analysis.active_buckets == info.active_buckets);
+	REQUIRE(analysis.false_positive_rate == Approx(info.false_positive_rate));
 }
 
 TEST_CASE("Prefix range filter bitmap statistics return always true for fully covered range", "[optimizer]") {
