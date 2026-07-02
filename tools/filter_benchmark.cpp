@@ -20,6 +20,10 @@
 
 using namespace duckdb;
 
+#if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
+#include "grafite_benchmark_adapter.hpp"
+#endif
+
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
 #include "diva_benchmark_adapter.hpp"
 #endif
@@ -37,6 +41,7 @@ struct BenchmarkConfig {
 	idx_t cluster_step = 1;
 	idx_t repetitions = 5;
 	uint64_t seed = 42;
+	double grafite_bits_per_key = 12.0;
 	double diva_bits_per_key = 16.0;
 	string output_path;
 };
@@ -75,6 +80,15 @@ struct PRFRunResult {
 };
 
 struct DivaRunResult {
+	uint64_t build_ns = 0;
+	uint64_t probe_ns = 0;
+	idx_t matched_count = 0;
+	idx_t true_positive_count = 0;
+	idx_t false_positive_count = 0;
+	idx_t bytes = 0;
+};
+
+struct GrafiteRunResult {
 	uint64_t build_ns = 0;
 	uint64_t probe_ns = 0;
 	idx_t matched_count = 0;
@@ -133,6 +147,8 @@ BenchmarkConfig ParseArguments(int argc, char *argv[]) {
 			config.repetitions = UnsafeNumericCast<idx_t>(ParseUnsigned(arg.substr(14), "repetitions"));
 		} else if (StartsWith(arg, "--seed=")) {
 			config.seed = ParseUnsigned(arg.substr(7), "seed");
+		} else if (StartsWith(arg, "--grafite-bpk=")) {
+			config.grafite_bits_per_key = stod(arg.substr(14));
 		} else if (StartsWith(arg, "--diva-bpk=")) {
 			config.diva_bits_per_key = stod(arg.substr(11));
 		} else if (StartsWith(arg, "--output=")) {
@@ -148,6 +164,7 @@ BenchmarkConfig ParseArguments(int argc, char *argv[]) {
 			    << "  --cluster-step=N\n"
 			    << "  --repetitions=N\n"
 			    << "  --seed=N\n"
+			    << "  --grafite-bpk=N\n"
 			    << "  --diva-bpk=N\n"
 			    << "  --output=PATH\n";
 			std::exit(0);
@@ -169,6 +186,9 @@ BenchmarkConfig ParseArguments(int argc, char *argv[]) {
 	}
 	if (config.repetitions == 0) {
 		throw InvalidInputException("repetitions must be > 0");
+	}
+	if (config.grafite_bits_per_key <= 2.0) {
+		throw InvalidInputException("grafite-bpk must be > 2");
 	}
 	if (config.diva_bits_per_key <= 1.0) {
 		throw InvalidInputException("diva-bpk must be > 1");
@@ -341,6 +361,27 @@ PRFRunResult RunPrefixRangeFilterBenchmark(ClientContext &context, const vector<
 	return result;
 }
 
+#if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
+GrafiteRunResult RunGrafiteBenchmark(const std::vector<uint64_t> &build_keys, const std::vector<uint64_t> &probe_keys,
+                                     const MembershipInfo &membership, double bits_per_key) {
+	GrafiteRunResult result;
+
+	GrafiteBenchmarkFilter filter;
+	result.build_ns = TimeNs([&]() { filter.Build(build_keys, bits_per_key); });
+
+	result.probe_ns = TimeNs([&]() {
+		for (idx_t i = 0; i < probe_keys.size(); i++) {
+			const auto matched = filter.Probe(probe_keys[i]);
+			result.matched_count += matched ? 1 : 0;
+			result.true_positive_count += matched && membership.flags[i] ? 1 : 0;
+		}
+	});
+	result.false_positive_count = result.matched_count - result.true_positive_count;
+	result.bytes = UnsafeNumericCast<idx_t>(filter.SizeBytes());
+	return result;
+}
+#endif
+
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
 DivaRunResult RunDivaBenchmark(const std::vector<uint64_t> &build_keys, const std::vector<uint64_t> &probe_keys,
                                const MembershipInfo &membership, double bits_per_key) {
@@ -385,6 +426,16 @@ void WritePRFRow(std::ostream &out, const BenchmarkConfig &config, const Cluster
 	    << std::fixed << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << '\n';
 }
 
+#if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
+void WriteGrafiteRow(std::ostream &out, const BenchmarkConfig &config, idx_t cluster_count,
+                     const GrafiteRunResult &result) {
+	const auto probes_per_sec =
+	    result.probe_ns == 0 ? 0.0 : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
+	out << "grafite," << cluster_count << ',' << result.build_ns << ',' << 0 << ',' << result.bytes << ',' << std::fixed
+	    << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << '\n';
+}
+#endif
+
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
 void WriteDivaRow(std::ostream &out, const BenchmarkConfig &config, idx_t cluster_count, const DivaRunResult &result) {
 	const auto probes_per_sec =
@@ -427,6 +478,12 @@ int main(int argc, char *argv[]) {
 
 					const auto prf_result = RunPrefixRangeFilterBenchmark(context, layout.keys, probes, membership);
 					WritePRFRow(*out, config, layout, cluster_count, rep, prf_result);
+
+#if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
+					const auto grafite_result =
+					    RunGrafiteBenchmark(layout.keys, probes, membership, config.grafite_bits_per_key);
+					WriteGrafiteRow(*out, config, cluster_count, grafite_result);
+#endif
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
 					const auto diva_result = RunDivaBenchmark(layout.keys, probes, membership, config.diva_bits_per_key);

@@ -1,0 +1,6 @@
+Repository: https://github.com/marcocosta97/sux
+Branch: main
+Local source snapshot copied from: /tmp/grafite_sux_inspect
+
+Notes:
+- Vendored as Grafite's default SUX dependency for Elias-Fano support.

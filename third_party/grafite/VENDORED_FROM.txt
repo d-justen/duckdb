@@ -1,0 +1,7 @@
+Repository: https://github.com/marcocosta97/grafite
+Branch: main
+Local source snapshot copied from: /tmp/grafite_inspect
+
+Notes:
+- Vendored for filter_benchmark integration.
+- Uses the SUX-based default implementation.
