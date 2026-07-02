@@ -110,11 +110,11 @@ public:
 		}
 
 		const U comparable = CONVERTER::Convert(value.GetValueUnsafe<T>());
+		if (mode == Mode::DIRECT_RANGES) {
+			return DirectRangeLookup(comparable);
+		}
 		const U y = comparable - min;
 		const uint8_t in_range = y <= span;
-		if (mode == Mode::DIRECT_RANGES) {
-			return DirectRangeLookup(comparable) & in_range;
-		}
 		const U bit_idx = ShiftRight(y, shift);
 		const uint32_t word_idx = (bit_idx >> WORD_SHIFT) & (0U - in_range);
 		const uint8_t bit = (bitmap[word_idx] >> (bit_idx & WORD_MASK)) & 1ULL;
@@ -135,7 +135,8 @@ public:
 			bool found_overlap = false;
 			for (idx_t range_idx = 0; range_idx < range_count; range_idx++) {
 				const auto &range = ranges[range_idx];
-				if (range.upper < lower_bound) {
+				const auto range_upper = DirectRangeUpper(range);
+				if (range_upper < lower_bound) {
 					continue;
 				}
 				if (range.lower > upper_bound) {
@@ -150,10 +151,10 @@ public:
 				           (covered_until == NumericLimits<U>::Maximum() && range.lower > covered_until)) {
 					return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 				}
-				if (range.upper >= upper_bound) {
+				if (range_upper >= upper_bound) {
 					return FilterPropagateResult::FILTER_ALWAYS_TRUE;
 				}
-				covered_until = range.upper;
+				covered_until = range_upper;
 			}
 			return found_overlap ? FilterPropagateResult::NO_PRUNING_POSSIBLE
 			                     : FilterPropagateResult::FILTER_ALWAYS_FALSE;
@@ -257,7 +258,7 @@ private:
 
 	struct DirectRange {
 		U lower;
-		U upper;
+		U width;
 	};
 
 	struct Gap {
@@ -308,12 +309,10 @@ private:
 		idx_t found_count = 0;
 		for (const auto &entry : keys.template ValidValues<T>()) {
 			const U comparable = CONVERTER::Convert(entry.GetValue());
-			const U y = comparable - min;
-			const uint8_t in_range = y <= span;
 			const uint8_t bit = DirectRangeLookup<RANGE_COUNT>(comparable);
 
 			result_sel.set_index(found_count, entry.GetIndex());
-			found_count += bit & in_range;
+			found_count += bit;
 		}
 		return found_count;
 	}
@@ -450,20 +449,36 @@ private:
 
 	template <idx_t RANGE_COUNT>
 	uint8_t DirectRangeLookup(U value) const {
-		uint8_t result = 0;
-		for (idx_t range_idx = 0; range_idx < RANGE_COUNT; range_idx++) {
-			result |= (value >= ranges[range_idx].lower) & (value <= ranges[range_idx].upper);
+		if constexpr (RANGE_COUNT == 1) {
+			return ValueInDirectRange(value, ranges[0]);
+		} else if constexpr (RANGE_COUNT == 2) {
+			return ValueInDirectRange(value, ranges[0]) | ValueInDirectRange(value, ranges[1]);
+		} else if constexpr (RANGE_COUNT == 3) {
+			return ValueInDirectRange(value, ranges[0]) | ValueInDirectRange(value, ranges[1]) |
+			       ValueInDirectRange(value, ranges[2]);
+		} else if constexpr (RANGE_COUNT == 4) {
+			return ValueInDirectRange(value, ranges[0]) | ValueInDirectRange(value, ranges[1]) |
+			       ValueInDirectRange(value, ranges[2]) | ValueInDirectRange(value, ranges[3]);
+		} else {
+			return 0;
 		}
-		return result;
 	}
 
 	bool DirectRangeLookup(U value) const {
 		for (idx_t range_idx = 0; range_idx < range_count; range_idx++) {
-			if (value >= ranges[range_idx].lower && value <= ranges[range_idx].upper) {
+			if (ValueInDirectRange(value, ranges[range_idx])) {
 				return true;
 			}
 		}
 		return false;
+	}
+
+	static uint8_t ValueInDirectRange(U value, const DirectRange &range) {
+		return static_cast<uint8_t>((value - range.lower) <= range.width);
+	}
+
+	static U DirectRangeUpper(const DirectRange &range) {
+		return range.lower + range.width;
 	}
 
 	bool TryCompressToDirectRanges(double max_false_positive_rate) {
@@ -529,12 +544,16 @@ private:
 			for (idx_t gap_idx = 0; gap_idx < actual_kept_gap_count; gap_idx++) {
 				const auto &gap = selected_gaps[gap_idx];
 				if (next_bucket <= gap.start - 1) {
-					ranges[range_count++] = {BucketLowerBound(next_bucket), BucketUpperBound(gap.start - 1)};
+					const auto lower = BucketLowerBound(next_bucket);
+					const auto upper = BucketUpperBound(gap.start - 1);
+					ranges[range_count++] = {lower, static_cast<U>(upper - lower)};
 				}
 				next_bucket = gap.start + gap.length;
 			}
 			if (next_bucket < logical_bucket_count) {
-				ranges[range_count++] = {BucketLowerBound(next_bucket), BucketUpperBound(logical_bucket_count - 1)};
+				const auto lower = BucketLowerBound(next_bucket);
+				const auto upper = BucketUpperBound(logical_bucket_count - 1);
+				ranges[range_count++] = {lower, static_cast<U>(upper - lower)};
 			}
 			if (range_count == 0 || range_count > MAX_DIRECT_RANGES) {
 				return false;
