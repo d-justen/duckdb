@@ -16,6 +16,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace duckdb;
@@ -100,6 +101,16 @@ struct GrafiteRunResult {
 struct MembershipInfo {
 	vector<uint8_t> flags;
 	idx_t positives = 0;
+};
+
+struct RepetitionContext {
+	vector<uint64_t> probes;
+	vector<idx_t> cluster_counts;
+};
+
+struct ResultRow {
+	idx_t cluster_count;
+	string line;
 };
 
 template <class FUNC>
@@ -238,6 +249,25 @@ vector<uint64_t> GenerateProbeKeys(uint64_t domain_size, idx_t probe_count, uint
 	return probes;
 }
 
+vector<idx_t> GenerateClusterCounts(const BenchmarkConfig &config) {
+	vector<idx_t> cluster_counts;
+	for (idx_t cluster_count = config.min_clusters; cluster_count <= config.max_clusters;
+	     cluster_count += config.cluster_step) {
+		cluster_counts.push_back(cluster_count);
+	}
+	return cluster_counts;
+}
+
+RepetitionContext CreateRepetitionContext(const BenchmarkConfig &config, idx_t rep) {
+	RepetitionContext result;
+	result.probes = GenerateProbeKeys(config.domain_size, config.probe_count, config.seed + rep);
+	result.cluster_counts = GenerateClusterCounts(config);
+
+	std::mt19937_64 rng(config.seed + 0x9E3779B97F4A7C15ULL + rep);
+	std::shuffle(result.cluster_counts.begin(), result.cluster_counts.end(), rng);
+	return result;
+}
+
 MembershipInfo ComputeMembership(uint64_t domain_size, const vector<uint64_t> &build_keys, const vector<uint64_t> &probe_keys) {
 	MembershipInfo info;
 	info.flags.resize(probe_keys.size(), 0);
@@ -259,6 +289,14 @@ void FillUBigIntVector(Vector &vector, const std::vector<uint64_t> &values) {
 		data[i] = values[i];
 	}
 	FlatVector::SetSize(vector, values.size());
+}
+
+double ComputeActualFalsePositiveRate(idx_t false_positive_count, const MembershipInfo &membership, idx_t probe_count) {
+	const auto negative_probe_count = probe_count - membership.positives;
+	if (negative_probe_count == 0) {
+		return 0.0;
+	}
+	return static_cast<double>(false_positive_count) / static_cast<double>(negative_probe_count);
 }
 
 idx_t CountMatchedPositives(const SelectionVector &sel, idx_t match_count, const MembershipInfo &membership) {
@@ -410,44 +448,73 @@ DivaRunResult RunDivaBenchmark(const std::vector<uint64_t> &build_keys, const st
 
 void WriteHeader(std::ostream &out) {
 	out << "filter,cluster_count,build_time_ns,post_processing_time_ns,summary_bytes,probe_throughput_per_sec,"
-	       "false_positives\n";
+	       "false_positives,estimated_fpr,actual_fpr,mode,range_count,shift,active_buckets\n";
 }
 
-void WriteBloomRow(std::ostream &out, const BenchmarkConfig &config, const ClusterLayout &layout, idx_t cluster_count,
-                   idx_t rep, const BloomRunResult &result) {
+string FormatBloomRow(const BenchmarkConfig &config, idx_t cluster_count, const MembershipInfo &membership,
+                      const BloomRunResult &result) {
 	const auto probes_per_sec =
 	    result.probe_ns == 0 ? 0.0 : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
+	const auto actual_fpr = ComputeActualFalsePositiveRate(result.false_positive_count, membership, config.probe_count);
+	std::ostringstream out;
 	out << "bloom," << cluster_count << ',' << result.build_core_ns << ',' << 0 << ',' << result.bytes << ',' << std::fixed
-	    << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << '\n';
+	    << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << ',' << "" << ','
+	    << std::setprecision(9) << actual_fpr << ',' << "na,0,0,0";
+	return out.str();
 }
 
-void WritePRFRow(std::ostream &out, const char *filter_name, const BenchmarkConfig &config, const ClusterLayout &layout,
-                 idx_t cluster_count, idx_t rep, const PRFRunResult &result) {
+const char *CompressionModeName(CompressionMode mode) {
+	switch (mode) {
+	case CompressionMode::BITMAP:
+		return "bitmap";
+	case CompressionMode::DIRECT_RANGES:
+		return "direct_ranges";
+	default:
+		return "unknown";
+	}
+}
+
+string FormatPRFRow(const char *filter_name, const BenchmarkConfig &config, idx_t cluster_count,
+                    const MembershipInfo &membership, const PRFRunResult &result) {
 	const auto probes_per_sec =
 	    result.probe_ns == 0 ? 0.0 : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
 	const auto post_build_ns = result.compress_ns + result.analyze_ns;
+	const auto actual_fpr = ComputeActualFalsePositiveRate(result.false_positive_count, membership, config.probe_count);
 
+	std::ostringstream out;
 	out << filter_name << ',' << cluster_count << ',' << result.build_core_ns << ',' << post_build_ns << ','
 	    << result.bytes << ',' << std::fixed << std::setprecision(3) << probes_per_sec << ','
-	    << result.false_positive_count << '\n';
+	    << result.false_positive_count << ',' << std::setprecision(9) << result.estimated_fpr << ','
+	    << actual_fpr << ',' << CompressionModeName(result.mode) << ',' << result.range_count << ',' << result.shift
+	    << ',' << result.active_buckets;
+	return out.str();
 }
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
-void WriteGrafiteRow(std::ostream &out, const BenchmarkConfig &config, idx_t cluster_count,
-                     const GrafiteRunResult &result) {
+string FormatGrafiteRow(const BenchmarkConfig &config, idx_t cluster_count, const MembershipInfo &membership,
+                        const GrafiteRunResult &result) {
 	const auto probes_per_sec =
 	    result.probe_ns == 0 ? 0.0 : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
+	const auto actual_fpr = ComputeActualFalsePositiveRate(result.false_positive_count, membership, config.probe_count);
+	std::ostringstream out;
 	out << "grafite," << cluster_count << ',' << result.build_ns << ',' << 0 << ',' << result.bytes << ',' << std::fixed
-	    << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << '\n';
+	    << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << ',' << "" << ','
+	    << std::setprecision(9) << actual_fpr << ',' << "na,0,0,0";
+	return out.str();
 }
 #endif
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
-void WriteDivaRow(std::ostream &out, const BenchmarkConfig &config, idx_t cluster_count, const DivaRunResult &result) {
+string FormatDivaRow(const BenchmarkConfig &config, idx_t cluster_count, const MembershipInfo &membership,
+                     const DivaRunResult &result) {
 	const auto probes_per_sec =
 	    result.probe_ns == 0 ? 0.0 : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
+	const auto actual_fpr = ComputeActualFalsePositiveRate(result.false_positive_count, membership, config.probe_count);
+	std::ostringstream out;
 	out << "diva," << cluster_count << ',' << result.build_ns << ',' << 0 << ',' << result.bytes << ',' << std::fixed
-	    << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << '\n';
+	    << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << ',' << "" << ','
+	    << std::setprecision(9) << actual_fpr << ',' << "na,0,0,0";
+	return out.str();
 }
 #endif
 
@@ -472,35 +539,48 @@ int main(int argc, char *argv[]) {
 		auto &context = *con.context;
 
 		WriteHeader(*out);
-		for (idx_t cluster_count = config.min_clusters; cluster_count <= config.max_clusters;
-		     cluster_count += config.cluster_step) {
-			const auto layout = GenerateClusteredKeys(config.domain_size, config.total_keys, cluster_count);
-			const auto probes = GenerateProbeKeys(config.domain_size, config.probe_count, config.seed + cluster_count);
-			const auto membership = ComputeMembership(config.domain_size, layout.keys, probes);
+		for (idx_t rep = 0; rep < config.repetitions; rep++) {
+			const auto repetition = CreateRepetitionContext(config, rep);
+			vector<ResultRow> rows;
+			rows.reserve(repetition.cluster_counts.size() * 5);
+			for (const auto cluster_count : repetition.cluster_counts) {
+				const auto layout = GenerateClusteredKeys(config.domain_size, config.total_keys, cluster_count);
+				const auto membership = ComputeMembership(config.domain_size, layout.keys, repetition.probes);
 
-				for (idx_t rep = 0; rep < config.repetitions; rep++) {
-					const auto bloom_result = RunBloomFilterBenchmark(context, layout.keys, probes, membership);
-					WriteBloomRow(*out, config, layout, cluster_count, rep, bloom_result);
+				(void)RunBloomFilterBenchmark(context, layout.keys, repetition.probes, membership);
+				const auto bloom_result = RunBloomFilterBenchmark(context, layout.keys, repetition.probes, membership);
+				rows.push_back({cluster_count, FormatBloomRow(config, cluster_count, membership, bloom_result)});
 
-					const auto prf_uncompressed_result =
-					    RunPrefixRangeFilterBenchmark(context, layout.keys, probes, membership, false);
-					WritePRFRow(*out, "prf_uncompressed", config, layout, cluster_count, rep, prf_uncompressed_result);
+				(void)RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, false);
+				const auto prf_uncompressed_result =
+				    RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, false);
+				rows.push_back(
+				    {cluster_count, FormatPRFRow("prf_uncompressed", config, cluster_count, membership, prf_uncompressed_result)});
 
-					const auto prf_result = RunPrefixRangeFilterBenchmark(context, layout.keys, probes, membership, true);
-					WritePRFRow(*out, "prf", config, layout, cluster_count, rep, prf_result);
+				(void)RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, true);
+				const auto prf_result = RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, true);
+				rows.push_back({cluster_count, FormatPRFRow("prf", config, cluster_count, membership, prf_result)});
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
-					const auto grafite_result =
-					    RunGrafiteBenchmark(layout.keys, probes, membership, config.grafite_bits_per_key);
-					WriteGrafiteRow(*out, config, cluster_count, grafite_result);
+				(void)RunGrafiteBenchmark(layout.keys, repetition.probes, membership, config.grafite_bits_per_key);
+				const auto grafite_result =
+				    RunGrafiteBenchmark(layout.keys, repetition.probes, membership, config.grafite_bits_per_key);
+				rows.push_back({cluster_count, FormatGrafiteRow(config, cluster_count, membership, grafite_result)});
 #endif
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
-					const auto diva_result = RunDivaBenchmark(layout.keys, probes, membership, config.diva_bits_per_key);
-					WriteDivaRow(*out, config, cluster_count, diva_result);
+				(void)RunDivaBenchmark(layout.keys, repetition.probes, membership, config.diva_bits_per_key);
+				const auto diva_result = RunDivaBenchmark(layout.keys, repetition.probes, membership, config.diva_bits_per_key);
+				rows.push_back({cluster_count, FormatDivaRow(config, cluster_count, membership, diva_result)});
 #endif
-				}
 			}
+			std::sort(rows.begin(), rows.end(), [](const ResultRow &lhs, const ResultRow &rhs) {
+				return lhs.cluster_count < rhs.cluster_count;
+			});
+			for (const auto &row : rows) {
+				*out << row.line << '\n';
+			}
+		}
 
 		return 0;
 	} catch (const std::exception &ex) {
