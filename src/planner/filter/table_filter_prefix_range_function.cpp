@@ -451,7 +451,7 @@ private:
 	template <idx_t RANGE_COUNT>
 	uint8_t DirectRangeLookup(U value) const {
 		if constexpr (RANGE_COUNT == 1) {
-			return ValueInDirectRange(value, ranges[0]);
+			return static_cast<uint8_t>((value - min) <= span);
 		} else if constexpr (RANGE_COUNT == 2) {
 			return ValueInDirectRange(value, ranges[0]) | ValueInDirectRange(value, ranges[1]);
 		} else if constexpr (RANGE_COUNT == 3) {
