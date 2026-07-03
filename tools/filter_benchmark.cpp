@@ -125,6 +125,10 @@ bool StartsWith(const string &arg, const string &prefix) {
 	return arg.rfind(prefix, 0) == 0;
 }
 
+bool IsPowerOfTwo(idx_t value) {
+	return value > 0 && (value & (value - 1)) == 0;
+}
+
 uint64_t ParseUnsigned(const string &arg, const string &name) {
 	try {
 		size_t pos;
@@ -172,7 +176,7 @@ BenchmarkConfig ParseArguments(int argc, char *argv[]) {
 			    << "  --probe-count=N\n"
 			    << "  --min-clusters=N\n"
 			    << "  --max-clusters=N\n"
-			    << "  --cluster-step=N\n"
+			    << "  --cluster-step=N (accepted for compatibility, ignored; cluster counts use powers of two)\n"
 			    << "  --repetitions=N\n"
 			    << "  --seed=N\n"
 			    << "  --grafite-bpk=N\n"
@@ -194,6 +198,9 @@ BenchmarkConfig ParseArguments(int argc, char *argv[]) {
 	}
 	if (config.min_clusters == 0 || config.max_clusters < config.min_clusters || config.cluster_step == 0) {
 		throw InvalidInputException("invalid cluster range");
+	}
+	if (!IsPowerOfTwo(config.min_clusters) || !IsPowerOfTwo(config.max_clusters)) {
+		throw InvalidInputException("min-clusters and max-clusters must be powers of two");
 	}
 	if (config.repetitions == 0) {
 		throw InvalidInputException("repetitions must be > 0");
@@ -251,9 +258,11 @@ vector<uint64_t> GenerateProbeKeys(uint64_t domain_size, idx_t probe_count, uint
 
 vector<idx_t> GenerateClusterCounts(const BenchmarkConfig &config) {
 	vector<idx_t> cluster_counts;
-	for (idx_t cluster_count = config.min_clusters; cluster_count <= config.max_clusters;
-	     cluster_count += config.cluster_step) {
+	for (idx_t cluster_count = config.min_clusters; cluster_count <= config.max_clusters; cluster_count <<= 1) {
 		cluster_counts.push_back(cluster_count);
+		if (cluster_count > NumericLimits<idx_t>::Maximum() / 2) {
+			break;
+		}
 	}
 	return cluster_counts;
 }
