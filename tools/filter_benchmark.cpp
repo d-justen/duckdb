@@ -316,7 +316,8 @@ BloomRunResult RunBloomFilterBenchmark(ClientContext &context, const vector<uint
 }
 
 PRFRunResult RunPrefixRangeFilterBenchmark(ClientContext &context, const vector<uint64_t> &build_keys,
-                                           const vector<uint64_t> &probe_keys, const MembershipInfo &membership) {
+                                           const vector<uint64_t> &probe_keys, const MembershipInfo &membership,
+                                           bool enable_compression) {
 	PRFRunResult result;
 	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::UBIGINT);
 	PrefixRangeFilter::Sizing sizing;
@@ -339,7 +340,9 @@ PRFRunResult RunPrefixRangeFilterBenchmark(ClientContext &context, const vector<
 	});
 
 	static constexpr double PRF_FALSE_POSITIVE_RATE_THRESHOLD = 0.001;
-	result.compress_ns = TimeNs([&]() { filter->Compress(context, PRF_FALSE_POSITIVE_RATE_THRESHOLD); });
+	if (enable_compression) {
+		result.compress_ns = TimeNs([&]() { filter->Compress(context, PRF_FALSE_POSITIVE_RATE_THRESHOLD); });
+	}
 	PrefixRangeFilter::Analysis analysis;
 	result.analyze_ns = TimeNs([&]() { analysis = filter->Analyze(); });
 
@@ -354,10 +357,9 @@ PRFRunResult RunPrefixRangeFilterBenchmark(ClientContext &context, const vector<
 	result.range_count = info.range_count;
 	result.estimated_fpr = info.false_positive_rate;
 	result.active_buckets = analysis.active_buckets;
-	const auto bucket_width = uint64_t(1) << info.shift;
 	result.bytes = info.mode == CompressionMode::DIRECT_RANGES
 	                   ? UnsafeNumericCast<idx_t>(info.range_count * 2 * sizeof(uint64_t))
-	                   : UnsafeNumericCast<idx_t>(((info.active_buckets * bucket_width + 63) / 64) * sizeof(uint64_t));
+	                   : UnsafeNumericCast<idx_t>(((info.logical_bucket_count + 63) / 64) * sizeof(uint64_t));
 	return result;
 }
 
@@ -416,14 +418,15 @@ void WriteBloomRow(std::ostream &out, const BenchmarkConfig &config, const Clust
 	    << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << '\n';
 }
 
-void WritePRFRow(std::ostream &out, const BenchmarkConfig &config, const ClusterLayout &layout, idx_t cluster_count,
-                 idx_t rep, const PRFRunResult &result) {
+void WritePRFRow(std::ostream &out, const char *filter_name, const BenchmarkConfig &config, const ClusterLayout &layout,
+                 idx_t cluster_count, idx_t rep, const PRFRunResult &result) {
 	const auto probes_per_sec =
 	    result.probe_ns == 0 ? 0.0 : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
 	const auto post_build_ns = result.compress_ns + result.analyze_ns;
 
-	out << "prf," << cluster_count << ',' << result.build_core_ns << ',' << post_build_ns << ',' << result.bytes << ','
-	    << std::fixed << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << '\n';
+	out << filter_name << ',' << cluster_count << ',' << result.build_core_ns << ',' << post_build_ns << ','
+	    << result.bytes << ',' << std::fixed << std::setprecision(3) << probes_per_sec << ','
+	    << result.false_positive_count << '\n';
 }
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
@@ -476,8 +479,12 @@ int main(int argc, char *argv[]) {
 					const auto bloom_result = RunBloomFilterBenchmark(context, layout.keys, probes, membership);
 					WriteBloomRow(*out, config, layout, cluster_count, rep, bloom_result);
 
-					const auto prf_result = RunPrefixRangeFilterBenchmark(context, layout.keys, probes, membership);
-					WritePRFRow(*out, config, layout, cluster_count, rep, prf_result);
+					const auto prf_uncompressed_result =
+					    RunPrefixRangeFilterBenchmark(context, layout.keys, probes, membership, false);
+					WritePRFRow(*out, "prf_uncompressed", config, layout, cluster_count, rep, prf_uncompressed_result);
+
+					const auto prf_result = RunPrefixRangeFilterBenchmark(context, layout.keys, probes, membership, true);
+					WritePRFRow(*out, "prf", config, layout, cluster_count, rep, prf_result);
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
 					const auto grafite_result =

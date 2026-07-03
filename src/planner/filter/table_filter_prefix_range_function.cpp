@@ -233,6 +233,7 @@ public:
 		info.shift = shift;
 		info.range_count = range_count;
 		info.active_buckets = mode == Mode::DIRECT_RANGES ? active_buckets : CountActiveBuckets();
+		info.logical_bucket_count = logical_bucket_count;
 		info.false_positive_rate =
 		    mode == Mode::DIRECT_RANGES
 		        ? direct_false_positive_rate

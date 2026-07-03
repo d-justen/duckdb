@@ -159,6 +159,7 @@ public:
 		idx_t shift = 0;
 		idx_t range_count = 0;
 		idx_t active_buckets = 0;
+		idx_t logical_bucket_count = 0;
 		double false_positive_rate = 0;
 	};
 
