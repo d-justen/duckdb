@@ -205,8 +205,9 @@ ClusterLayout GenerateClusteredKeys(uint64_t domain_size, idx_t total_keys, idx_
 	layout.cluster_length_remainder = total_keys % cluster_count;
 
 	const auto free_values = UnsafeNumericCast<idx_t>(domain_size - total_keys);
-	layout.base_gap = free_values / cluster_count;
-	layout.gap_remainder = free_values % cluster_count;
+	const auto gap_count = cluster_count > 1 ? cluster_count - 1 : 0;
+	layout.base_gap = gap_count > 0 ? free_values / gap_count : 0;
+	layout.gap_remainder = gap_count > 0 ? free_values % gap_count : 0;
 
 	layout.keys.reserve(total_keys);
 	uint64_t cursor = 0;
@@ -216,8 +217,10 @@ ClusterLayout GenerateClusteredKeys(uint64_t domain_size, idx_t total_keys, idx_
 			layout.keys.push_back(cursor + i);
 		}
 		cursor += cluster_len;
-		const idx_t gap = layout.base_gap + (cluster_idx < layout.gap_remainder ? 1 : 0);
-		cursor += gap;
+		if (cluster_idx + 1 < cluster_count) {
+			const idx_t gap = layout.base_gap + (cluster_idx < layout.gap_remainder ? 1 : 0);
+			cursor += gap;
+		}
 	}
 	D_ASSERT(layout.keys.size() == total_keys);
 	D_ASSERT(layout.keys.back() < domain_size);

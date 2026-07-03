@@ -23,6 +23,32 @@ void FillVector(Vector &vector, const std::vector<uint64_t> &values) {
 	FlatVector::SetSize(vector, values.size());
 }
 
+std::vector<uint64_t> GenerateClusteredKeysForTest(uint64_t domain_size, idx_t total_keys, idx_t cluster_count) {
+	const idx_t cluster_length = total_keys / cluster_count;
+	const idx_t cluster_length_remainder = total_keys % cluster_count;
+
+	const auto free_values = UnsafeNumericCast<idx_t>(domain_size - total_keys);
+	const auto gap_count = cluster_count > 1 ? cluster_count - 1 : 0;
+	const auto base_gap = gap_count > 0 ? free_values / gap_count : 0;
+	const auto gap_remainder = gap_count > 0 ? free_values % gap_count : 0;
+
+	std::vector<uint64_t> keys;
+	keys.reserve(total_keys);
+	uint64_t cursor = 0;
+	for (idx_t cluster_idx = 0; cluster_idx < cluster_count; cluster_idx++) {
+		const idx_t cluster_len = cluster_length + (cluster_idx < cluster_length_remainder ? 1 : 0);
+		for (idx_t i = 0; i < cluster_len; i++) {
+			keys.push_back(cursor + i);
+		}
+		cursor += cluster_len;
+		if (cluster_idx + 1 < cluster_count) {
+			const idx_t gap = base_gap + (cluster_idx < gap_remainder ? 1 : 0);
+			cursor += gap;
+		}
+	}
+	return keys;
+}
+
 bool TestBloom(DuckDB &db) {
 	Connection con(db);
 	auto &context = *con.context;
@@ -138,6 +164,17 @@ bool TestPRFDirectRanges(DuckDB &db) {
 	return true;
 }
 
+bool TestClusteredKeySpan() {
+	const auto keys_two = GenerateClusteredKeysForTest(100, 10, 2);
+	const auto keys_three = GenerateClusteredKeysForTest(100, 10, 3);
+	const auto keys_one = GenerateClusteredKeysForTest(100, 10, 1);
+	if (keys_two.back() != 99 || keys_three.back() != 99 || keys_one.back() != 9) {
+		std::cerr << "Clustered key generator sanity check failed\n";
+		return false;
+	}
+	return true;
+}
+
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
 bool TestGrafite() {
 	std::vector<uint64_t> build_keys = {0, 1, 10, 11, 20, 21};
@@ -159,7 +196,7 @@ bool TestGrafite() {
 
 int main() {
 	DuckDB db(nullptr);
-	if (!TestBloom(db) || !TestPRF(db) || !TestPRFDirectRanges(db)) {
+	if (!TestBloom(db) || !TestPRF(db) || !TestPRFDirectRanges(db) || !TestClusteredKeySpan()) {
 		return 1;
 	}
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
