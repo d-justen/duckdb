@@ -4317,6 +4317,24 @@ PragmaType EnumUtil::FromString<PragmaType>(const char *value) {
 	return static_cast<PragmaType>(StringUtil::StringToEnum(GetPragmaTypeValues(), 2, "PragmaType", value));
 }
 
+const StringUtil::EnumStringLiteral *GetPrefixRangeCompressionModeValues() {
+	static constexpr StringUtil::EnumStringLiteral values[] {
+		{ static_cast<uint32_t>(PrefixRangeCompressionMode::BITMAP), "BITMAP" },
+		{ static_cast<uint32_t>(PrefixRangeCompressionMode::DIRECT_RANGES), "DIRECT_RANGES" }
+	};
+	return values;
+}
+
+template<>
+const char* EnumUtil::ToChars<PrefixRangeCompressionMode>(PrefixRangeCompressionMode value) {
+	return StringUtil::EnumToString(GetPrefixRangeCompressionModeValues(), 2, "PrefixRangeCompressionMode", static_cast<uint32_t>(value));
+}
+
+template<>
+PrefixRangeCompressionMode EnumUtil::FromString<PrefixRangeCompressionMode>(const char *value) {
+	return static_cast<PrefixRangeCompressionMode>(StringUtil::StringToEnum(GetPrefixRangeCompressionModeValues(), 2, "PrefixRangeCompressionMode", value));
+}
+
 const StringUtil::EnumStringLiteral *GetPreparedParamTypeValues() {
 	static constexpr StringUtil::EnumStringLiteral values[] {
 		{ static_cast<uint32_t>(PreparedParamType::AUTO_INCREMENT), "AUTO_INCREMENT" },
