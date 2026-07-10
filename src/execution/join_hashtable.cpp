@@ -978,6 +978,38 @@ void JoinHashTable::MergePrefixRangeBuildState(PrefixRangeFilter::BuildState &st
 	prefix_range_filter->MergeBuildState(state);
 }
 
+bool JoinHashTable::AnalyzePrefixRangeFilter() {
+	if (!ShouldAnalyzePrefixRangeFilter()) {
+		return false;
+	}
+	prefix_range_filter->Compress(context, prefix_range_filter_false_positive_rate_threshold);
+	const auto analysis = prefix_range_filter->Analyze();
+	const bool exceeds_threshold = analysis.false_positive_rate > prefix_range_filter_false_positive_rate_threshold;
+	prefix_range_filter->SetAllowsTupleFiltering(!exceeds_threshold);
+	should_analyze_prefix_range_filter = false;
+	return exceeds_threshold;
+}
+
+void JoinHashTable::BuildBloomFilter() {
+	SetBuildBloomFilter(true);
+	PrepareBloomFilterForFinalize();
+	TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, 0,
+	                                data_collection->ChunkCount(), false);
+	Vector hashes(LogicalType::HASH);
+	do {
+		const auto count = iterator.GetCurrentChunkCount();
+		if (count == 0) {
+			continue;
+		}
+		Vector build_keys(layout_ptr->GetTypes()[0], count);
+		auto &sel = *FlatVector::IncrementalSelectionVector();
+		data_collection->Gather(iterator.GetChunkState().row_locations, sel, count, 0, build_keys, sel, nullptr);
+		FlatVector::SetSize(build_keys, count_t(count));
+		VectorOperations::Hash(build_keys, hashes, count);
+		bloom_filter.InsertHashes(hashes);
+	} while (iterator.Next());
+}
+
 void JoinHashTable::AllocatePointerTable() {
 	capacity = PointerTableCapacity(Count());
 	D_ASSERT(IsPowerOfTwo(capacity));
@@ -2431,6 +2463,8 @@ void JoinHashTable::ResetForNewIterationSinglePartition() {
 	bloom_filter_init_count = 0;
 	prefix_range_filter.reset();
 	should_build_prefix_range_filter = false;
+	should_analyze_prefix_range_filter = false;
+	prefix_range_filter_false_positive_rate_threshold = 0.0;
 	ResetCorrelatedMarkJoinInfo(*this);
 	// The next iteration may rebuild a different small build side, so this iteration's dictionary
 	// state is stale. Keep in lock-step with BuildDictionaryArrays, which sets these four fields.

@@ -1,0 +1,25 @@
+# name: benchmark/micro/pushdown/prefix_range_filter_bitmap_exact.benchmark
+# description: Prefix range filter exact bitmap lookup path
+# group: [pushdown]
+
+name PrefixRangeFilterBitmapExact
+group micro
+subgroup pushdown
+
+storage persistent
+
+load
+CREATE TABLE build AS SELECT i id, i < 2500000 p FROM range(5000000) _(i);
+CREATE TABLE probe AS SELECT ((i * 15485863) % 5000000) id FROM range(25000000) _(i);
+
+init
+SET disabled_optimizers TO 'compressed_materialization';
+SET enable_prefix_range_filter=true;
+SET enable_join_bloom_filter_pushdown=false;
+SET enable_join_min_max_filter_pushdown=false;
+
+run
+SELECT count(*) FROM build, probe WHERE build.id = probe.id AND p = TRUE;
+
+result I
+12500000

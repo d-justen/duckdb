@@ -132,20 +132,23 @@ bool BloomFilter::LookupOne(const uint64_t hash) const {
 
 BloomFilterFunctionData::BloomFilterFunctionData(optional_ptr<BloomFilter> filter_p, bool filters_null_values_p,
                                                  const string &key_column_name_p, const LogicalType &key_type_p,
-                                                 float selectivity_threshold_p, idx_t n_vectors_to_check_p)
-    : filter(filter_p), filters_null_values(filters_null_values_p), key_column_name(key_column_name_p),
-      key_type(key_type_p), selectivity_threshold(selectivity_threshold_p), n_vectors_to_check(n_vectors_to_check_p) {
+                                                 float selectivity_threshold_p, idx_t n_vectors_to_check_p,
+                                                 bool allow_row_group_pruning_p)
+    : filter(filter_p), filters_null_values(filters_null_values_p), allow_row_group_pruning(allow_row_group_pruning_p),
+      key_column_name(key_column_name_p), key_type(key_type_p), selectivity_threshold(selectivity_threshold_p),
+      n_vectors_to_check(n_vectors_to_check_p) {
 }
 
 unique_ptr<FunctionData> BloomFilterFunctionData::Copy() const {
 	return make_uniq<BloomFilterFunctionData>(filter, filters_null_values, key_column_name, key_type,
-	                                          selectivity_threshold, n_vectors_to_check);
+	                                          selectivity_threshold, n_vectors_to_check, allow_row_group_pruning);
 }
 
 bool BloomFilterFunctionData::Equals(const FunctionData &other_p) const {
 	auto &other = other_p.Cast<BloomFilterFunctionData>();
 	return filter.get() == other.filter.get() && filters_null_values == other.filters_null_values &&
-	       key_column_name == other.key_column_name && key_type == other.key_type;
+	       allow_row_group_pruning == other.allow_row_group_pruning && key_column_name == other.key_column_name &&
+	       key_type == other.key_type;
 }
 
 static idx_t SelectBloomFilter(Vector &input, const BloomFilterFunctionData &func_data, SelectionVector &result_sel,
@@ -271,6 +274,9 @@ FilterPropagateResult BloomFilterScalarFun::FilterPrune(const FunctionStatistics
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
 	auto &data = input.bind_data->Cast<BloomFilterFunctionData>();
+	if (!data.allow_row_group_pruning) {
+		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+	}
 	if (!data.filter || !data.filter->IsInitialized()) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}

@@ -645,6 +645,27 @@
         "struct": "EnableHTTPMetadataCacheSetting"
     },
     {
+        "name": "enable_join_bloom_filter_pushdown",
+        "description": "Whether bloom filters may be pushed down from hash joins",
+        "type": "BOOLEAN",
+        "default_scope": "local",
+        "default_value": "true"
+    },
+    {
+        "name": "enable_join_bloom_filter_row_group_pruning",
+        "description": "Whether bloom filters pushed down from hash joins may prune row groups",
+        "type": "BOOLEAN",
+        "default_scope": "local",
+        "default_value": "true"
+    },
+    {
+        "name": "enable_join_min_max_filter_pushdown",
+        "description": "Whether min/max filters may be pushed down from hash joins",
+        "type": "BOOLEAN",
+        "default_scope": "local",
+        "default_value": "true"
+    },
+    {
         "name": "enable_logging",
         "description": "Enables the logger",
         "type": "BOOLEAN",
@@ -671,6 +692,13 @@
         "description": "Whether or not query optimization is enabled",
         "type": "BOOLEAN",
         "default_scope": "global",
+        "default_value": "true"
+    },
+    {
+        "name": "enable_prefix_range_filter",
+        "description": "Whether dynamic prefix range filters may be generated from hash joins",
+        "type": "BOOLEAN",
+        "default_scope": "local",
         "default_value": "true"
     },
     {

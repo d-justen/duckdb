@@ -1,0 +1,22 @@
+# name: benchmark/micro/pushdown/prefix_range_filter_direct_ranges_manual.benchmark
+# description: Manual four-range predicate matching the direct prefix range filter workload
+# group: [pushdown]
+
+name PrefixRangeFilterDirectRangesManual
+group micro
+subgroup pushdown
+
+storage persistent
+
+load
+CREATE TABLE probe AS SELECT ((i * 15485863) % 60010000) id FROM range(60010000) _(i);
+
+run
+SELECT count(*) FROM probe
+WHERE id BETWEEN 0 AND 9999
+   OR id BETWEEN 20000000 AND 20009999
+   OR id BETWEEN 40000000 AND 40009999
+   OR id BETWEEN 60000000 AND 60009999;
+
+result I
+40000

@@ -1,0 +1,109 @@
+# name: test/sql/join/inner/test_join_filter_pushdown_settings.test
+# description: Test independent hash join filter controls
+# group: [inner]
+
+statement ok
+PRAGMA threads=1;
+
+statement ok
+SET disabled_optimizers = 'join_order,build_side_probe_side,compressed_materialization';
+
+statement ok
+CREATE TABLE probe_numeric AS
+SELECT i::BIGINT AS k, (i % 7)::INTEGER AS g FROM range(100000) t(i);
+
+statement ok
+CREATE TABLE build_numeric AS
+SELECT (i * 2)::BIGINT AS k, (i % 7)::INTEGER AS g FROM range(30000) t(i);
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe_numeric p JOIN build_numeric b ON p.k = b.k AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN PRF\(k\).*
+
+statement ok
+SET enable_prefix_range_filter=false;
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe_numeric p JOIN build_numeric b ON p.k = b.k AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*IN PRF\(k\).*
+
+statement ok
+RESET enable_prefix_range_filter;
+
+statement ok
+CREATE TABLE probe_bloom AS
+SELECT (i * 1000)::HUGEINT AS k, (i % 7)::INTEGER AS g FROM range(100000) t(i);
+
+statement ok
+CREATE TABLE build_bloom AS
+SELECT (i * 2000)::HUGEINT AS k, (i % 7)::INTEGER AS g FROM range(30000) t(i);
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe_bloom p JOIN build_bloom b ON p.k = b.k AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN BF\(k\).*
+
+statement ok
+SET enable_join_bloom_filter_pushdown=false;
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe_bloom p JOIN build_bloom b ON p.k = b.k AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*IN BF\(k\).*
+
+statement ok
+RESET enable_join_bloom_filter_pushdown;
+
+statement ok
+SET enable_join_min_max_filter_pushdown=false;
+
+statement ok
+CREATE TABLE probe_inequality AS SELECT i::BIGINT AS k, (i % 7)::INTEGER AS g FROM range(1000) t(i);
+
+statement ok
+CREATE TABLE build_inequality AS SELECT (i * 2)::BIGINT AS k, (i % 7)::INTEGER AS g FROM range(100) t(i);
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe_inequality p JOIN build_inequality b ON p.k >= b.k AND p.g = b.g;
+----
+analyzed_plan	<!REGEX>:(?s).*Dynamic.*Filters:.*optional:.*k.*>=.*
+
+statement ok
+RESET enable_join_min_max_filter_pushdown;
+
+# Disabling Bloom row-group pruning must leave Bloom tuple filtering enabled.
+statement ok
+SET enable_join_bloom_filter_row_group_pruning=false;
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM probe_bloom p JOIN build_bloom b ON p.k = b.k AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN BF\(k\).*
+
+statement ok
+RESET enable_join_bloom_filter_row_group_pruning;
+
+# Exercise parallel and forced-external hash joins with the new settings present.
+statement ok
+SET threads=4;
+
+query I
+SELECT count(*) FROM probe_numeric p JOIN build_numeric b ON p.k = b.k;
+----
+30000
+
+statement ok
+SET debug_force_external=true;
+
+query I
+SELECT count(*) FROM probe_numeric p JOIN build_numeric b ON p.k = b.k;
+----
+30000
+
+statement ok
+RESET debug_force_external;
+
+statement ok
+SET disabled_optimizers = '';

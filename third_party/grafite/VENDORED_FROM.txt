@@ -1,0 +1,9 @@
+Repository: https://github.com/marcocosta97/grafite
+Branch: main
+Vendored commit: 6838e9c6f757b300c410e79bc9c608ece2c5f23f
+
+Notes:
+- Vendored for filter_benchmark integration.
+- Uses the SUX-based default implementation.
+- GPLv3 code is compiled only when BUILD_FILTER_BENCHMARK and BUILD_GRAFITE_BENCHMARK are enabled explicitly.
+- Trailing whitespace was normalized after copying.

@@ -14,6 +14,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/column_binding.hpp"
 #include "duckdb/planner/expression.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
 namespace duckdb {
@@ -128,7 +129,8 @@ private:
 	bool TryRegisterPrefixRangeFilter(const JoinFilterPushdownFilter &info, ClientContext &context, JoinHashTable &ht,
 	                                  const PhysicalOperator &op, const JoinFilterPushdownColumn &column,
 	                                  ProjectionIndex filter_col_idx, const Value &min_val, const Value &max_val,
-	                                  idx_t max_bits, JoinFilterGlobalState &gstate) const;
+	                                  const PrefixRangeFilter::Sizing &sizing, bool register_bloom_fallback,
+	                                  JoinFilterGlobalState &gstate) const;
 
 	bool CanUseInFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht, const ExpressionType &cmp) const;
 	bool CanUseBloomFilter(const ClientContext &context, const PhysicalComparisonJoin &op, const ExpressionType &cmp,

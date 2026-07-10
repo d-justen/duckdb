@@ -1,0 +1,7 @@
+Upstream repository: https://github.com/n3slami/Diva
+Vendored commit: d0f85b25a90e00e3aeff4391e2f280d11cacb2af
+
+This directory contains the minimal subset of the upstream Diva repository
+needed to build the integer-optimized benchmark adapter on supported Linux
+x86_64 platforms.
+Trailing whitespace was normalized after copying.

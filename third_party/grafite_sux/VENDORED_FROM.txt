@@ -1,0 +1,7 @@
+Repository: https://github.com/marcocosta97/sux
+Branch: master
+Vendored commit: ae970b754118b802a0342798378861fb22fe8411
+
+Notes:
+- Vendored as Grafite's default SUX dependency for Elias-Fano support.
+- Trailing whitespace was normalized after copying.

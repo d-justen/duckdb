@@ -1,0 +1,32 @@
+# name: benchmark/micro/pushdown/prefix_range_filter_direct_ranges.benchmark
+# description: Prefix range filter direct-range compressed lookup path
+# group: [pushdown]
+
+name PrefixRangeFilterDirectRanges
+group micro
+subgroup pushdown
+
+storage persistent
+
+load
+CREATE TABLE build AS
+SELECT i % 10000 id FROM range(1000000) _(i)
+UNION ALL
+SELECT 20000000 + (i % 10000) id FROM range(1000000) _(i)
+UNION ALL
+SELECT 40000000 + (i % 10000) id FROM range(1000000) _(i)
+UNION ALL
+SELECT 60000000 + (i % 10000) id FROM range(1000000) _(i);
+CREATE TABLE probe AS SELECT ((i * 15485863) % 60010000) id FROM range(60010000) _(i);
+
+init
+SET disabled_optimizers TO 'compressed_materialization';
+SET enable_prefix_range_filter=true;
+SET enable_join_bloom_filter_pushdown=false;
+SET enable_join_min_max_filter_pushdown=false;
+
+run
+SELECT count(*) FROM build, probe WHERE build.id = probe.id;
+
+result I
+4000000

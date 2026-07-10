@@ -998,6 +998,36 @@ struct EnableHTTPMetadataCacheSetting {
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
+struct EnableJoinBloomFilterPushdownSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_join_bloom_filter_pushdown";
+	static constexpr const char *Description = "Whether bloom filters may be pushed down from hash joins";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
+struct EnableJoinBloomFilterRowGroupPruningSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_join_bloom_filter_row_group_pruning";
+	static constexpr const char *Description = "Whether bloom filters pushed down from hash joins may prune row groups";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
+struct EnableJoinMinMaxFilterPushdownSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_join_min_max_filter_pushdown";
+	static constexpr const char *Description = "Whether min/max filters may be pushed down from hash joins";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
 struct EnableLogging {
 	using RETURN_TYPE = bool;
 	static constexpr const char *Name = "enable_logging";
@@ -1036,6 +1066,16 @@ struct EnableOptimizerSetting {
 	static constexpr const char *InputType = "BOOLEAN";
 	static constexpr const char *DefaultValue = "true";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
+struct EnablePrefixRangeFilterSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_prefix_range_filter";
+	static constexpr const char *Description = "Whether dynamic prefix range filters may be generated from hash joins";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 

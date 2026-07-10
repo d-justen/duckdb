@@ -117,10 +117,12 @@ private:
 struct BloomFilterFunctionData : public FunctionData {
 	BloomFilterFunctionData(optional_ptr<BloomFilter> filter_p, bool filters_null_values_p,
 	                        const string &key_column_name_p, const LogicalType &key_type_p,
-	                        float selectivity_threshold_p, idx_t n_vectors_to_check_p);
+	                        float selectivity_threshold_p, idx_t n_vectors_to_check_p,
+	                        bool allow_row_group_pruning_p = true);
 
 	optional_ptr<BloomFilter> filter;
 	bool filters_null_values;
+	bool allow_row_group_pruning;
 	string key_column_name;
 	LogicalType key_type;
 	float selectivity_threshold;
@@ -130,9 +132,30 @@ struct BloomFilterFunctionData : public FunctionData {
 	bool Equals(const FunctionData &other) const override;
 };
 
+enum class PrefixRangeCompressionMode : uint8_t { BITMAP, DIRECT_RANGES };
+
 //! Runtime prefix-range filter state used by join pushdown and internal tablefilter functions.
 class PrefixRangeFilter {
 public:
+	struct Sizing {
+		uhugeint_t span;
+		idx_t shift;
+	};
+
+	struct Analysis {
+		idx_t active_buckets;
+		double false_positive_rate;
+	};
+
+	struct CompressionInfo {
+		PrefixRangeCompressionMode mode = PrefixRangeCompressionMode::BITMAP;
+		idx_t shift = 0;
+		idx_t range_count = 0;
+		idx_t active_buckets = 0;
+		idx_t logical_bucket_count = 0;
+		double false_positive_rate = 0;
+	};
+
 	struct BuildState {
 		virtual ~BuildState() = default;
 		template <class TARGET>
@@ -149,7 +172,8 @@ public:
 	};
 
 	virtual ~PrefixRangeFilter() = default;
-	virtual void Initialize(ClientContext &context, idx_t number_of_rows, Value min, Value max, idx_t max_bits) = 0;
+	virtual void Initialize(ClientContext &context, idx_t number_of_rows, Value min, Value max,
+	                        const Sizing &sizing) = 0;
 	virtual unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const = 0;
 	virtual void InsertKeys(Vector &keys, BuildState &state) const = 0;
 	virtual void MergeBuildState(BuildState &state) = 0;
@@ -158,10 +182,31 @@ public:
 	virtual idx_t LookupKeys(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel,
 	                         idx_t count) const = 0;
 	virtual FilterPropagateResult LookupRange(const Value &lower_bound, const Value &upper_bound) const = 0;
+	virtual FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const = 0;
 	virtual bool IsInitialized() const = 0;
+	virtual Analysis Analyze() const = 0;
+	virtual void Compress(ClientContext &context, double max_false_positive_rate) = 0;
+	virtual CompressionInfo GetCompressionInfo() const = 0;
 	static bool SupportedType(const LogicalType &type);
 	static unique_ptr<PrefixRangeFilter> CreatePrefixRangeFilter(const LogicalType &key_type);
 	static bool TryComputeSpan(const Value &lower_bound, const Value &upper_bound, uhugeint_t &result);
+	static bool TryComputeSizing(const Value &min, const Value &max, idx_t count, Sizing &sizing,
+	                             double false_positive_rate = 0.001);
+	static bool TryComputeFixedSizeSizing(const Value &min, const Value &max, idx_t bucket_count_limit, Sizing &sizing);
+	static bool TryComputeBucketCount(const uhugeint_t &span, idx_t shift, idx_t &bucket_count);
+	static double ComputeFalsePositiveRateUpperBound(const uhugeint_t &span, idx_t count, idx_t shift);
+	static double EstimateFalsePositiveRate(const uhugeint_t &span, idx_t key_count, idx_t active_buckets, idx_t shift);
+
+	void SetAllowsTupleFiltering(bool enabled) {
+		allows_tuple_filtering = enabled;
+	}
+
+	bool AllowsTupleFiltering() const {
+		return allows_tuple_filtering;
+	}
+
+protected:
+	bool allows_tuple_filtering = true;
 };
 
 //! FunctionData for prefix range internal function

@@ -1091,6 +1091,9 @@ private:
 		for (auto &prefix_range_state : prefix_range_states) {
 			sink.hash_table->MergePrefixRangeBuildState(*prefix_range_state);
 		}
+		if (sink.hash_table->AnalyzePrefixRangeFilter()) {
+			sink.hash_table->BuildBloomFilter();
+		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
 
 		// Both finalize paths finish writing the chains before reaching here,
@@ -1381,21 +1384,24 @@ void JoinFilterPushdownInfo::DeferRuntimeFilter(DeferredRuntimeFilterType type, 
 	gstate.deferred_runtime_filters.push_back({type, &op, info.dynamic_filters, column, filter_col_idx});
 }
 
-bool JoinFilterPushdownInfo::TryRegisterPrefixRangeFilter(const JoinFilterPushdownFilter &info, ClientContext &context,
-                                                          JoinHashTable &ht, const PhysicalOperator &op,
-                                                          const JoinFilterPushdownColumn &column,
-                                                          ProjectionIndex filter_col_idx, const Value &min_val,
-                                                          const Value &max_val, idx_t max_bits,
-                                                          JoinFilterGlobalState &gstate) const {
+bool JoinFilterPushdownInfo::TryRegisterPrefixRangeFilter(
+    const JoinFilterPushdownFilter &info, ClientContext &context, JoinHashTable &ht, const PhysicalOperator &op,
+    const JoinFilterPushdownColumn &column, ProjectionIndex filter_col_idx, const Value &min_val, const Value &max_val,
+    const PrefixRangeFilter::Sizing &sizing, bool register_bloom_fallback, JoinFilterGlobalState &gstate) const {
 	if (!ht.GetPrefixRangeFilter()) {
 		const auto key_type = ht.conditions[0].GetLHS().GetReturnType();
 		auto prefix_filter = PrefixRangeFilter::CreatePrefixRangeFilter(key_type);
-		prefix_filter->Initialize(context, ht.Count(), min_val, max_val, max_bits);
+		prefix_filter->Initialize(context, ht.Count(), min_val, max_val, sizing);
 		ht.SetPrefixRangeFilter(std::move(prefix_filter));
 		ht.SetBuildPrefixRangeFilter();
+		static constexpr double PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD = 0.001;
+		ht.SetAnalyzePrefixRangeFilter(PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD);
 	}
 
 	DeferRuntimeFilter(DeferredRuntimeFilterType::PREFIX_RANGE, op, info, column, filter_col_idx, gstate);
+	if (register_bloom_fallback) {
+		DeferRuntimeFilter(DeferredRuntimeFilterType::BLOOM_FILTER, op, info, column, filter_col_idx, gstate);
+	}
 	return true;
 }
 
@@ -1444,7 +1450,6 @@ static unique_ptr<Expression> CreateRuntimeFilterExpression(ClientContext &conte
 
 	switch (deferred.type) {
 	case DeferredRuntimeFilterType::BLOOM_FILTER: {
-		D_ASSERT(ht.GetBloomFilter().IsInitialized());
 		if (!ht.GetBloomFilter().IsInitialized()) {
 			return nullptr;
 		}
@@ -1452,7 +1457,8 @@ static unique_ptr<Expression> CreateRuntimeFilterExpression(ClientContext &conte
 		return make_uniq<BoundFunctionExpression>(
 		    BoundScalarFunction(BloomFilterScalarFun::GetFunction(filter_input_type)), std::move(children),
 		    make_uniq<BloomFilterFunctionData>(ht.GetBloomFilter(), filters_null_values, key_name, key_type,
-		                                       selectivity_threshold, n_vectors_to_check));
+		                                       selectivity_threshold, n_vectors_to_check,
+		                                       Settings::Get<EnableJoinBloomFilterRowGroupPruningSetting>(context)));
 	}
 	case DeferredRuntimeFilterType::PREFIX_RANGE: {
 		auto prefix_range_filter = ht.GetPrefixRangeFilter();
@@ -1574,6 +1580,28 @@ static void CreateDynamicMinMaxFilters(const PhysicalComparisonJoin &op, const J
 	}
 }
 
+static bool PlanPrefixRangeFilter(const Value &min, const Value &max, PrefixRangeFilter::Sizing &sizing,
+                                  bool &approximate) {
+	static constexpr idx_t EXACT_BUCKET_COUNT_THRESHOLD = 1ULL << 23;
+	static constexpr idx_t FIXED_SIZE_BUCKET_COUNT = 1ULL << 26;
+	if (!PrefixRangeFilter::TryComputeSpan(min, max, sizing.span)) {
+		return false;
+	}
+	sizing.shift = 0;
+	if (sizing.span == 0) {
+		approximate = false;
+		return true;
+	}
+	idx_t bucket_count;
+	if (PrefixRangeFilter::TryComputeBucketCount(sizing.span, sizing.shift, bucket_count) &&
+	    bucket_count <= EXACT_BUCKET_COUNT_THRESHOLD) {
+		approximate = false;
+		return true;
+	}
+	approximate = true;
+	return PrefixRangeFilter::TryComputeFixedSizeSizing(min, max, FIXED_SIZE_BUCKET_COUNT, sizing);
+}
+
 static idx_t BloomFilterBitBudget(idx_t ht_count) {
 	return BloomFilter::GetNumberOfSectors(ht_count) * 64;
 }
@@ -1586,6 +1614,9 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(ClientContext &con
 	if (probe_info.empty()) {
 		return final_min_max; // There are no table sources in which we can push down filters
 	}
+	const bool enable_bloom_filter = Settings::Get<EnableJoinBloomFilterPushdownSetting>(context);
+	const bool enable_min_max_filter = Settings::Get<EnableJoinMinMaxFilterPushdownSetting>(context);
+	const bool enable_prefix_range_filter = Settings::Get<EnablePrefixRangeFilterSetting>(context);
 
 	// create a filter for each column that reached a table scan
 	for (auto &info : probe_info) {
@@ -1645,15 +1676,18 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(ClientContext &con
 				if (cmp != ExpressionType::COMPARE_EQUAL) {
 					// min != max - generate range filters for non-equality comparisons.
 					// For non-equalities, the range must be half-open.
-					CreateDynamicMinMaxFilters(op, info, context, pushdown_column, filter_col_idx, cmp, min_val,
-					                           max_val, condition_type, reconstruct_filter_expression, true);
+					if (enable_min_max_filter) {
+						CreateDynamicMinMaxFilters(op, info, context, pushdown_column, filter_col_idx, cmp, min_val,
+						                           max_val, condition_type, reconstruct_filter_expression, true);
+					}
 					continue;
 				}
 
 				uhugeint_t span;
 				const auto can_compute_span =
 				    PrefixRangeFilter::TryComputeSpan(min_val_before_cast, max_val_before_cast, span);
-				const auto can_emit_prf = allow_prefix_range_filters && can_emit_runtime_filters && gstate &&
+				const auto can_emit_prf = enable_prefix_range_filter && allow_prefix_range_filters &&
+				                          can_emit_runtime_filters && gstate &&
 				                          CanUsePrefixRangeFilter(context, op, ht, cmp) && can_compute_span;
 
 				bool pushed_in_filter = false;
@@ -1661,33 +1695,31 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(ClientContext &con
 					pushed_in_filter = PushInFilter(info, pushdown_column, *ht, op, filter_idx, filter_col_idx);
 				}
 
-				static constexpr idx_t SMALL_EXACT_PRF_BITS = 1ULL << 26;
-				if (can_emit_prf && span < SMALL_EXACT_PRF_BITS &&
-				    TryRegisterPrefixRangeFilter(info, context, *ht, op, pushdown_column, filter_col_idx,
-				                                 min_val_before_cast, max_val_before_cast, SMALL_EXACT_PRF_BITS,
-				                                 *gstate)) {
-					continue;
-				}
-
 				if (can_emit_prf) {
+					static constexpr idx_t SMALL_PRF_SPAN = 1ULL << 26;
 					auto build_count = ht->Count();
 					if (build_count == 0) {
 						build_count = ht->GetSinkCollection().Count();
 					}
-					const auto bloom_filter_bits = BloomFilterBitBudget(build_count);
-					if (span <= bloom_filter_bits &&
-					    TryRegisterPrefixRangeFilter(info, context, *ht, op, pushdown_column, filter_col_idx,
-					                                 min_val_before_cast, max_val_before_cast, bloom_filter_bits,
-					                                 *gstate)) {
+					const bool main_precedence_selects_prf =
+					    span < SMALL_PRF_SPAN || span <= BloomFilterBitBudget(build_count);
+					PrefixRangeFilter::Sizing sizing;
+					bool approximate = false;
+					if (main_precedence_selects_prf &&
+					    PlanPrefixRangeFilter(min_val_before_cast, max_val_before_cast, sizing, approximate) &&
+					    TryRegisterPrefixRangeFilter(
+					        info, context, *ht, op, pushdown_column, filter_col_idx, min_val_before_cast,
+					        max_val_before_cast, sizing,
+					        approximate && enable_bloom_filter && CanUseBloomFilter(context, op, cmp, ht), *gstate)) {
 						continue;
 					}
 				}
 
-				if (!pushed_in_filter) {
+				if (enable_min_max_filter && !pushed_in_filter) {
 					CreateDynamicMinMaxFilters(op, info, context, pushdown_column, filter_col_idx, cmp, min_val,
 					                           max_val, condition_type, reconstruct_filter_expression, false);
 				}
-				if (allow_bloom_filters && can_emit_runtime_filters && ht && gstate &&
+				if (enable_bloom_filter && allow_bloom_filters && can_emit_runtime_filters && ht && gstate &&
 				    CanUseBloomFilter(context, op, cmp, ht)) {
 					ht->SetBuildBloomFilter(true);
 					DeferRuntimeFilter(DeferredRuntimeFilterType::BLOOM_FILTER, op, info, pushdown_column,
@@ -1821,6 +1853,9 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 		                                 sink.global_filter_state.get());
 		if (use_perfect_hash) {
 			ht.BuildPrefixRangeFilter();
+			if (ht.AnalyzePrefixRangeFilter()) {
+				ht.BuildBloomFilter();
+			}
 			PublishDeferredRuntimeFilters(context, ht, *sink.global_filter_state);
 		}
 	}

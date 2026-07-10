@@ -6,13 +6,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "duckdb/planner/filter/table_filter_functions.hpp"
-#include "duckdb/planner/filter/table_filter_function_helpers.hpp"
-
-#include "duckdb/execution/expression_executor_state.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/storage/statistics/numeric_stats.hpp"
-
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/array.hpp"
 #include "duckdb/common/assert.hpp"
@@ -29,13 +22,16 @@
 #include "duckdb/common/types/uhugeint.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/uhugeint.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/filter/table_filter_function_helpers.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
-#include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include "duckdb/planner/table_filter_state.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 
@@ -60,19 +56,18 @@ struct PrefixRangeBitmapBuildState : public PrefixRangeFilter::BuildState {
 template <typename U>
 class PrefixRangeBitmap {
 public:
-	void Initialize(ClientContext &context, U min_p, U span_p, idx_t max_bits) {
+	void Initialize(ClientContext &context, U min_p, U span_p, idx_t shift_p) {
 		min = min_p;
 		span = span_p;
-		shift = 0;
-
-		while ((span >> shift) >= max_bits) {
-			shift++;
-		}
+		shift = shift_p;
 
 		const idx_t buckets = UnsafeNumericCast<idx_t>((span >> shift) + 1);
+		logical_bucket_count = buckets;
 		word_count = buckets == 0 ? 1 : (buckets + 63) >> WORD_SHIFT;
 
 		buf_ = AllocateBitmap(context, word_count, bitmap);
+		mode = Mode::BITMAP;
+		range_count = 0;
 
 		// Only mark initialized as true when local bitmaps are merged.
 		initialized = false;
@@ -109,9 +104,12 @@ public:
 		}
 
 		const U comparable = CONVERTER::Convert(value.GetValueUnsafe<T>());
+		if (mode == Mode::DIRECT_RANGES) {
+			return DirectRangeLookup(comparable);
+		}
 		const U y = comparable - min;
-		const U bit_idx = y >> shift;
 		const uint8_t in_range = y <= span;
+		const U bit_idx = ShiftRight(y, shift);
 		const uint32_t word_idx = (bit_idx >> WORD_SHIFT) & (0U - in_range);
 		const uint8_t bit = (bitmap[word_idx] >> (bit_idx & WORD_MASK)) & 1ULL;
 		return bit & in_range;
@@ -119,90 +117,153 @@ public:
 
 	template <typename T, typename CONVERTER>
 	idx_t LookupKeys(Vector &keys, SelectionVector &result_sel, idx_t count) const {
-		idx_t found_count = 0;
-		for (const auto &entry : keys.template ValidValues<T>()) {
-			const U comparable = CONVERTER::Convert(entry.GetValue());
-			const U y = comparable - min;
-			const U bit_idx = y >> shift;
-			const uint8_t in_range = y <= span;
-			const uint32_t word_idx = (bit_idx >> WORD_SHIFT) & (0U - in_range);
-			const uint8_t bit = (bitmap[word_idx] >> (bit_idx & WORD_MASK)) & 1ULL;
-
-			result_sel.set_index(found_count, entry.GetIndex());
-			found_count += bit & in_range;
+		if (mode == Mode::DIRECT_RANGES) {
+			return LookupKeysDirect<T, CONVERTER>(keys, result_sel, count);
 		}
-		return found_count;
+		return LookupKeysBitmap<T, CONVERTER>(keys, result_sel, count);
 	}
 
 	template <typename T, typename CONVERTER>
 	idx_t LookupKeys(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel, idx_t count) const {
 		UnifiedVectorFormat key_data;
 		keys.ToUnifiedFormat(key_data);
-
 		const auto keys_data = UnifiedVectorFormat::GetData<T>(key_data);
 		idx_t found_count = 0;
 		for (idx_t i = 0; i < count; i++) {
-			const auto idx = sel.get_index_unsafe(i);
-			const auto key_idx = key_data.sel->get_index(idx);
+			const auto source_idx = sel.get_index_unsafe(i);
+			const auto key_idx = key_data.sel->get_index(source_idx);
 			if (!key_data.validity.RowIsValid(key_idx)) {
 				continue;
 			}
 			const U comparable = CONVERTER::Convert(keys_data[key_idx]);
-			const U y = comparable - min;
-			const U bit_idx = y >> shift;
-			const uint8_t in_range = y <= span;
-			const uint32_t word_idx = (bit_idx >> WORD_SHIFT) & (0U - in_range);
-			const uint8_t bit = (bitmap[word_idx] >> (bit_idx & WORD_MASK)) & 1ULL;
-
-			result_sel.set_index(found_count, i);
-			found_count += bit & in_range;
+			bool matches;
+			if (mode == Mode::DIRECT_RANGES) {
+				matches = DirectRangeLookup(comparable);
+			} else {
+				const U y = comparable - min;
+				const uint8_t in_range = y <= span;
+				const U bit_idx = ShiftRight(y, shift);
+				const uint32_t word_idx = (bit_idx >> WORD_SHIFT) & (0U - in_range);
+				matches = ((bitmap[word_idx] >> (bit_idx & WORD_MASK)) & 1ULL) && in_range;
+			}
+			if (matches) {
+				result_sel.set_index(found_count++, i);
+			}
 		}
 		return found_count;
 	}
 
 	FilterPropagateResult LookupRange(U lower_bound, U upper_bound) const {
+		if (mode == Mode::DIRECT_RANGES) {
+			auto covered_until = lower_bound;
+			bool found_overlap = false;
+			for (idx_t range_idx = 0; range_idx < range_count; range_idx++) {
+				const auto &range = ranges[range_idx];
+				const auto range_upper = DirectRangeUpper(range);
+				if (range_upper < lower_bound) {
+					continue;
+				}
+				if (range.lower > upper_bound) {
+					break;
+				}
+				if (!found_overlap) {
+					if (range.lower > lower_bound) {
+						return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+					}
+					found_overlap = true;
+				} else if ((covered_until != NumericLimits<U>::Maximum() && range.lower > covered_until + 1) ||
+				           (covered_until == NumericLimits<U>::Maximum() && range.lower > covered_until)) {
+					return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+				}
+				if (range_upper >= upper_bound) {
+					return FilterPropagateResult::FILTER_ALWAYS_TRUE;
+				}
+				covered_until = range_upper;
+			}
+			return found_overlap ? FilterPropagateResult::NO_PRUNING_POSSIBLE
+			                     : FilterPropagateResult::FILTER_ALWAYS_FALSE;
+		}
+
 		const U lb_y = lower_bound - min;
-		const U lb_bit_idx = lb_y >> shift;
+		const U lb_bit_idx = ShiftRight(lb_y, shift);
 		const auto lb_word_idx = lb_bit_idx >> WORD_SHIFT;
 
 		const U ub_y = upper_bound - min;
-		const U ub_bit_idx = ub_y >> shift;
+		const U ub_bit_idx = ShiftRight(ub_y, shift);
 		const auto ub_word_idx = ub_bit_idx >> WORD_SHIFT;
 
 		const idx_t lb_bit_off = UnsafeNumericCast<idx_t>(lb_bit_idx & UnsafeNumericCast<U>(WORD_MASK));
 		const idx_t ub_bit_off = UnsafeNumericCast<idx_t>(ub_bit_idx & UnsafeNumericCast<U>(WORD_MASK));
 
-		// TODO: Count the amount of 1's in the range, compare to a threshold, and make a decision if we want to use the
-		// per-row filter for this row group.
+		bool any_set = false;
+		bool all_set = true;
 		if (lb_word_idx == ub_word_idx) {
 			const auto range_mask = ((~0ULL << lb_bit_off) & (~0ULL >> (WORD_MASK - ub_bit_off)));
-			if (bitmap[lb_word_idx] & range_mask) {
-				return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+			const auto word = bitmap[lb_word_idx] & range_mask;
+			any_set = word != 0;
+			all_set = word == range_mask;
+		} else {
+			const auto lb_word_mask = (~0ULL << lb_bit_off);
+			const auto lb_word = bitmap[lb_word_idx] & lb_word_mask;
+			any_set |= lb_word != 0;
+			all_set &= lb_word == lb_word_mask;
+
+			for (idx_t i = UnsafeNumericCast<idx_t>(lb_word_idx) + 1; i < UnsafeNumericCast<idx_t>(ub_word_idx); i++) {
+				const auto word = bitmap[i];
+				any_set |= word != 0;
+				all_set &= word == ~0ULL;
 			}
-			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+
+			const auto ub_word_mask = ~0ULL >> (WORD_MASK - ub_bit_off);
+			const auto ub_word = bitmap[ub_word_idx] & ub_word_mask;
+			any_set |= ub_word != 0;
+			all_set &= ub_word == ub_word_mask;
 		}
 
-		const auto lb_word_mask = (~0ULL << lb_bit_off);
-		if (bitmap[lb_word_idx] & lb_word_mask) {
-			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		if (all_set) {
+			return FilterPropagateResult::FILTER_ALWAYS_TRUE;
 		}
-
-		for (idx_t i = UnsafeNumericCast<idx_t>(lb_word_idx) + 1; i < UnsafeNumericCast<idx_t>(ub_word_idx); i++) {
-			if (bitmap[i]) {
-				return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-			}
-		}
-
-		const auto ub_word_mask = ~0ULL >> (WORD_MASK - ub_bit_off);
-		if (bitmap[ub_word_idx] & ub_word_mask) {
-			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-		}
-
-		return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+		return any_set ? FilterPropagateResult::NO_PRUNING_POSSIBLE : FilterPropagateResult::FILTER_ALWAYS_FALSE;
 	}
 
 	bool IsInitialized() const {
 		return initialized;
+	}
+
+	PrefixRangeFilter::Analysis Analyze() const {
+		if (mode == Mode::DIRECT_RANGES) {
+			return {active_buckets, direct_false_positive_rate};
+		}
+
+		const auto current_active_buckets = CountActiveBuckets();
+		return {current_active_buckets, ConservativeFalsePositiveRate(
+		                                    Uhugeint::Convert(current_active_buckets) * BucketWidth(), active_buckets)};
+	}
+
+	void Compress(ClientContext &context, double max_false_positive_rate) {
+		if (!initialized || mode != Mode::BITMAP || max_false_positive_rate < 0) {
+			return;
+		}
+		active_buckets = CountActiveBuckets();
+		if (TryCompressToDirectRanges(max_false_positive_rate)) {
+			return;
+		}
+		TryCompressDyadically(context, max_false_positive_rate);
+	}
+
+	PrefixRangeFilter::CompressionInfo GetCompressionInfo() const {
+		PrefixRangeFilter::CompressionInfo info;
+		info.mode = mode == Mode::DIRECT_RANGES ? PrefixRangeCompressionMode::DIRECT_RANGES
+		                                        : PrefixRangeCompressionMode::BITMAP;
+		info.shift = shift;
+		info.range_count = range_count;
+		info.active_buckets = mode == Mode::DIRECT_RANGES ? active_buckets : CountActiveBuckets();
+		info.logical_bucket_count = logical_bucket_count;
+		info.false_positive_rate =
+		    mode == Mode::DIRECT_RANGES
+		        ? direct_false_positive_rate
+		        : ConservativeFalsePositiveRate(Uhugeint::Convert(info.active_buckets) * BucketWidth(), active_buckets);
+		return info;
 	}
 
 	U Min() const {
@@ -216,12 +277,409 @@ public:
 private:
 	static constexpr idx_t WORD_SHIFT = 6;
 	static constexpr idx_t WORD_MASK = 63;
+	static constexpr idx_t MAX_DIRECT_RANGES = 4;
+	static constexpr idx_t MAX_DIRECT_GAPS = MAX_DIRECT_RANGES - 1;
+
+	enum class Mode : uint8_t { BITMAP, DIRECT_RANGES };
+
+	struct DirectRange {
+		U lower;
+		U width;
+	};
+
+	struct Gap {
+		idx_t start;
+		idx_t length;
+	};
+
+	struct BitmapStorage {
+		AllocatedData data;
+		uint64_t *bitmap = nullptr;
+	};
+
+	template <typename T, typename CONVERTER>
+	idx_t LookupKeysBitmap(Vector &keys, SelectionVector &result_sel, idx_t count) const {
+		idx_t found_count = 0;
+		for (const auto &entry : keys.template ValidValues<T>()) {
+			const U comparable = CONVERTER::Convert(entry.GetValue());
+			const U y = comparable - min;
+			const uint8_t in_range = y <= span;
+			const U bit_idx = ShiftRight(y, shift);
+			const uint32_t word_idx = (bit_idx >> WORD_SHIFT) & (0U - in_range);
+			const uint8_t bit = (bitmap[word_idx] >> (bit_idx & WORD_MASK)) & 1ULL;
+
+			result_sel.set_index(found_count, entry.GetIndex());
+			found_count += bit & in_range;
+		}
+		return found_count;
+	}
+
+	template <typename T, typename CONVERTER>
+	idx_t LookupKeysDirect(Vector &keys, SelectionVector &result_sel, idx_t count) const {
+		switch (range_count) {
+		case 1:
+			return LookupKeysDirect<T, CONVERTER, 1>(keys, result_sel, count);
+		case 2:
+			return LookupKeysDirect<T, CONVERTER, 2>(keys, result_sel, count);
+		case 3:
+			return LookupKeysDirect<T, CONVERTER, 3>(keys, result_sel, count);
+		case 4:
+			return LookupKeysDirect<T, CONVERTER, 4>(keys, result_sel, count);
+		default:
+			return 0;
+		}
+	}
+
+	template <typename T, typename CONVERTER, idx_t RANGE_COUNT>
+	idx_t LookupKeysDirect(Vector &keys, SelectionVector &result_sel, idx_t count) const {
+		idx_t found_count = 0;
+		for (const auto &entry : keys.template ValidValues<T>()) {
+			const U comparable = CONVERTER::Convert(entry.GetValue());
+			const uint8_t bit = DirectRangeLookup<RANGE_COUNT>(comparable);
+
+			result_sel.set_index(found_count, entry.GetIndex());
+			found_count += bit;
+		}
+		return found_count;
+	}
+
+	static U ShiftRight(U value, idx_t shift_p) {
+		if (shift_p >= UnsafeNumericCast<idx_t>(sizeof(U) * 8)) {
+			return 0;
+		}
+		return value >> shift_p;
+	}
+
+	static bool IsGapLarger(const Gap &lhs, const Gap &rhs) {
+		if (lhs.length != rhs.length) {
+			return lhs.length > rhs.length;
+		}
+		return lhs.start < rhs.start;
+	}
+
+	static uint64_t MaskForValidBits(idx_t valid_bits) {
+		if (valid_bits >= 64) {
+			return ~0ULL;
+		}
+		if (valid_bits == 0) {
+			return 0;
+		}
+		return (1ULL << valid_bits) - 1ULL;
+	}
+
+	static uint64_t PackMergedPairsTo32(uint64_t word) {
+		uint64_t merged = (word | (word >> 1)) & 0x5555555555555555ULL;
+		merged = (merged | (merged >> 1)) & 0x3333333333333333ULL;
+		merged = (merged | (merged >> 2)) & 0x0F0F0F0F0F0F0F0FULL;
+		merged = (merged | (merged >> 4)) & 0x00FF00FF00FF00FFULL;
+		merged = (merged | (merged >> 8)) & 0x0000FFFF0000FFFFULL;
+		merged = (merged | (merged >> 16)) & 0x00000000FFFFFFFFULL;
+		return merged;
+	}
+
+	static void MaybeInsertTopGap(array<Gap, MAX_DIRECT_GAPS> &top_gaps, idx_t &top_gap_count, Gap candidate) {
+		if (candidate.length == 0) {
+			return;
+		}
+		if (top_gap_count < MAX_DIRECT_GAPS) {
+			top_gaps[top_gap_count++] = candidate;
+		} else {
+			idx_t smallest_idx = 0;
+			for (idx_t i = 1; i < top_gap_count; i++) {
+				if (IsGapLarger(top_gaps[smallest_idx], top_gaps[i])) {
+					smallest_idx = i;
+				}
+			}
+			if (!IsGapLarger(candidate, top_gaps[smallest_idx])) {
+				return;
+			}
+			top_gaps[smallest_idx] = candidate;
+		}
+		std::sort(top_gaps.begin(), top_gaps.begin() + top_gap_count,
+		          [](const Gap &lhs, const Gap &rhs) { return IsGapLarger(lhs, rhs); });
+	}
+
+	static idx_t TopGapLengthSum(const array<Gap, MAX_DIRECT_GAPS> &top_gaps, idx_t top_gap_count, idx_t keep_count) {
+		const auto limit = MinValue<idx_t>(top_gap_count, keep_count);
+		idx_t sum = 0;
+		for (idx_t i = 0; i < limit; i++) {
+			sum += top_gaps[i].length;
+		}
+		return sum;
+	}
+
+	bool ShouldRejectDirectRangeCompression(const array<Gap, MAX_DIRECT_GAPS> &top_gaps, idx_t top_gap_count,
+	                                        idx_t previous_set_bucket, double max_false_positive_rate) const {
+		array<Gap, MAX_DIRECT_GAPS> optimistic_gaps = top_gaps;
+		auto optimistic_gap_count = top_gap_count;
+		if (previous_set_bucket + 1 < logical_bucket_count - 1) {
+			MaybeInsertTopGap(optimistic_gaps, optimistic_gap_count,
+			                  Gap {previous_set_bucket + 1, logical_bucket_count - previous_set_bucket - 2});
+		}
+		const auto removed_buckets = TopGapLengthSum(optimistic_gaps, optimistic_gap_count, MAX_DIRECT_GAPS);
+		const auto covered_buckets = logical_bucket_count - removed_buckets;
+		const auto optimistic_false_positive_rate =
+		    ConservativeFalsePositiveRate(Uhugeint::Convert(covered_buckets) * BucketWidth(), active_buckets);
+		return optimistic_false_positive_rate > max_false_positive_rate;
+	}
+
+	static BitmapStorage AllocateBitmapStorage(ClientContext &context, idx_t words) {
+		BitmapStorage result;
+		result.data = AllocateBitmap(context, words, result.bitmap);
+		return result;
+	}
+
+	idx_t CountActiveBuckets() const {
+		idx_t result = 0;
+		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
+			result += UnsafeNumericCast<idx_t>(__builtin_popcountll(bitmap[word_idx]));
+		}
+		return result;
+	}
+
+	uhugeint_t BucketWidth() const {
+		return uhugeint_t(1) << uhugeint_t(UnsafeNumericCast<uint64_t>(shift));
+	}
+
+	double ConservativeFalsePositiveRate(uhugeint_t covered_values, idx_t positive_lower_bound_p) const {
+		const auto domain_size = Uhugeint::Convert(span) + 1;
+		if (Uhugeint::GreaterThan(covered_values, domain_size)) {
+			covered_values = domain_size;
+		}
+		const auto positive_lower_bound = Uhugeint::Convert(positive_lower_bound_p);
+		if (Uhugeint::LessThanEquals(domain_size, positive_lower_bound) ||
+		    Uhugeint::LessThanEquals(covered_values, positive_lower_bound)) {
+			return 0;
+		}
+		const auto false_positives = covered_values - positive_lower_bound;
+		const auto negative_values = domain_size - positive_lower_bound;
+		return Uhugeint::Cast<double>(false_positives) / Uhugeint::Cast<double>(negative_values);
+	}
+
+	U BucketLowerBound(idx_t bucket_idx) const {
+		if (shift >= UnsafeNumericCast<idx_t>(sizeof(U) * 8)) {
+			return min;
+		}
+		return UnsafeNumericCast<U>(min + (UnsafeNumericCast<U>(bucket_idx) << shift));
+	}
+
+	U BucketUpperBound(idx_t bucket_idx) const {
+		if (bucket_idx + 1 >= logical_bucket_count) {
+			return min + span;
+		}
+		if (shift >= UnsafeNumericCast<idx_t>(sizeof(U) * 8)) {
+			return min + span;
+		}
+		return UnsafeNumericCast<U>(min + ((UnsafeNumericCast<U>(bucket_idx + 1) << shift) - 1));
+	}
+
+	template <idx_t RANGE_COUNT>
+	uint8_t DirectRangeLookup(U value) const {
+		if constexpr (RANGE_COUNT == 1) {
+			return static_cast<uint8_t>((value - min) <= span);
+		} else if constexpr (RANGE_COUNT == 2) {
+			return ValueInDirectRange(value, ranges[0]) | ValueInDirectRange(value, ranges[1]);
+		} else if constexpr (RANGE_COUNT == 3) {
+			return ValueInDirectRange(value, ranges[0]) | ValueInDirectRange(value, ranges[1]) |
+			       ValueInDirectRange(value, ranges[2]);
+		} else if constexpr (RANGE_COUNT == 4) {
+			return ValueInDirectRange(value, ranges[0]) | ValueInDirectRange(value, ranges[1]) |
+			       ValueInDirectRange(value, ranges[2]) | ValueInDirectRange(value, ranges[3]);
+		} else {
+			return 0;
+		}
+	}
+
+	bool DirectRangeLookup(U value) const {
+		for (idx_t range_idx = 0; range_idx < range_count; range_idx++) {
+			if (ValueInDirectRange(value, ranges[range_idx])) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static uint8_t ValueInDirectRange(U value, const DirectRange &range) {
+		return static_cast<uint8_t>((value - range.lower) <= range.width);
+	}
+
+	static U DirectRangeUpper(const DirectRange &range) {
+		return range.lower + range.width;
+	}
+
+	bool TryCompressToDirectRanges(double max_false_positive_rate) {
+		if (logical_bucket_count == 0 || active_buckets == 0 || active_buckets > logical_bucket_count) {
+			return false;
+		}
+		// Signed numeric keys use their raw unsigned representation, so a range spanning zero wraps around the
+		// unsigned domain. The bitmap supports that layout, but direct ranges require a linear ordering.
+		if (span > NumericLimits<U>::Maximum() - min) {
+			return false;
+		}
+
+		array<Gap, MAX_DIRECT_GAPS> top_gaps;
+		top_gaps.fill({0, 0});
+		idx_t top_gap_count = 0;
+		bool have_previous_set = false;
+		idx_t previous_set_bucket = 0;
+
+		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
+			const auto word_base = word_idx << WORD_SHIFT;
+			if (word_base >= logical_bucket_count) {
+				break;
+			}
+			const auto valid_bits = MinValue<idx_t>(64, logical_bucket_count - word_base);
+			const uint64_t word = bitmap[word_idx] & MaskForValidBits(valid_bits);
+
+			uint64_t remaining = word;
+			while (remaining != 0) {
+				const auto bit = UnsafeNumericCast<idx_t>(__builtin_ctzll(remaining));
+				const auto bucket = word_base + bit;
+				if (have_previous_set) {
+					MaybeInsertTopGap(top_gaps, top_gap_count,
+					                  Gap {previous_set_bucket + 1, bucket - previous_set_bucket - 1});
+				}
+				have_previous_set = true;
+				previous_set_bucket = bucket;
+				remaining &= remaining - 1;
+			}
+
+			if (have_previous_set && ShouldRejectDirectRangeCompression(top_gaps, top_gap_count, previous_set_bucket,
+			                                                            max_false_positive_rate)) {
+				return false;
+			}
+		}
+
+		if (!have_previous_set) {
+			return false;
+		}
+
+		for (idx_t direct_range_count = 1; direct_range_count <= MAX_DIRECT_RANGES; direct_range_count++) {
+			const auto kept_gap_count = direct_range_count - 1;
+			const auto actual_kept_gap_count = MinValue<idx_t>(kept_gap_count, top_gap_count);
+			double false_positive_rate;
+			const auto removed_buckets = TopGapLengthSum(top_gaps, top_gap_count, actual_kept_gap_count);
+			const auto covered_buckets = logical_bucket_count - removed_buckets;
+			false_positive_rate =
+			    ConservativeFalsePositiveRate(Uhugeint::Convert(covered_buckets) * BucketWidth(), active_buckets);
+			if (false_positive_rate > max_false_positive_rate) {
+				continue;
+			}
+
+			array<Gap, MAX_DIRECT_GAPS> selected_gaps = top_gaps;
+			std::sort(selected_gaps.begin(), selected_gaps.begin() + actual_kept_gap_count,
+			          [](const Gap &lhs, const Gap &rhs) { return lhs.start < rhs.start; });
+
+			idx_t next_bucket = 0;
+			range_count = 0;
+			for (idx_t gap_idx = 0; gap_idx < actual_kept_gap_count; gap_idx++) {
+				const auto &gap = selected_gaps[gap_idx];
+				if (next_bucket <= gap.start - 1) {
+					const auto lower = BucketLowerBound(next_bucket);
+					const auto upper = BucketUpperBound(gap.start - 1);
+					ranges[range_count++] = {lower, static_cast<U>(upper - lower)};
+				}
+				next_bucket = gap.start + gap.length;
+			}
+			if (next_bucket < logical_bucket_count) {
+				const auto lower = BucketLowerBound(next_bucket);
+				const auto upper = BucketUpperBound(logical_bucket_count - 1);
+				ranges[range_count++] = {lower, static_cast<U>(upper - lower)};
+			}
+			if (range_count == 0 || range_count > MAX_DIRECT_RANGES) {
+				return false;
+			}
+			mode = Mode::DIRECT_RANGES;
+			direct_false_positive_rate = false_positive_rate;
+			return true;
+		}
+		return false;
+	}
+
+	idx_t ReduceBitmapDyadically(const uint64_t *source, idx_t source_word_count, idx_t source_logical_bucket_count,
+	                             uint64_t *destination, idx_t destination_word_count) const {
+		const auto next_logical_bucket_count = (source_logical_bucket_count + 1) >> 1;
+		D_ASSERT(destination_word_count == ((next_logical_bucket_count + 63) >> WORD_SHIFT));
+		idx_t next_active_buckets = 0;
+		idx_t dst_word_idx = 0;
+		for (idx_t src_word_idx = 0; dst_word_idx < destination_word_count; src_word_idx += 2, dst_word_idx++) {
+			const uint64_t low = PackMergedPairsTo32(source[src_word_idx]);
+			const uint64_t high =
+			    src_word_idx + 1 < source_word_count ? (PackMergedPairsTo32(source[src_word_idx + 1]) << 32) : 0ULL;
+			const uint64_t packed = low | high;
+			destination[dst_word_idx] = packed;
+			next_active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(packed));
+		}
+		if ((next_logical_bucket_count & WORD_MASK) != 0) {
+			destination[destination_word_count - 1] &= MaskForValidBits(next_logical_bucket_count & WORD_MASK);
+		}
+		return next_active_buckets;
+	}
+
+	void TryCompressDyadically(ClientContext &context, double max_false_positive_rate) {
+		if (logical_bucket_count <= 1) {
+			return;
+		}
+
+		auto current_words = word_count;
+		auto current_logical_buckets = logical_bucket_count;
+		auto current_shift = shift;
+		auto current_bitmap = bitmap;
+
+		BitmapStorage scratch = AllocateBitmapStorage(
+		    context, MaxValue<idx_t>(1, (((current_logical_buckets + 1) >> 1) + 63) >> WORD_SHIFT));
+		BitmapStorage accepted;
+		bool changed = false;
+
+		while (current_logical_buckets > 1) {
+			const auto next_logical_buckets = (current_logical_buckets + 1) >> 1;
+			const auto next_words = (next_logical_buckets + 63) >> WORD_SHIFT;
+			if (scratch.data.GetSize() < next_words * sizeof(uint64_t)) {
+				scratch = AllocateBitmapStorage(context, next_words);
+			}
+			const auto next_active_buckets = ReduceBitmapDyadically(
+			    current_bitmap, current_words, current_logical_buckets, scratch.bitmap, next_words);
+			const auto next_shift = current_shift + 1;
+			const auto previous_shift = shift;
+			shift = next_shift;
+			const auto false_positive_rate =
+			    ConservativeFalsePositiveRate(Uhugeint::Convert(next_active_buckets) * BucketWidth(), active_buckets);
+			shift = previous_shift;
+			if (false_positive_rate > max_false_positive_rate) {
+				break;
+			}
+
+			accepted = AllocateBitmapStorage(context, next_words);
+			std::copy_n(scratch.bitmap, next_words, accepted.bitmap);
+			current_bitmap = accepted.bitmap;
+			current_words = next_words;
+			current_logical_buckets = next_logical_buckets;
+			current_shift = next_shift;
+			changed = true;
+		}
+
+		if (!changed) {
+			return;
+		}
+
+		buf_ = std::move(accepted.data);
+		bitmap = accepted.bitmap;
+		word_count = current_words;
+		logical_bucket_count = current_logical_buckets;
+		shift = current_shift;
+	}
 
 	bool initialized = false;
+	Mode mode = Mode::BITMAP;
 	U min;
 	U span;
 	idx_t shift;
+	idx_t logical_bucket_count;
 	idx_t word_count;
+	idx_t active_buckets = 0;
+	double direct_false_positive_rate = 0;
+	idx_t range_count = 0;
+	array<DirectRange, MAX_DIRECT_RANGES> ranges;
 	AllocatedData buf_;
 	uint64_t *bitmap;
 };
@@ -242,6 +700,13 @@ struct StringPrefixConverter {
 	}
 };
 
+uint32_t StringPrefixComparable(const string_t &value, char padding) {
+	array<char, string_t::PREFIX_BYTES> padded_prefix;
+	padded_prefix.fill(padding);
+	memcpy(padded_prefix.data(), value.GetData(), MinValue<idx_t>(value.GetSize(), string_t::PREFIX_BYTES));
+	return string_t(padded_prefix.data(), string_t::PREFIX_BYTES).GetPrefixIntegerComparable();
+}
+
 uint32_t StringMinComparable(const Value &value) {
 	return StringPrefixConverter::Convert(value.GetValueUnsafe<string_t>());
 }
@@ -253,12 +718,7 @@ uint32_t StringMaxComparable(const Value &value) {
 	}
 
 	// Pad string prefix with 0xFF to keep correctness if max is truncated at \0 char, e.g., ab\0c -> ab
-	array<char, string_t::PREFIX_BYTES> padded_prefix;
-	padded_prefix.fill(char(0xFF));
-	for (idx_t i = 0; i < max_string.GetSize(); i++) {
-		padded_prefix[i] = max_string.GetData()[i];
-	}
-	return string_t(padded_prefix.data(), string_t::PREFIX_BYTES).GetPrefixIntegerComparable();
+	return StringPrefixComparable(max_string, char(0xFF));
 }
 
 template <typename T>
@@ -268,12 +728,12 @@ private:
 
 public:
 	void Initialize(ClientContext &context, idx_t number_of_rows, Value min_val, Value max_val,
-	                idx_t max_bits) override {
+	                const PrefixRangeFilter::Sizing &sizing) override {
 		D_ASSERT(min_val <= max_val);
 		D_ASSERT(number_of_rows > 0);
 		const auto min = NumericConverter<T>::Convert(min_val.GetValueUnsafe<T>());
 		const auto max = NumericConverter<T>::Convert(max_val.GetValueUnsafe<T>());
-		bitmap.Initialize(context, min, max - min, max_bits);
+		bitmap.Initialize(context, min, max - min, sizing.shift);
 	}
 
 	unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const override {
@@ -298,9 +758,6 @@ public:
 
 	idx_t LookupKeys(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel,
 	                 idx_t count) const override {
-		if (keys.GetVectorType() == VectorType::CONSTANT_VECTOR) {
-			return bitmap.template LookupOne<T, NumericConverter<T>>(keys.GetValue(0)) ? count : 0;
-		}
 		return bitmap.template LookupKeys<T, NumericConverter<T>>(keys, sel, result_sel, count);
 	}
 
@@ -316,11 +773,39 @@ public:
 
 		const auto adjusted_lb = NumericConverter<T>::Convert(MaxValue<T>(lb, bitmap_min));
 		const auto adjusted_ub = NumericConverter<T>::Convert(MinValue<T>(ub, bitmap_max));
-		return bitmap.LookupRange(adjusted_lb, adjusted_ub);
+		auto result = bitmap.LookupRange(adjusted_lb, adjusted_ub);
+		if (result == FilterPropagateResult::FILTER_ALWAYS_TRUE && (lb < bitmap_min || ub > bitmap_max)) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+		return result;
+	}
+
+	FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const override {
+		if (stats.GetStatsType() != StatisticsType::NUMERIC_STATS || !NumericStats::HasMinMax(stats)) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+		const auto min = NumericStats::Min(stats);
+		const auto max = NumericStats::Max(stats);
+		if (min > max) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+		return LookupRange(min, max);
 	}
 
 	bool IsInitialized() const override {
 		return bitmap.IsInitialized();
+	}
+
+	Analysis Analyze() const override {
+		return bitmap.Analyze();
+	}
+
+	void Compress(ClientContext &context, double max_false_positive_rate) override {
+		bitmap.Compress(context, max_false_positive_rate);
+	}
+
+	CompressionInfo GetCompressionInfo() const override {
+		return bitmap.GetCompressionInfo();
 	}
 
 private:
@@ -330,13 +815,13 @@ private:
 class StringPrefixRangeFilter : public PrefixRangeFilter {
 public:
 	void Initialize(ClientContext &context, idx_t number_of_rows, Value min_val, Value max_val,
-	                idx_t max_bits) override {
+	                const PrefixRangeFilter::Sizing &sizing) override {
 		D_ASSERT(min_val <= max_val);
 		D_ASSERT(number_of_rows > 0);
 		const auto min = StringPrefixConverter::Convert(min_val.GetValueUnsafe<string_t>());
 		const auto max = StringPrefixConverter::Convert(max_val.GetValueUnsafe<string_t>());
 		D_ASSERT(min <= max);
-		bitmap.Initialize(context, min, max - min, max_bits);
+		bitmap.Initialize(context, min, max - min, sizing.shift);
 	}
 
 	unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const override {
@@ -361,9 +846,6 @@ public:
 
 	idx_t LookupKeys(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel,
 	                 idx_t count) const override {
-		if (keys.GetVectorType() == VectorType::CONSTANT_VECTOR) {
-			return bitmap.template LookupOne<string_t, StringPrefixConverter>(keys.GetValue(0)) ? count : 0;
-		}
 		return bitmap.template LookupKeys<string_t, StringPrefixConverter>(keys, sel, result_sel, count);
 	}
 
@@ -382,11 +864,52 @@ public:
 
 		lower_bound_comparable = MaxValue<uint32_t>(lower_bound_comparable, bitmap_min);
 		upper_bound_comparable = MinValue<uint32_t>(upper_bound_comparable, bitmap_max);
-		return bitmap.LookupRange(lower_bound_comparable, upper_bound_comparable);
+		auto result = bitmap.LookupRange(lower_bound_comparable, upper_bound_comparable);
+		if (result == FilterPropagateResult::FILTER_ALWAYS_TRUE &&
+		    (StringMinComparable(lower_bound) < bitmap_min || StringMaxComparable(upper_bound) > bitmap_max)) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+		return result;
+	}
+
+	FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const override {
+		if (stats.GetStatsType() != StatisticsType::STRING_STATS || !StringStats::HasMinMax(stats)) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+
+		const auto min_string = StringStats::Min(stats);
+		const auto max_string = StringStats::Max(stats);
+		const auto min =
+		    StringPrefixComparable(string_t(min_string.data(), UnsafeNumericCast<uint32_t>(min_string.size())), '\0');
+		const auto max_padding = StringStats::GetMaxType(stats) == StringStatsType::TRUNCATED_STATS ? char(0xFF) : '\0';
+		const auto max = StringPrefixComparable(
+		    string_t(max_string.data(), UnsafeNumericCast<uint32_t>(max_string.size())), max_padding);
+		if (min > max) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+
+		const auto bitmap_min = bitmap.Min();
+		const auto bitmap_max = bitmap.Min() + bitmap.Span();
+		if (max < bitmap_min || min > bitmap_max) {
+			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+		}
+		return bitmap.LookupRange(MaxValue<uint32_t>(min, bitmap_min), MinValue<uint32_t>(max, bitmap_max));
 	}
 
 	bool IsInitialized() const override {
 		return bitmap.IsInitialized();
+	}
+
+	Analysis Analyze() const override {
+		return bitmap.Analyze();
+	}
+
+	void Compress(ClientContext &context, double max_false_positive_rate) override {
+		bitmap.Compress(context, max_false_positive_rate);
+	}
+
+	CompressionInfo GetCompressionInfo() const override {
+		return bitmap.GetCompressionInfo();
 	}
 
 private:
@@ -420,6 +943,50 @@ bool ComputeStringPrefixSpan(const Value &lower_bound, const Value &upper_bound,
 		return false;
 	}
 #endif
+}
+
+bool PrefixRangeFilter::TryComputeBucketCount(const uhugeint_t &span, idx_t shift, idx_t &bucket_count) {
+	const auto shifted_span = span >> uhugeint_t(UnsafeNumericCast<uint64_t>(shift));
+	auto bucket_count_huge = shifted_span;
+	if (!Uhugeint::TryAddInPlace(bucket_count_huge, 1)) {
+		return false;
+	}
+	return Uhugeint::TryCast(bucket_count_huge, bucket_count);
+}
+
+double PrefixRangeFilter::ComputeFalsePositiveRateUpperBound(const uhugeint_t &span, idx_t count, idx_t shift) {
+	if (count == 0 || Uhugeint::LessThanEquals(span, Uhugeint::Convert(count))) {
+		return 0;
+	}
+	D_ASSERT(shift >= 0);
+	const auto bucket_width = uhugeint_t(1) << uhugeint_t(UnsafeNumericCast<uint64_t>(shift));
+	const auto numerator = Uhugeint::Cast<double>(Uhugeint::Convert(count) * (bucket_width - 1));
+	const auto denominator = Uhugeint::Cast<double>(span - Uhugeint::Convert(count));
+	D_ASSERT(denominator > 0);
+	return numerator / denominator;
+}
+
+double PrefixRangeFilter::EstimateFalsePositiveRate(const uhugeint_t &span, idx_t key_count, idx_t active_buckets,
+                                                    idx_t shift) {
+	if (key_count == 0) {
+		return 0;
+	}
+	const auto total_values = span + 1;
+	if (Uhugeint::LessThanEquals(total_values, Uhugeint::Convert(key_count))) {
+		return 0;
+	}
+	D_ASSERT(shift >= 0);
+	const auto bucket_width = uhugeint_t(1) << uhugeint_t(UnsafeNumericCast<uint64_t>(shift));
+	auto covered_values = Uhugeint::Convert(active_buckets) * bucket_width;
+	if (Uhugeint::GreaterThan(covered_values, total_values)) {
+		covered_values = total_values;
+	}
+	if (Uhugeint::LessThanEquals(covered_values, Uhugeint::Convert(key_count))) {
+		return 0;
+	}
+	const auto false_positives = covered_values - Uhugeint::Convert(key_count);
+	const auto negative_values = total_values - Uhugeint::Convert(key_count);
+	return Uhugeint::Cast<double>(false_positives) / Uhugeint::Cast<double>(negative_values);
 }
 
 unique_ptr<PrefixRangeFilter> PrefixRangeFilter::CreatePrefixRangeFilter(const LogicalType &key_type) {
@@ -482,6 +1049,52 @@ bool PrefixRangeFilter::TryComputeSpan(const Value &lower_bound, const Value &up
 	default:
 		return false;
 	}
+}
+
+bool PrefixRangeFilter::TryComputeSizing(const Value &min, const Value &max, idx_t count, Sizing &sizing,
+                                         double false_positive_rate) {
+	if (count == 0 || false_positive_rate < 0) {
+		return false;
+	}
+	if (!TryComputeSpan(min, max, sizing.span)) {
+		return false;
+	}
+	if (sizing.span == 0) {
+		return false;
+	}
+	if (Uhugeint::LessThanEquals(sizing.span, Uhugeint::Convert(count))) {
+		sizing.shift = 0;
+		return true;
+	}
+
+	idx_t best_shift = 0;
+	for (idx_t shift = 1; shift < 64; shift++) {
+		if (ComputeFalsePositiveRateUpperBound(sizing.span, count, shift) > false_positive_rate) {
+			break;
+		}
+		best_shift = shift;
+	}
+	sizing.shift = best_shift;
+	return true;
+}
+
+bool PrefixRangeFilter::TryComputeFixedSizeSizing(const Value &min, const Value &max, idx_t bucket_count_limit,
+                                                  Sizing &sizing) {
+	if (bucket_count_limit == 0) {
+		return false;
+	}
+	if (!TryComputeSpan(min, max, sizing.span)) {
+		return false;
+	}
+	if (sizing.span == 0) {
+		return false;
+	}
+	sizing.shift = 0;
+	idx_t bucket_count;
+	while (TryComputeBucketCount(sizing.span, sizing.shift, bucket_count) && bucket_count > bucket_count_limit) {
+		sizing.shift++;
+	}
+	return TryComputeBucketCount(sizing.span, sizing.shift, bucket_count) && bucket_count <= bucket_count_limit;
 }
 
 bool PrefixRangeFilter::SupportedType(const LogicalType &type) {
@@ -551,6 +1164,9 @@ static idx_t PrefixRangeSelect(DataChunk &args, ExpressionState &state, optional
 	if (!func_data.filter || !func_data.filter->IsInitialized()) {
 		return SetAllTrueSelection(count, sel, true_sel, false_sel);
 	}
+	if (!func_data.filter->AllowsTupleFiltering()) {
+		return SetAllTrueSelection(count, sel, true_sel, false_sel);
+	}
 	if (tracking_state && !tracking_state->IsActive()) {
 		tracking_state->Update(0, 0);
 		return SetAllTrueSelection(count, sel, true_sel, false_sel);
@@ -589,35 +1205,11 @@ FilterPropagateResult PrefixRangeScalarFun::FilterPrune(const FunctionStatistics
 	if (!data.filter || !data.filter->IsInitialized()) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
-	auto column_stats = input.ChildStats(0);
-	if (!column_stats) {
+	auto child_stats = input.ChildStats(0);
+	if (!child_stats) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
-	auto &stats = *column_stats;
-	switch (stats.GetStatsType()) {
-	case StatisticsType::NUMERIC_STATS: {
-		if (!NumericStats::HasMinMax(stats)) {
-			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-		}
-		const auto min = NumericStats::Min(stats);
-		const auto max = NumericStats::Max(stats);
-		if (min > max) {
-			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-		}
-		return data.filter->LookupRange(min, max);
-	}
-	case StatisticsType::STRING_STATS: {
-		if (!StringStats::HasMinMax(stats)) {
-			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-		}
-		// String stats may contain raw parquet bytes that are not valid UTF-8. Reconstruct them as BLOBs so the
-		// prefix-range comparable logic can inspect the raw bytes without value-construction validation.
-		return data.filter->LookupRange(Value::BLOB_RAW(StringStats::Min(stats)),
-		                                Value::BLOB_RAW(StringStats::Max(stats)));
-	}
-	default:
-		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-	}
+	return data.filter->LookupStatistics(*child_stats);
 }
 
 ScalarFunction TableFilterPrefixRangeFun::GetFunction() {
