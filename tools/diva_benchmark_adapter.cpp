@@ -32,6 +32,10 @@ bool DivaBenchmarkFilter::Probe(uint64_t key) const {
 	return impl->filter->PointQuery(key);
 }
 
+bool DivaBenchmarkFilter::RangeProbe(uint64_t lower, uint64_t upper) const {
+	return impl->filter->RangeQuery(lower, upper);
+}
+
 size_t DivaBenchmarkFilter::SizeBytes() const {
 	return impl->filter->Size();
 }

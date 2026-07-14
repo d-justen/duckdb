@@ -39,6 +39,10 @@ bool GrafiteBenchmarkFilter::Probe(uint64_t key) const {
 	return impl->filter.query(key);
 }
 
+bool GrafiteBenchmarkFilter::RangeProbe(uint64_t lower, uint64_t upper) const {
+	return impl->filter.query(lower, upper);
+}
+
 size_t GrafiteBenchmarkFilter::SizeBytes() const {
 	return impl->filter.size();
 }

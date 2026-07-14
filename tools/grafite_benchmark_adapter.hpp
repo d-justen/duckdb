@@ -17,6 +17,7 @@ public:
 
 	void Build(const std::vector<uint64_t> &keys, double bits_per_key);
 	bool Probe(uint64_t key) const;
+	bool RangeProbe(uint64_t lower, uint64_t upper) const;
 	size_t SizeBytes() const;
 
 private:
