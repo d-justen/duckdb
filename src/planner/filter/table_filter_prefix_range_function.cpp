@@ -77,6 +77,7 @@ public:
 		base_active_buckets = 0;
 		current_active_buckets = 0;
 		current_run_count = 0;
+		current_run_count_is_exact = false;
 		cached_false_positive_rate = 0;
 		analysis_cached = false;
 		compression_finalized = false;
@@ -237,7 +238,7 @@ public:
 		info.shift = shift;
 		info.range_count = range_count;
 		info.active_buckets = analysis_cached ? current_active_buckets : CountActiveBuckets();
-		info.run_count = analysis_cached ? current_run_count : CountRuns();
+		info.run_count = analysis_cached && current_run_count_is_exact ? current_run_count : CountRuns();
 		info.logical_bucket_count = logical_bucket_count;
 		info.bitmap_allocation_bytes = mode == Mode::BITMAP ? buf_.GetSize() : 0;
 		info.false_positive_rate = analysis_cached ? cached_false_positive_rate
@@ -257,6 +258,7 @@ private:
 	static constexpr idx_t WORD_SHIFT = 6;
 	static constexpr idx_t WORD_MASK = 63;
 	static constexpr idx_t MAX_DIRECT_RANGES = 4;
+	static constexpr idx_t METRICS_BLOCK_WORDS = 64;
 	static constexpr idx_t BITMAP_CACHE_TARGET_BYTES = 16 * 1024;
 
 	enum class Mode : uint8_t { BITMAP, DIRECT_RANGES };
@@ -271,12 +273,13 @@ private:
 		idx_t run_count = 0;
 		idx_t recorded_starts = 0;
 		idx_t recorded_ends = 0;
+		bool run_count_is_exact = true;
 		array<idx_t, MAX_DIRECT_RANGES> run_starts;
 		array<idx_t, MAX_DIRECT_RANGES> run_ends;
 
 		bool HasExactRanges() const {
-			return run_count > 0 && run_count <= MAX_DIRECT_RANGES && recorded_starts == run_count &&
-			       recorded_ends == run_count;
+			return run_count_is_exact && run_count > 0 && run_count <= MAX_DIRECT_RANGES &&
+			       recorded_starts == run_count && recorded_ends == run_count;
 		}
 	};
 
@@ -293,10 +296,11 @@ private:
 
 	class BitmapMetricsBuilder {
 	public:
+		template <bool ANALYZE_RUNS>
 		void PushWord(uint64_t word, idx_t valid_bits, idx_t word_base) {
 			const auto first_bit = static_cast<uint8_t>(word & 1ULL);
 			if (has_pending) {
-				ConsumePending(first_bit);
+				ConsumePending<ANALYZE_RUNS>(first_bit);
 			}
 			pending_word = word;
 			pending_valid_bits = valid_bits;
@@ -304,12 +308,18 @@ private:
 			has_pending = true;
 		}
 
+		template <bool ANALYZE_RUNS>
 		BitmapMetrics Finish() {
 			if (has_pending) {
-				ConsumePending(0);
+				ConsumePending<ANALYZE_RUNS>(0);
 				has_pending = false;
 			}
+			metrics.run_count_is_exact = ANALYZE_RUNS;
 			return metrics;
+		}
+
+		idx_t RunCount() const {
+			return metrics.run_count;
 		}
 
 	private:
@@ -321,9 +331,15 @@ private:
 			}
 		}
 
+		template <bool ANALYZE_RUNS>
 		void ConsumePending(uint8_t next_word_first_bit) {
 			const auto valid_mask = MaskForValidBits(pending_valid_bits);
 			const auto word = pending_word & valid_mask;
+			metrics.active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(word));
+			if constexpr (!ANALYZE_RUNS) {
+				return;
+			}
+
 			const auto previous_bits = (word << 1) | previous_word_last_bit;
 			auto next_bits = word >> 1;
 			if (pending_valid_bits == 64 && next_word_first_bit) {
@@ -332,7 +348,6 @@ private:
 
 			const auto starts = word & ~previous_bits & valid_mask;
 			const auto ends = word & ~next_bits & valid_mask;
-			metrics.active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(word));
 			metrics.run_count += UnsafeNumericCast<idx_t>(__builtin_popcountll(starts));
 			RecordPositions(starts, metrics.run_starts, metrics.recorded_starts);
 			RecordPositions(ends, metrics.run_ends, metrics.recorded_ends);
@@ -444,7 +459,19 @@ private:
 		if (mode != Mode::BITMAP || !bitmap) {
 			return current_run_count;
 		}
-		return AnalyzeBitmap(bitmap, word_count, logical_bucket_count).run_count;
+
+		idx_t result = 0;
+		uint8_t previous_word_last_bit = 0;
+		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
+			const auto word_base = word_idx << WORD_SHIFT;
+			const auto valid_bits = MinValue<idx_t>(64, logical_bucket_count - word_base);
+			const auto valid_mask = MaskForValidBits(valid_bits);
+			const auto word = bitmap[word_idx] & valid_mask;
+			const auto previous_bits = (word << 1) | previous_word_last_bit;
+			result += UnsafeNumericCast<idx_t>(__builtin_popcountll(word & ~previous_bits & valid_mask));
+			previous_word_last_bit = valid_bits == 0 ? 0 : static_cast<uint8_t>((word >> (valid_bits - 1)) & 1ULL);
+		}
+		return result;
 	}
 
 	static uhugeint_t BucketWidth(idx_t shift_p) {
@@ -537,25 +564,26 @@ private:
 			const auto word_base = word_idx << WORD_SHIFT;
 			const auto valid_bits = MinValue<idx_t>(64, source_logical_bucket_count - word_base);
 			const auto word = source[word_idx] & MaskForValidBits(valid_bits);
-			builder.PushWord(word, valid_bits, word_base);
+			builder.template PushWord<true>(word, valid_bits, word_base);
 		}
-		return builder.Finish();
+		return builder.template Finish<true>();
 	}
 
-	DyadicPassResult AnalyzeAndReduceBitmap(const uint64_t *source, idx_t source_word_count,
-	                                        idx_t source_logical_bucket_count, uint64_t *destination,
-	                                        idx_t destination_word_count) const {
-		const auto destination_logical_bucket_count = (source_logical_bucket_count + 1) >> 1;
-		D_ASSERT(destination_word_count == ((destination_logical_bucket_count + 63) >> WORD_SHIFT));
-
-		BitmapMetricsBuilder source_builder;
-		BitmapMetricsBuilder destination_builder;
-		for (idx_t destination_word_idx = 0; destination_word_idx < destination_word_count; destination_word_idx++) {
+	template <bool ANALYZE_SOURCE, bool ANALYZE_SOURCE_RUNS, bool ANALYZE_DESTINATION_RUNS>
+	void AnalyzeAndReduceBlock(const uint64_t *source, idx_t source_word_count, idx_t source_logical_bucket_count,
+	                           uint64_t *destination, idx_t destination_logical_bucket_count,
+	                           idx_t destination_word_begin, idx_t destination_word_end,
+	                           BitmapMetricsBuilder &source_builder, BitmapMetricsBuilder &destination_builder) const {
+		for (idx_t destination_word_idx = destination_word_begin; destination_word_idx < destination_word_end;
+		     destination_word_idx++) {
 			const auto first_source_word_idx = destination_word_idx * 2;
 			const auto first_source_word_base = first_source_word_idx << WORD_SHIFT;
 			const auto first_valid_bits = MinValue<idx_t>(64, source_logical_bucket_count - first_source_word_base);
 			const auto first_source_word = source[first_source_word_idx] & MaskForValidBits(first_valid_bits);
-			source_builder.PushWord(first_source_word, first_valid_bits, first_source_word_base);
+			if constexpr (ANALYZE_SOURCE) {
+				source_builder.template PushWord<ANALYZE_SOURCE_RUNS>(first_source_word, first_valid_bits,
+				                                                      first_source_word_base);
+			}
 
 			const auto low = PackMergedPairsTo32(first_source_word);
 			uint64_t high = 0;
@@ -565,7 +593,10 @@ private:
 				const auto second_valid_bits =
 				    MinValue<idx_t>(64, source_logical_bucket_count - second_source_word_base);
 				const auto second_source_word = source[second_source_word_idx] & MaskForValidBits(second_valid_bits);
-				source_builder.PushWord(second_source_word, second_valid_bits, second_source_word_base);
+				if constexpr (ANALYZE_SOURCE) {
+					source_builder.template PushWord<ANALYZE_SOURCE_RUNS>(second_source_word, second_valid_bits,
+					                                                      second_source_word_base);
+				}
 				high = PackMergedPairsTo32(second_source_word) << 32;
 			}
 
@@ -574,10 +605,73 @@ private:
 			    MinValue<idx_t>(64, destination_logical_bucket_count - destination_word_base);
 			const auto packed = (low | high) & MaskForValidBits(destination_valid_bits);
 			destination[destination_word_idx] = packed;
-			destination_builder.PushWord(packed, destination_valid_bits, destination_word_base);
+			destination_builder.template PushWord<ANALYZE_DESTINATION_RUNS>(packed, destination_valid_bits,
+			                                                                destination_word_base);
+		}
+	}
+
+	template <bool ANALYZE_SOURCE>
+	DyadicPassResult AnalyzeAndReduceBitmap(const uint64_t *source, idx_t source_word_count,
+	                                        idx_t source_logical_bucket_count, uint64_t *destination,
+	                                        idx_t destination_word_count) const {
+		const auto destination_logical_bucket_count = (source_logical_bucket_count + 1) >> 1;
+		D_ASSERT(destination_word_count == ((destination_logical_bucket_count + 63) >> WORD_SHIFT));
+
+		BitmapMetricsBuilder source_builder;
+		BitmapMetricsBuilder destination_builder;
+		bool analyze_source_runs = ANALYZE_SOURCE;
+		bool analyze_destination_runs = true;
+		for (idx_t destination_word_begin = 0; destination_word_begin < destination_word_count;
+		     destination_word_begin += METRICS_BLOCK_WORDS) {
+			const auto destination_word_end =
+			    MinValue<idx_t>(destination_word_begin + METRICS_BLOCK_WORDS, destination_word_count);
+			if constexpr (ANALYZE_SOURCE) {
+				if (analyze_source_runs) {
+					if (analyze_destination_runs) {
+						AnalyzeAndReduceBlock<true, true, true>(source, source_word_count, source_logical_bucket_count,
+						                                        destination, destination_logical_bucket_count,
+						                                        destination_word_begin, destination_word_end,
+						                                        source_builder, destination_builder);
+					} else {
+						AnalyzeAndReduceBlock<true, true, false>(source, source_word_count, source_logical_bucket_count,
+						                                         destination, destination_logical_bucket_count,
+						                                         destination_word_begin, destination_word_end,
+						                                         source_builder, destination_builder);
+					}
+				} else if (analyze_destination_runs) {
+					AnalyzeAndReduceBlock<true, false, true>(source, source_word_count, source_logical_bucket_count,
+					                                         destination, destination_logical_bucket_count,
+					                                         destination_word_begin, destination_word_end,
+					                                         source_builder, destination_builder);
+				} else {
+					AnalyzeAndReduceBlock<true, false, false>(source, source_word_count, source_logical_bucket_count,
+					                                          destination, destination_logical_bucket_count,
+					                                          destination_word_begin, destination_word_end,
+					                                          source_builder, destination_builder);
+				}
+				analyze_source_runs &= source_builder.RunCount() <= MAX_DIRECT_RANGES;
+			} else if (analyze_destination_runs) {
+				AnalyzeAndReduceBlock<false, false, true>(source, source_word_count, source_logical_bucket_count,
+				                                          destination, destination_logical_bucket_count,
+				                                          destination_word_begin, destination_word_end, source_builder,
+				                                          destination_builder);
+			} else {
+				AnalyzeAndReduceBlock<false, false, false>(source, source_word_count, source_logical_bucket_count,
+				                                           destination, destination_logical_bucket_count,
+				                                           destination_word_begin, destination_word_end, source_builder,
+				                                           destination_builder);
+			}
+			analyze_destination_runs &= destination_builder.RunCount() <= MAX_DIRECT_RANGES;
 		}
 
-		return {source_builder.Finish(), destination_builder.Finish()};
+		DyadicPassResult result;
+		if constexpr (ANALYZE_SOURCE) {
+			result.source =
+			    analyze_source_runs ? source_builder.template Finish<true>() : source_builder.template Finish<false>();
+		}
+		result.destination = analyze_destination_runs ? destination_builder.template Finish<true>()
+		                                              : destination_builder.template Finish<false>();
+		return result;
 	}
 
 	bool ShouldAcceptDyadicLevel(idx_t current_words, const BitmapMetrics &candidate, idx_t candidate_shift,
@@ -599,6 +693,7 @@ private:
 	void SetCachedAnalysis(const BitmapMetrics &metrics, double false_positive_rate) {
 		current_active_buckets = metrics.active_buckets;
 		current_run_count = metrics.run_count;
+		current_run_count_is_exact = metrics.run_count_is_exact;
 		cached_false_positive_rate = false_positive_rate;
 		analysis_cached = true;
 	}
@@ -652,8 +747,8 @@ private:
 			auto next_logical_buckets = (current_logical_buckets + 1) >> 1;
 			auto next_words = (next_logical_buckets + 63) >> WORD_SHIFT;
 			scratch = AllocateBitmapStorage(context, next_words);
-			const auto first_pass = AnalyzeAndReduceBitmap(current.bitmap, current_words, current_logical_buckets,
-			                                               scratch.bitmap, next_words);
+			const auto first_pass = AnalyzeAndReduceBitmap<true>(current.bitmap, current_words, current_logical_buckets,
+			                                                     scratch.bitmap, next_words);
 			current_metrics = first_pass.source;
 
 			base_active_buckets = current_metrics.active_buckets;
@@ -706,10 +801,8 @@ private:
 				next_logical_buckets = (current_logical_buckets + 1) >> 1;
 				next_words = (next_logical_buckets + 63) >> WORD_SHIFT;
 				D_ASSERT(scratch.word_capacity >= next_words);
-				const auto next_pass = AnalyzeAndReduceBitmap(current.bitmap, current_words, current_logical_buckets,
-				                                              scratch.bitmap, next_words);
-				D_ASSERT(next_pass.source.active_buckets == current_metrics.active_buckets);
-				D_ASSERT(next_pass.source.run_count == current_metrics.run_count);
+				const auto next_pass = AnalyzeAndReduceBitmap<false>(
+				    current.bitmap, current_words, current_logical_buckets, scratch.bitmap, next_words);
 				candidate_metrics = next_pass.destination;
 			}
 		} else {
@@ -744,6 +837,7 @@ private:
 	idx_t base_active_buckets = 0;
 	idx_t current_active_buckets = 0;
 	idx_t current_run_count = 0;
+	bool current_run_count_is_exact = false;
 	double cached_false_positive_rate = 0;
 	bool analysis_cached = false;
 	bool compression_finalized = false;
