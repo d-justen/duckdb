@@ -169,19 +169,18 @@ BenchmarkConfig ParseArguments(int argc, char *argv[]) {
 		} else if (StartsWith(arg, "--output=")) {
 			config.output_path = arg.substr(9);
 		} else if (arg == "--help") {
-			std::cout
-			    << "Usage: filter_benchmark [options]\n"
-			    << "  --domain-size=N\n"
-			    << "  --total-keys=N\n"
-			    << "  --probe-count=N\n"
-			    << "  --min-clusters=N\n"
-			    << "  --max-clusters=N\n"
-			    << "  --cluster-step=N (accepted for compatibility, ignored; cluster counts use powers of two)\n"
-			    << "  --repetitions=N\n"
-			    << "  --seed=N\n"
-			    << "  --grafite-bpk=N\n"
-			    << "  --diva-bpk=N\n"
-			    << "  --output=PATH\n";
+			std::cout << "Usage: filter_benchmark [options]\n"
+			          << "  --domain-size=N\n"
+			          << "  --total-keys=N\n"
+			          << "  --probe-count=N\n"
+			          << "  --min-clusters=N\n"
+			          << "  --max-clusters=N\n"
+			          << "  --cluster-step=N (accepted for compatibility, ignored; cluster counts use powers of two)\n"
+			          << "  --repetitions=N\n"
+			          << "  --seed=N\n"
+			          << "  --grafite-bpk=N\n"
+			          << "  --diva-bpk=N\n"
+			          << "  --output=PATH\n";
 			std::exit(0);
 		} else {
 			throw InvalidInputException("Unknown argument: %s", arg);
@@ -277,7 +276,8 @@ RepetitionContext CreateRepetitionContext(const BenchmarkConfig &config, idx_t r
 	return result;
 }
 
-MembershipInfo ComputeMembership(uint64_t domain_size, const vector<uint64_t> &build_keys, const vector<uint64_t> &probe_keys) {
+MembershipInfo ComputeMembership(uint64_t domain_size, const vector<uint64_t> &build_keys,
+                                 const vector<uint64_t> &probe_keys) {
 	MembershipInfo info;
 	info.flags.resize(probe_keys.size(), 0);
 	vector<uint8_t> in_build(domain_size, 0);
@@ -373,7 +373,8 @@ PRFRunResult RunPrefixRangeFilterBenchmark(ClientContext &context, const vector<
 	PrefixRangeFilter::Sizing sizing;
 	const auto min_key = build_keys.front();
 	const auto max_key = build_keys.back();
-	if (!PrefixRangeFilter::TryComputeSizing(Value::UBIGINT(min_key), Value::UBIGINT(max_key), build_keys.size(), sizing)) {
+	if (!PrefixRangeFilter::TryComputeSizing(Value::UBIGINT(min_key), Value::UBIGINT(max_key), build_keys.size(),
+	                                         sizing)) {
 		throw InternalException("Failed to compute PRF sizing");
 	}
 	filter->Initialize(context, build_keys.size(), Value::UBIGINT(min_key), Value::UBIGINT(max_key), sizing);
@@ -397,7 +398,8 @@ PRFRunResult RunPrefixRangeFilterBenchmark(ClientContext &context, const vector<
 	result.analyze_ns = TimeNs([&]() { analysis = filter->Analyze(); });
 
 	SelectionVector sel(probe_keys.size());
-	result.probe_ns = TimeNs([&]() { result.matched_count = filter->LookupKeys(probe_vector, sel, probe_keys.size()); });
+	result.probe_ns =
+	    TimeNs([&]() { result.matched_count = filter->LookupKeys(probe_vector, sel, probe_keys.size()); });
 	result.true_positive_count = CountMatchedPositives(sel, result.matched_count, membership);
 	result.false_positive_count = result.matched_count - result.true_positive_count;
 
@@ -463,12 +465,13 @@ void WriteHeader(std::ostream &out) {
 string FormatBloomRow(const BenchmarkConfig &config, idx_t cluster_count, const MembershipInfo &membership,
                       const BloomRunResult &result) {
 	const auto probes_per_sec =
-	    result.probe_ns == 0 ? 0.0 : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
+	    result.probe_ns == 0 ? 0.0
+	                         : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
 	const auto actual_fpr = ComputeActualFalsePositiveRate(result.false_positive_count, membership, config.probe_count);
 	std::ostringstream out;
-	out << "bloom," << cluster_count << ',' << result.build_core_ns << ',' << 0 << ',' << result.bytes << ',' << std::fixed
-	    << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << ',' << "" << ','
-	    << std::setprecision(9) << actual_fpr << ',' << "na,0,0,0";
+	out << "bloom," << cluster_count << ',' << result.build_core_ns << ',' << 0 << ',' << result.bytes << ','
+	    << std::fixed << std::setprecision(3) << probes_per_sec << ',' << result.false_positive_count << ',' << ""
+	    << ',' << std::setprecision(9) << actual_fpr << ',' << "na,0,0,0";
 	return out.str();
 }
 
@@ -486,16 +489,17 @@ const char *CompressionModeName(CompressionMode mode) {
 string FormatPRFRow(const char *filter_name, const BenchmarkConfig &config, idx_t cluster_count,
                     const MembershipInfo &membership, const PRFRunResult &result) {
 	const auto probes_per_sec =
-	    result.probe_ns == 0 ? 0.0 : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
+	    result.probe_ns == 0 ? 0.0
+	                         : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
 	const auto post_build_ns = result.compress_ns + result.analyze_ns;
 	const auto actual_fpr = ComputeActualFalsePositiveRate(result.false_positive_count, membership, config.probe_count);
 
 	std::ostringstream out;
 	out << filter_name << ',' << cluster_count << ',' << result.build_core_ns << ',' << post_build_ns << ','
 	    << result.bytes << ',' << std::fixed << std::setprecision(3) << probes_per_sec << ','
-	    << result.false_positive_count << ',' << std::setprecision(9) << result.estimated_fpr << ','
-	    << actual_fpr << ',' << CompressionModeName(result.mode) << ',' << result.range_count << ',' << result.shift
-	    << ',' << result.active_buckets;
+	    << result.false_positive_count << ',' << std::setprecision(9) << result.estimated_fpr << ',' << actual_fpr
+	    << ',' << CompressionModeName(result.mode) << ',' << result.range_count << ',' << result.shift << ','
+	    << result.active_buckets;
 	return out.str();
 }
 
@@ -503,7 +507,8 @@ string FormatPRFRow(const char *filter_name, const BenchmarkConfig &config, idx_
 string FormatGrafiteRow(const BenchmarkConfig &config, idx_t cluster_count, const MembershipInfo &membership,
                         const GrafiteRunResult &result) {
 	const auto probes_per_sec =
-	    result.probe_ns == 0 ? 0.0 : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
+	    result.probe_ns == 0 ? 0.0
+	                         : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
 	const auto actual_fpr = ComputeActualFalsePositiveRate(result.false_positive_count, membership, config.probe_count);
 	std::ostringstream out;
 	out << "grafite," << cluster_count << ',' << result.build_ns << ',' << 0 << ',' << result.bytes << ',' << std::fixed
@@ -517,7 +522,8 @@ string FormatGrafiteRow(const BenchmarkConfig &config, idx_t cluster_count, cons
 string FormatDivaRow(const BenchmarkConfig &config, idx_t cluster_count, const MembershipInfo &membership,
                      const DivaRunResult &result) {
 	const auto probes_per_sec =
-	    result.probe_ns == 0 ? 0.0 : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
+	    result.probe_ns == 0 ? 0.0
+	                         : static_cast<double>(config.probe_count) * 1e9 / static_cast<double>(result.probe_ns);
 	const auto actual_fpr = ComputeActualFalsePositiveRate(result.false_positive_count, membership, config.probe_count);
 	std::ostringstream out;
 	out << "diva," << cluster_count << ',' << result.build_ns << ',' << 0 << ',' << result.bytes << ',' << std::fixed
@@ -563,11 +569,12 @@ int main(int argc, char *argv[]) {
 				(void)RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, false);
 				const auto prf_uncompressed_result =
 				    RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, false);
-				rows.push_back(
-				    {cluster_count, FormatPRFRow("prf_uncompressed", config, cluster_count, membership, prf_uncompressed_result)});
+				rows.push_back({cluster_count, FormatPRFRow("prf_uncompressed", config, cluster_count, membership,
+				                                            prf_uncompressed_result)});
 
 				(void)RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, true);
-				const auto prf_result = RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, true);
+				const auto prf_result =
+				    RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, true);
 				rows.push_back({cluster_count, FormatPRFRow("prf", config, cluster_count, membership, prf_result)});
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
@@ -579,13 +586,13 @@ int main(int argc, char *argv[]) {
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
 				(void)RunDivaBenchmark(layout.keys, repetition.probes, membership, config.diva_bits_per_key);
-				const auto diva_result = RunDivaBenchmark(layout.keys, repetition.probes, membership, config.diva_bits_per_key);
+				const auto diva_result =
+				    RunDivaBenchmark(layout.keys, repetition.probes, membership, config.diva_bits_per_key);
 				rows.push_back({cluster_count, FormatDivaRow(config, cluster_count, membership, diva_result)});
 #endif
 			}
-			std::sort(rows.begin(), rows.end(), [](const ResultRow &lhs, const ResultRow &rhs) {
-				return lhs.cluster_count < rhs.cluster_count;
-			});
+			std::sort(rows.begin(), rows.end(),
+			          [](const ResultRow &lhs, const ResultRow &rhs) { return lhs.cluster_count < rhs.cluster_count; });
 			for (const auto &row : rows) {
 				*out << row.line << '\n';
 			}

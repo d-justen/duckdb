@@ -99,8 +99,8 @@ bool TestPRF(DuckDB &db) {
 		std::cerr << "PRF sizing failed\n";
 		return false;
 	}
-	filter->Initialize(context, build_keys.size(), Value::UBIGINT(build_keys.front()), Value::UBIGINT(build_keys.back()),
-	                   sizing);
+	filter->Initialize(context, build_keys.size(), Value::UBIGINT(build_keys.front()),
+	                   Value::UBIGINT(build_keys.back()), sizing);
 
 	Vector build_vec(LogicalType::UBIGINT, build_keys.size());
 	Vector probe_vec(LogicalType::UBIGINT, probes.size());
@@ -140,8 +140,8 @@ bool TestPRFDirectRanges(DuckDB &db) {
 		std::cerr << "PRF direct-range fixed-size sizing failed\n";
 		return false;
 	}
-	filter->Initialize(context, build_keys.size(), Value::UBIGINT(build_keys.front()), Value::UBIGINT(build_keys.back()),
-	                   sizing);
+	filter->Initialize(context, build_keys.size(), Value::UBIGINT(build_keys.front()),
+	                   Value::UBIGINT(build_keys.back()), sizing);
 
 	Vector build_vec(LogicalType::UBIGINT, build_keys.size());
 	Vector probe_vec(LogicalType::UBIGINT, probes.size());
@@ -240,7 +240,8 @@ bool TestDiva() {
 
 int main() {
 	DuckDB db(nullptr);
-	if (!TestBloom(db) || !TestPRF(db) || !TestPRFDirectRanges(db) || !TestPRFRangeNoOverlap(db) || !TestClusteredKeySpan()) {
+	if (!TestBloom(db) || !TestPRF(db) || !TestPRFDirectRanges(db) || !TestPRFRangeNoOverlap(db) ||
+	    !TestClusteredKeySpan()) {
 		return 1;
 	}
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)

@@ -802,8 +802,7 @@ bool JoinHashTable::AnalyzePrefixRangeFilter() {
 		return false;
 	}
 	D_ASSERT(prefix_range_filter);
-	prefix_range_filter->Compress(context, prefix_range_filter_false_positive_rate_threshold);
-	const auto analysis = prefix_range_filter->Analyze();
+	const auto analysis = prefix_range_filter->Compress(context, prefix_range_filter_false_positive_rate_threshold);
 	const bool exceeds_threshold = analysis.false_positive_rate > prefix_range_filter_false_positive_rate_threshold;
 	prefix_range_filter->SetAllowsTupleFiltering(!exceeds_threshold);
 	should_analyze_prefix_range_filter = false;

@@ -88,6 +88,8 @@ TEST_CASE("Prefix range filter direct compression uses one range for contiguous 
 	auto info = filter->GetCompressionInfo();
 	REQUIRE(info.mode == CompressionMode::DIRECT_RANGES);
 	REQUIRE(info.range_count == 1);
+	REQUIRE(info.run_count == 1);
+	REQUIRE(info.bitmap_allocation_bytes == 0);
 	REQUIRE(info.false_positive_rate == 0);
 	for (auto key : keys) {
 		REQUIRE(ContainsKey(*filter, key));
@@ -109,6 +111,7 @@ TEST_CASE("Prefix range filter compresses exact threshold bitmap to one direct r
 	auto info = filter->GetCompressionInfo();
 	REQUIRE(info.mode == CompressionMode::DIRECT_RANGES);
 	REQUIRE(info.range_count == 1);
+	REQUIRE(info.bitmap_allocation_bytes == 0);
 	REQUIRE(info.false_positive_rate == 0);
 	REQUIRE(ContainsKey(*filter, 0));
 	REQUIRE(ContainsKey(*filter, KEY_COUNT - 1));
@@ -130,6 +133,8 @@ TEST_CASE("Prefix range filter direct compression preserves four sparse value ra
 	auto info = filter->GetCompressionInfo();
 	REQUIRE(info.mode == CompressionMode::DIRECT_RANGES);
 	REQUIRE(info.range_count == 4);
+	REQUIRE(info.run_count == 4);
+	REQUIRE(info.bitmap_allocation_bytes == 0);
 	REQUIRE(info.false_positive_rate == 0);
 	for (auto key : keys) {
 		REQUIRE(ContainsKey(*filter, key));
@@ -139,7 +144,7 @@ TEST_CASE("Prefix range filter direct compression preserves four sparse value ra
 	REQUIRE(!ContainsKey(*filter, 500));
 }
 
-TEST_CASE("Prefix range filter falls back to dyadic compression when four ranges exceed FPR", "[optimizer]") {
+TEST_CASE("Prefix range filter keeps a small bitmap when dyadic compression would add false positives", "[optimizer]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 
@@ -151,11 +156,32 @@ TEST_CASE("Prefix range filter falls back to dyadic compression when four ranges
 	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 64, 0, 0.34);
 	auto info = filter->GetCompressionInfo();
 	REQUIRE(info.mode == CompressionMode::BITMAP);
-	REQUIRE(info.shift == 1);
+	REQUIRE(info.shift == 0);
+	REQUIRE(info.run_count == keys.size());
+	REQUIRE(info.false_positive_rate == 0);
 	REQUIRE(info.false_positive_rate <= 0.34);
 	for (auto key : keys) {
 		REQUIRE(ContainsKey(*filter, key));
 	}
+}
+
+TEST_CASE("Prefix range filter rejects an initially oversized FPR before compression", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	static constexpr double MAX_FALSE_POSITIVE_RATE = 0.5;
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, {0, 16, 32, 48}, 0, 64, 4, MAX_FALSE_POSITIVE_RATE);
+	auto info = filter->GetCompressionInfo();
+	auto analysis = filter->Analyze();
+
+	REQUIRE(info.mode == CompressionMode::BITMAP);
+	REQUIRE(info.shift == 4);
+	REQUIRE(info.active_buckets == 4);
+	REQUIRE(info.run_count == 1);
+	REQUIRE(info.bitmap_allocation_bytes > 0);
+	REQUIRE(info.false_positive_rate > MAX_FALSE_POSITIVE_RATE);
+	REQUIRE(analysis.active_buckets == info.active_buckets);
+	REQUIRE(analysis.false_positive_rate == Approx(info.false_positive_rate));
 }
 
 TEST_CASE("Prefix range filter dyadic analysis preserves original positive lower bound", "[optimizer]") {
@@ -186,6 +212,53 @@ TEST_CASE("Prefix range filter dyadic analysis preserves original positive lower
 	}
 	REQUIRE(!ContainsKey(*filter, 2));
 	REQUIRE(!ContainsKey(*filter, 6));
+}
+
+TEST_CASE("Prefix range filter fast-builds exact ranges discovered by dyadic compression", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, {0, 1, 3, 4, 6, 7, 9, 10, 12, 13}, 0, 13, 0, 1.0);
+	auto info = filter->GetCompressionInfo();
+
+	REQUIRE(info.mode == CompressionMode::DIRECT_RANGES);
+	REQUIRE(info.shift == 1);
+	REQUIRE(info.range_count == 1);
+	REQUIRE(info.run_count == 1);
+	REQUIRE(info.bitmap_allocation_bytes == 0);
+	REQUIRE(info.false_positive_rate == Approx(1.0));
+	for (int32_t key : {0, 1, 3, 4, 6, 7, 9, 10, 12, 13}) {
+		REQUIRE(ContainsKey(*filter, key));
+	}
+}
+
+TEST_CASE("Prefix range filter right-sizes an accepted cache-sized bitmap", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	vector<int32_t> keys;
+	for (int32_t key = 0; key <= 262140; key += 6) {
+		keys.push_back(key);
+	}
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 262140, 0, 1.0);
+	auto info = filter->GetCompressionInfo();
+	const auto first_analysis = filter->Analyze();
+	const auto second_analysis = filter->Compress(*con.context, 1.0);
+	const auto repeated_info = filter->GetCompressionInfo();
+
+	REQUIRE(info.mode == CompressionMode::BITMAP);
+	REQUIRE(info.shift == 1);
+	REQUIRE(info.logical_bucket_count == 131071);
+	REQUIRE(info.bitmap_allocation_bytes == 64 + 2048 * sizeof(uint64_t));
+	REQUIRE(info.run_count == keys.size());
+	REQUIRE(first_analysis.active_buckets == info.active_buckets);
+	REQUIRE(first_analysis.false_positive_rate == Approx(info.false_positive_rate));
+	REQUIRE(second_analysis.active_buckets == first_analysis.active_buckets);
+	REQUIRE(second_analysis.false_positive_rate == Approx(first_analysis.false_positive_rate));
+	REQUIRE(repeated_info.shift == info.shift);
+	REQUIRE(repeated_info.bitmap_allocation_bytes == info.bitmap_allocation_bytes);
+	REQUIRE(ContainsKey(*filter, keys.front()));
+	REQUIRE(ContainsKey(*filter, keys.back()));
 }
 
 TEST_CASE("Prefix range filter FPR analysis is conservative for duplicate build keys", "[optimizer]") {

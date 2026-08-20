@@ -112,10 +112,10 @@ Config ParseArguments(int argc, char *argv[]) {
 		}
 	}
 	if (config.domain_size == 0 || config.total_keys == 0 || config.total_keys >= config.domain_size ||
-	    config.min_clusters < 2 || config.max_clusters < config.min_clusters ||
-	    !IsPowerOfTwo(config.min_clusters) || !IsPowerOfTwo(config.max_clusters) ||
-	    config.max_clusters > config.total_keys || config.max_clusters - 1 > config.domain_size - config.total_keys ||
-	    config.queries_per_cluster_count == 0 || config.repetitions == 0) {
+	    config.min_clusters < 2 || config.max_clusters < config.min_clusters || !IsPowerOfTwo(config.min_clusters) ||
+	    !IsPowerOfTwo(config.max_clusters) || config.max_clusters > config.total_keys ||
+	    config.max_clusters - 1 > config.domain_size - config.total_keys || config.queries_per_cluster_count == 0 ||
+	    config.repetitions == 0) {
 		throw InvalidInputException("invalid benchmark configuration");
 	}
 	if (config.grafite_bits_per_key <= 2.0 || config.diva_bits_per_key <= 1.0) {
@@ -199,7 +199,7 @@ unique_ptr<PrefixRangeFilter> BuildPRF(ClientContext &context, const vector<uint
 
 idx_t PRFBytes(const PrefixRangeFilter::CompressionInfo &info) {
 	return info.mode == CompressionMode::DIRECT_RANGES ? info.range_count * 2 * sizeof(uint64_t)
-	                                                  : ((info.logical_bucket_count + 63) / 64) * sizeof(uint64_t);
+	                                                   : ((info.logical_bucket_count + 63) / 64) * sizeof(uint64_t);
 }
 
 template <class FUNC>
@@ -243,7 +243,8 @@ int main(int argc, char *argv[]) {
 			out = &file_out;
 		}
 		*out << "repetition,cluster_count,gap_count,gap_selection,min_range_width,max_range_width,mean_range_width,"
-		        "summary,mode,query_count,total_query_time_ns,queries_per_sec,possibly_overlapping,correctly_reports_no_overlap,"
+		        "summary,mode,query_count,total_query_time_ns,queries_per_sec,possibly_overlapping,correctly_reports_"
+		        "no_overlap,"
 		        "summary_bytes,compression_mode,shift,range_count,active_buckets\n";
 
 		DuckDB db(nullptr);
@@ -259,10 +260,11 @@ int main(int argc, char *argv[]) {
 
 				idx_t matches;
 				auto info = prf->GetCompressionInfo();
-				auto ns = TimeQueries(layout.gaps, config.queries_per_cluster_count, matches, [&](const QueryRange &gap) {
-					return prf->LookupRange(Value::UBIGINT(gap.lower), Value::UBIGINT(gap.upper)) !=
-					       FilterPropagateResult::FILTER_ALWAYS_FALSE;
-				});
+				auto ns =
+				    TimeQueries(layout.gaps, config.queries_per_cluster_count, matches, [&](const QueryRange &gap) {
+					    return prf->LookupRange(Value::UBIGINT(gap.lower), Value::UBIGINT(gap.upper)) !=
+					           FilterPropagateResult::FILTER_ALWAYS_FALSE;
+				    });
 				WriteResult(*out, rep, cluster_count, layout, "prf", "uncompressed", config.queries_per_cluster_count,
 				            PRFBytes(info), "bitmap", info.shift, info.range_count, info.active_buckets, ns, matches);
 
