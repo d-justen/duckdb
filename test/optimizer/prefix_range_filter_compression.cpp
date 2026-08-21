@@ -303,6 +303,36 @@ TEST_CASE("Prefix range filter bitmap statistics return always true for fully co
 	REQUIRE(filter->LookupStatistics(Int32Statistics(-10, 100)) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
 }
 
+TEST_CASE("Prefix range filter indexes long homogeneous bitmap word runs", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	vector<int32_t> keys;
+	keys.reserve(140004);
+	for (int32_t key = 1; key <= 140000; key++) {
+		keys.push_back(key);
+	}
+	for (int32_t key : {300000, 500000, 700000, 900000}) {
+		keys.push_back(key);
+	}
+
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 1100000, 0, 0);
+	const auto info = filter->GetCompressionInfo();
+	REQUIRE(info.mode == CompressionMode::BITMAP);
+	REQUIRE(info.shift == 0);
+	REQUIRE(info.range_index_count > 0);
+	REQUIRE(info.range_index_bytes >= info.range_index_count * 2 * sizeof(idx_t));
+
+	// The boundary words are included in these checks; only the complete interior words use the index.
+	REQUIRE(filter->LookupStatistics(Int32Statistics(64, 139967)) == FilterPropagateResult::FILTER_ALWAYS_TRUE);
+	REQUIRE(filter->LookupStatistics(Int32Statistics(140001, 299999)) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
+	REQUIRE(filter->LookupStatistics(Int32Statistics(140001, 499999)) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
+
+	// Short and single-word ranges continue to use exact boundary masks.
+	REQUIRE(filter->LookupStatistics(Int32Statistics(0, 0)) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
+	REQUIRE(filter->LookupStatistics(Int32Statistics(1, 1)) == FilterPropagateResult::FILTER_ALWAYS_TRUE);
+}
+
 TEST_CASE("Prefix range filter direct ranges return always true for fully covered range", "[optimizer]") {
 	DuckDB db(nullptr);
 	Connection con(db);

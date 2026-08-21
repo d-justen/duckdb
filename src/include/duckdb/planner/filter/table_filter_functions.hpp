@@ -162,6 +162,8 @@ public:
 		idx_t run_count = 0;
 		idx_t logical_bucket_count = 0;
 		idx_t bitmap_allocation_bytes = 0;
+		idx_t range_index_count = 0;
+		idx_t range_index_bytes = 0;
 		double false_positive_rate = 0;
 	};
 

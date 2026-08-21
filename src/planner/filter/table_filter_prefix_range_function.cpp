@@ -74,6 +74,8 @@ public:
 		buf_ = AllocateBitmap(context, word_count, bitmap);
 		mode = Mode::BITMAP;
 		range_count = 0;
+		homogeneous_word_runs.clear();
+		range_index_built = false;
 		base_active_buckets = 0;
 		current_active_buckets = 0;
 		current_run_count = 0;
@@ -180,35 +182,33 @@ public:
 		const idx_t lb_bit_off = UnsafeNumericCast<idx_t>(lb_bit_idx & UnsafeNumericCast<U>(WORD_MASK));
 		const idx_t ub_bit_off = UnsafeNumericCast<idx_t>(ub_bit_idx & UnsafeNumericCast<U>(WORD_MASK));
 
-		bool any_set = false;
-		bool all_set = true;
 		if (lb_word_idx == ub_word_idx) {
 			const auto range_mask = ((~0ULL << lb_bit_off) & (~0ULL >> (WORD_MASK - ub_bit_off)));
-			const auto word = bitmap[lb_word_idx] & range_mask;
-			any_set = word != 0;
-			all_set = word == range_mask;
-		} else {
-			const auto lb_word_mask = (~0ULL << lb_bit_off);
-			const auto lb_word = bitmap[lb_word_idx] & lb_word_mask;
-			any_set |= lb_word != 0;
-			all_set &= lb_word == lb_word_mask;
+			return RangeStateToResult(ClassifyMaskedWord(bitmap[lb_word_idx], range_mask));
+		}
 
-			for (idx_t i = UnsafeNumericCast<idx_t>(lb_word_idx) + 1; i < UnsafeNumericCast<idx_t>(ub_word_idx); i++) {
-				const auto word = bitmap[i];
-				any_set |= word != 0;
-				all_set &= word == ~0ULL;
+		auto state = ClassifyMaskedWord(bitmap[lb_word_idx], ~0ULL << lb_bit_off);
+		state = CombineRangeStates(state, ClassifyMaskedWord(bitmap[ub_word_idx], ~0ULL >> (WORD_MASK - ub_bit_off)));
+		if (state == BitmapRangeState::MIXED) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+
+		const auto interior_begin = UnsafeNumericCast<idx_t>(lb_word_idx) + 1;
+		const auto interior_end = UnsafeNumericCast<idx_t>(ub_word_idx);
+		if (interior_begin < interior_end) {
+			const auto interior_word_count = interior_end - interior_begin;
+			if (range_index_built && interior_word_count > RANGE_SCAN_WORD_LIMIT) {
+				state = CombineRangeStates(state, LookupIndexedWordRange(interior_begin, interior_end));
+			} else {
+				for (idx_t word_idx = interior_begin; word_idx < interior_end; word_idx++) {
+					state = CombineRangeStates(state, ClassifyWord(bitmap[word_idx]));
+					if (state == BitmapRangeState::MIXED) {
+						return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+					}
+				}
 			}
-
-			const auto ub_word_mask = ~0ULL >> (WORD_MASK - ub_bit_off);
-			const auto ub_word = bitmap[ub_word_idx] & ub_word_mask;
-			any_set |= ub_word != 0;
-			all_set &= ub_word == ub_word_mask;
 		}
-
-		if (all_set) {
-			return FilterPropagateResult::FILTER_ALWAYS_TRUE;
-		}
-		return any_set ? FilterPropagateResult::NO_PRUNING_POSSIBLE : FilterPropagateResult::FILTER_ALWAYS_FALSE;
+		return RangeStateToResult(state);
 	}
 
 	bool IsInitialized() const {
@@ -241,6 +241,8 @@ public:
 		info.run_count = analysis_cached && current_run_count_is_exact ? current_run_count : CountRuns();
 		info.logical_bucket_count = logical_bucket_count;
 		info.bitmap_allocation_bytes = mode == Mode::BITMAP ? buf_.GetSize() : 0;
+		info.range_index_count = homogeneous_word_runs.size();
+		info.range_index_bytes = homogeneous_word_runs.capacity() * sizeof(HomogeneousWordRun);
 		info.false_positive_rate = analysis_cached ? cached_false_positive_rate
 		                                           : FalsePositiveRate(info.active_buckets, shift, info.active_buckets);
 		return info;
@@ -260,12 +262,20 @@ private:
 	static constexpr idx_t MAX_DIRECT_RANGES = 4;
 	static constexpr idx_t METRICS_BLOCK_WORDS = 64;
 	static constexpr idx_t BITMAP_CACHE_TARGET_BYTES = 16 * 1024;
+	static constexpr idx_t RANGE_SCAN_WORD_LIMIT = 2048;
 
 	enum class Mode : uint8_t { BITMAP, DIRECT_RANGES };
+	enum class BitmapRangeState : uint8_t { EMPTY, FULL, MIXED };
 
 	struct DirectRange {
 		U lower;
 		U width;
+	};
+
+	struct HomogeneousWordRun {
+		idx_t begin_word;
+		idx_t end_word;
+		BitmapRangeState state;
 	};
 
 	struct BitmapMetrics {
@@ -425,6 +435,52 @@ private:
 			return 0;
 		}
 		return (1ULL << valid_bits) - 1ULL;
+	}
+
+	static bool NeedsRangeIndex(idx_t logical_buckets) {
+		return (logical_buckets >> WORD_SHIFT) > RANGE_SCAN_WORD_LIMIT;
+	}
+
+	static BitmapRangeState ClassifyMaskedWord(uint64_t word, uint64_t mask) {
+		const auto masked_word = word & mask;
+		if (masked_word == 0) {
+			return BitmapRangeState::EMPTY;
+		}
+		return masked_word == mask ? BitmapRangeState::FULL : BitmapRangeState::MIXED;
+	}
+
+	static BitmapRangeState ClassifyWord(uint64_t word) {
+		return ClassifyMaskedWord(word, ~0ULL);
+	}
+
+	static BitmapRangeState CombineRangeStates(BitmapRangeState left, BitmapRangeState right) {
+		return left == right ? left : BitmapRangeState::MIXED;
+	}
+
+	static FilterPropagateResult RangeStateToResult(BitmapRangeState state) {
+		switch (state) {
+		case BitmapRangeState::EMPTY:
+			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+		case BitmapRangeState::FULL:
+			return FilterPropagateResult::FILTER_ALWAYS_TRUE;
+		case BitmapRangeState::MIXED:
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		default:
+			throw InternalException("Invalid prefix range bitmap state");
+		}
+	}
+
+	BitmapRangeState LookupIndexedWordRange(idx_t begin_word, idx_t end_word) const {
+		D_ASSERT(range_index_built);
+		D_ASSERT(end_word - begin_word > RANGE_SCAN_WORD_LIMIT);
+		const auto entry =
+		    std::upper_bound(homogeneous_word_runs.begin(), homogeneous_word_runs.end(), begin_word,
+		                     [](idx_t value, const HomogeneousWordRun &run) { return value < run.begin_word; });
+		if (entry == homogeneous_word_runs.begin()) {
+			return BitmapRangeState::MIXED;
+		}
+		const auto &candidate = *(entry - 1);
+		return candidate.end_word >= end_word ? candidate.state : BitmapRangeState::MIXED;
 	}
 
 	static uint64_t PackMergedPairsTo32(uint64_t word) {
@@ -707,6 +763,8 @@ private:
 			ranges[range_idx] = {lower, static_cast<U>(upper - lower)};
 		}
 		mode = Mode::DIRECT_RANGES;
+		homogeneous_word_runs.clear();
+		range_index_built = false;
 		storage.data.Reset();
 		storage.bitmap = nullptr;
 		storage.word_capacity = 0;
@@ -728,6 +786,38 @@ private:
 		current.data.Reset();
 		bitmap = final_storage.bitmap;
 		buf_ = std::move(final_storage.data);
+	}
+
+	void BuildHomogeneousWordRunIndex() {
+		homogeneous_word_runs.clear();
+		range_index_built = NeedsRangeIndex(logical_bucket_count);
+		if (!range_index_built) {
+			return;
+		}
+
+		const auto complete_word_count = logical_bucket_count >> WORD_SHIFT;
+		for (idx_t anchor_word = 0; anchor_word < complete_word_count;) {
+			const auto state = ClassifyWord(bitmap[anchor_word]);
+			if (state == BitmapRangeState::MIXED) {
+				anchor_word += RANGE_SCAN_WORD_LIMIT;
+				continue;
+			}
+
+			auto begin_word = anchor_word;
+			while (begin_word > 0 && ClassifyWord(bitmap[begin_word - 1]) == state) {
+				begin_word--;
+			}
+			auto end_word = anchor_word + 1;
+			while (end_word < complete_word_count && ClassifyWord(bitmap[end_word]) == state) {
+				end_word++;
+			}
+			if (end_word - begin_word > RANGE_SCAN_WORD_LIMIT) {
+				homogeneous_word_runs.push_back({begin_word, end_word, state});
+			}
+			do {
+				anchor_word += RANGE_SCAN_WORD_LIMIT;
+			} while (anchor_word < end_word);
+		}
 	}
 
 	void CompressBitmap(ClientContext &context, double max_false_positive_rate) {
@@ -755,9 +845,15 @@ private:
 			const auto initial_false_positive_rate =
 			    FalsePositiveRate(current_metrics.active_buckets, current_shift, base_active_buckets);
 			SetCachedAnalysis(current_metrics, initial_false_positive_rate);
-			if (initial_false_positive_rate > max_false_positive_rate || current_metrics.active_buckets == 0) {
+			if (initial_false_positive_rate > max_false_positive_rate) {
 				compression_finalized = true;
 				SetBitmapStorage(context, current, scratch);
+				return;
+			}
+			if (current_metrics.active_buckets == 0) {
+				compression_finalized = true;
+				SetBitmapStorage(context, current, scratch);
+				BuildHomogeneousWordRunIndex();
 				return;
 			}
 
@@ -824,6 +920,7 @@ private:
 		mode = Mode::BITMAP;
 		range_count = 0;
 		SetBitmapStorage(context, current, scratch);
+		BuildHomogeneousWordRunIndex();
 		compression_finalized = true;
 	}
 
@@ -843,6 +940,8 @@ private:
 	bool compression_finalized = false;
 	idx_t range_count = 0;
 	array<DirectRange, MAX_DIRECT_RANGES> ranges;
+	vector<HomogeneousWordRun> homogeneous_word_runs;
+	bool range_index_built = false;
 	AllocatedData buf_;
 	uint64_t *bitmap;
 };

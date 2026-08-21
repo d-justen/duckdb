@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
@@ -37,6 +38,7 @@ struct Config {
 	uint64_t seed = 42;
 	double grafite_bits_per_key = 12.0;
 	double diva_bits_per_key = 16.0;
+	double max_false_positive_rate = 0.001;
 	string output_path;
 };
 
@@ -46,9 +48,18 @@ struct QueryRange {
 	uint64_t width;
 };
 
+struct QueryWorkload {
+	const char *name;
+	const vector<QueryRange> *ranges;
+	bool expected_overlap;
+};
+
 struct ClusterLayout {
 	vector<uint64_t> keys;
 	vector<QueryRange> gaps;
+	vector<QueryRange> clusters;
+	vector<QueryRange> mixed_ranges;
+	vector<QueryRange> domain_range;
 	uint64_t min_gap_width = 0;
 	uint64_t max_gap_width = 0;
 	double mean_gap_width = 0;
@@ -98,6 +109,8 @@ Config ParseArguments(int argc, char *argv[]) {
 			config.grafite_bits_per_key = stod(arg.substr(14));
 		} else if (StartsWith(arg, "--diva-bpk=")) {
 			config.diva_bits_per_key = stod(arg.substr(11));
+		} else if (StartsWith(arg, "--max-fpr=")) {
+			config.max_false_positive_rate = stod(arg.substr(10));
 		} else if (StartsWith(arg, "--output=")) {
 			config.output_path = arg.substr(9);
 		} else if (arg == "--help") {
@@ -105,7 +118,7 @@ Config ParseArguments(int argc, char *argv[]) {
 			          << "  --domain-size=N --total-keys=N\n"
 			          << "  --min-clusters=N --max-clusters=N (powers of two)\n"
 			          << "  --queries-per-cluster-count=N --repetitions=N --seed=N\n"
-			          << "  --grafite-bpk=N --diva-bpk=N --output=PATH\n";
+			          << "  --grafite-bpk=N --diva-bpk=N --max-fpr=N --output=PATH\n";
 			std::exit(0);
 		} else {
 			throw InvalidInputException("Unknown argument: %s", arg);
@@ -118,7 +131,9 @@ Config ParseArguments(int argc, char *argv[]) {
 	    config.repetitions == 0) {
 		throw InvalidInputException("invalid benchmark configuration");
 	}
-	if (config.grafite_bits_per_key <= 2.0 || config.diva_bits_per_key <= 1.0) {
+	if (config.grafite_bits_per_key <= 2.0 || config.diva_bits_per_key <= 1.0 ||
+	    !std::isfinite(config.max_false_positive_rate) || config.max_false_positive_rate < 0 ||
+	    config.max_false_positive_rate > 1) {
 		throw InvalidInputException("invalid bits-per-key configuration");
 	}
 	return config;
@@ -147,13 +162,17 @@ ClusterLayout GenerateClusterLayout(uint64_t domain_size, idx_t total_keys, idx_
 	ClusterLayout layout;
 	layout.keys.reserve(total_keys);
 	layout.gaps.reserve(gap_count);
+	layout.clusters.reserve(cluster_count);
+	layout.mixed_ranges.reserve(gap_count);
 	uint64_t cursor = 0;
 	uint64_t total_gap_width = 0;
 	for (idx_t cluster_idx = 0; cluster_idx < cluster_count; cluster_idx++) {
+		const auto cluster_start = cursor;
 		const idx_t length = cluster_length + (cluster_idx < cluster_remainder ? 1 : 0);
 		for (idx_t i = 0; i < length; i++) {
 			layout.keys.push_back(cursor++);
 		}
+		layout.clusters.push_back({cluster_start, cursor - 1, UnsafeNumericCast<uint64_t>(length)});
 		if (cluster_idx + 1 < cluster_count) {
 			const uint64_t width = base_gap + (cluster_idx < gap_remainder ? 1 : 0);
 			layout.gaps.push_back({cursor, cursor + width - 1, width});
@@ -161,6 +180,12 @@ ClusterLayout GenerateClusterLayout(uint64_t domain_size, idx_t total_keys, idx_
 			total_gap_width += width;
 		}
 	}
+	for (idx_t gap_idx = 0; gap_idx < layout.gaps.size(); gap_idx++) {
+		const auto lower = layout.clusters[gap_idx].upper;
+		const auto upper = layout.clusters[gap_idx + 1].lower;
+		layout.mixed_ranges.push_back({lower, upper, upper - lower + 1});
+	}
+	layout.domain_range.push_back({0, domain_size - 1, domain_size});
 	D_ASSERT(layout.keys.size() == total_keys);
 	D_ASSERT(layout.keys.front() == 0 && layout.keys.back() == domain_size - 1);
 	D_ASSERT(!layout.gaps.empty());
@@ -178,7 +203,14 @@ void FillVector(Vector &result, const vector<uint64_t> &values) {
 	FlatVector::SetSize(result, values.size());
 }
 
-unique_ptr<PrefixRangeFilter> BuildPRF(ClientContext &context, const vector<uint64_t> &keys, bool compress) {
+struct PRFBuildResult {
+	unique_ptr<PrefixRangeFilter> filter;
+	uint64_t post_processing_ns = 0;
+};
+
+PRFBuildResult BuildPRF(ClientContext &context, const vector<uint64_t> &keys, bool compress,
+                        double max_false_positive_rate) {
+	PRFBuildResult result;
 	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::UBIGINT);
 	PrefixRangeFilter::Sizing sizing;
 	if (!PrefixRangeFilter::TryComputeSizing(Value::UBIGINT(keys.front()), Value::UBIGINT(keys.back()), keys.size(),
@@ -192,40 +224,58 @@ unique_ptr<PrefixRangeFilter> BuildPRF(ClientContext &context, const vector<uint
 	filter->InsertKeys(vector, keys.size(), *state);
 	filter->MergeBuildState(*state);
 	if (compress) {
-		filter->Compress(context, 0.001);
+		const auto start = Clock::now();
+		filter->Compress(context, max_false_positive_rate);
+		result.post_processing_ns = UnsafeNumericCast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 	}
-	return filter;
+	result.filter = std::move(filter);
+	return result;
 }
 
 idx_t PRFBytes(const PrefixRangeFilter::CompressionInfo &info) {
-	return info.mode == CompressionMode::DIRECT_RANGES ? info.range_count * 2 * sizeof(uint64_t)
-	                                                   : ((info.logical_bucket_count + 63) / 64) * sizeof(uint64_t);
+	const auto filter_bytes = info.mode == CompressionMode::DIRECT_RANGES
+	                              ? info.range_count * 2 * sizeof(uint64_t)
+	                              : ((info.logical_bucket_count + 63) / 64) * sizeof(uint64_t);
+	return filter_bytes + info.range_index_bytes;
 }
 
 template <class FUNC>
-uint64_t TimeQueries(const vector<QueryRange> &gaps, idx_t count, idx_t &possibly_overlapping, FUNC &&query) {
+uint64_t TimeQueries(const vector<QueryRange> &ranges, idx_t count, idx_t &possibly_overlapping, FUNC &&query) {
 	possibly_overlapping = 0;
-	for (const auto &gap : gaps) {
-		possibly_overlapping += query(gap) ? 1 : 0;
+	for (const auto &range : ranges) {
+		possibly_overlapping += query(range) ? 1 : 0;
 	}
 	possibly_overlapping = 0;
 	const auto start = Clock::now();
 	for (idx_t i = 0; i < count; i++) {
-		possibly_overlapping += query(gaps[i % gaps.size()]) ? 1 : 0;
+		possibly_overlapping += query(ranges[i % ranges.size()]) ? 1 : 0;
 	}
 	return UnsafeNumericCast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 }
 
-void WriteResult(std::ostream &out, idx_t repetition, idx_t cluster_count, const ClusterLayout &layout,
-                 const char *summary, const char *mode, idx_t query_count, idx_t bytes, const char *compression_mode,
-                 idx_t shift, idx_t range_count, idx_t active_buckets, uint64_t ns, idx_t possibly_overlapping) {
+void WriteResult(std::ostream &out, idx_t repetition, idx_t cluster_count, const vector<QueryRange> &ranges,
+                 const char *query_kind, const char *summary, const char *mode, double max_false_positive_rate,
+                 idx_t query_count, idx_t bytes, const char *compression_mode, idx_t shift, idx_t range_count,
+                 idx_t active_buckets, uint64_t post_processing_ns, idx_t range_index_count, idx_t range_index_bytes,
+                 uint64_t ns, idx_t possibly_overlapping, bool expected_overlap) {
+	uint64_t min_width = NumericLimits<uint64_t>::Maximum();
+	uint64_t max_width = 0;
+	double total_width = 0;
+	for (const auto &range : ranges) {
+		min_width = MinValue<uint64_t>(min_width, range.width);
+		max_width = MaxValue<uint64_t>(max_width, range.width);
+		total_width += static_cast<double>(range.width);
+	}
+	const auto mean_width = total_width / static_cast<double>(ranges.size());
 	const auto throughput = ns == 0 ? 0.0 : static_cast<double>(query_count) * 1e9 / static_cast<double>(ns);
-	out << repetition << ',' << cluster_count << ',' << layout.gaps.size() << ",all," << layout.min_gap_width << ','
-	    << layout.max_gap_width << ',' << std::fixed << std::setprecision(3) << layout.mean_gap_width << ',' << summary
-	    << ',' << mode << ',' << query_count << ',' << ns << ',' << throughput << ',' << possibly_overlapping << ','
-	    << (possibly_overlapping == 0 ? "true" : "false") << ',' << bytes << ',' << compression_mode << ',' << shift
-	    << ',' << range_count << ',' << active_buckets << '\n';
+	out << repetition << ',' << cluster_count << ',' << ranges.size() << ',' << query_kind << ',' << min_width << ','
+	    << max_width << ',' << std::fixed << std::setprecision(3) << mean_width << ',' << summary << ',' << mode << ','
+	    << max_false_positive_rate << ',' << query_count << ',' << ns << ',' << throughput << ','
+	    << possibly_overlapping << ',' << bytes << ',' << compression_mode << ',' << shift << ',' << range_count << ','
+	    << active_buckets << ',' << post_processing_ns << ',' << range_index_count << ',' << range_index_bytes << ','
+	    << (!expected_overlap || possibly_overlapping == query_count ? "true" : "false") << '\n';
 }
 
 } // namespace
@@ -242,10 +292,11 @@ int main(int argc, char *argv[]) {
 			}
 			out = &file_out;
 		}
-		*out << "repetition,cluster_count,gap_count,gap_selection,min_range_width,max_range_width,mean_range_width,"
-		        "summary,mode,query_count,total_query_time_ns,queries_per_sec,possibly_overlapping,correctly_reports_"
-		        "no_overlap,"
-		        "summary_bytes,compression_mode,shift,range_count,active_buckets\n";
+		*out << "repetition,cluster_count,range_count,query_kind,min_range_width,max_range_width,mean_range_width,"
+		        "summary,mode,max_false_positive_rate,query_count,total_query_time_ns,queries_per_sec,possibly_"
+		        "overlapping,"
+		        "summary_bytes,compression_mode,shift,direct_range_count,active_buckets,post_processing_time_ns,"
+		        "range_index_count,range_index_bytes,correct_result\n";
 
 		DuckDB db(nullptr);
 		Connection con(db);
@@ -255,43 +306,63 @@ int main(int argc, char *argv[]) {
 			std::shuffle(cluster_counts.begin(), cluster_counts.end(), rng);
 			for (const auto cluster_count : cluster_counts) {
 				const auto layout = GenerateClusterLayout(config.domain_size, config.total_keys, cluster_count);
-				auto prf = BuildPRF(*con.context, layout.keys, false);
-				auto compressed_prf = BuildPRF(*con.context, layout.keys, true);
+				auto prf = BuildPRF(*con.context, layout.keys, false, config.max_false_positive_rate);
+				auto compressed_prf = BuildPRF(*con.context, layout.keys, true, config.max_false_positive_rate);
+				const vector<QueryWorkload> workloads {{"empty", &layout.gaps, false},
+				                                       {"full", &layout.clusters, true},
+				                                       {"mixed_bridge", &layout.mixed_ranges, true},
+				                                       {"mixed_domain", &layout.domain_range, true}};
 
-				idx_t matches;
-				auto info = prf->GetCompressionInfo();
-				auto ns =
-				    TimeQueries(layout.gaps, config.queries_per_cluster_count, matches, [&](const QueryRange &gap) {
-					    return prf->LookupRange(Value::UBIGINT(gap.lower), Value::UBIGINT(gap.upper)) !=
-					           FilterPropagateResult::FILTER_ALWAYS_FALSE;
-				    });
-				WriteResult(*out, rep, cluster_count, layout, "prf", "uncompressed", config.queries_per_cluster_count,
-				            PRFBytes(info), "bitmap", info.shift, info.range_count, info.active_buckets, ns, matches);
+				for (const auto &workload : workloads) {
+					idx_t matches;
+					auto info = prf.filter->GetCompressionInfo();
+					auto ns = TimeQueries(
+					    *workload.ranges, config.queries_per_cluster_count, matches, [&](const QueryRange &range) {
+						    return prf.filter->LookupRange(Value::UBIGINT(range.lower), Value::UBIGINT(range.upper)) !=
+						           FilterPropagateResult::FILTER_ALWAYS_FALSE;
+					    });
+					WriteResult(*out, rep, cluster_count, *workload.ranges, workload.name, "prf", "uncompressed",
+					            config.max_false_positive_rate, config.queries_per_cluster_count, PRFBytes(info),
+					            "bitmap", info.shift, info.range_count, info.active_buckets, prf.post_processing_ns,
+					            info.range_index_count, info.range_index_bytes, ns, matches, workload.expected_overlap);
 
-				info = compressed_prf->GetCompressionInfo();
-				ns = TimeQueries(layout.gaps, config.queries_per_cluster_count, matches, [&](const QueryRange &gap) {
-					return compressed_prf->LookupRange(Value::UBIGINT(gap.lower), Value::UBIGINT(gap.upper)) !=
-					       FilterPropagateResult::FILTER_ALWAYS_FALSE;
-				});
-				WriteResult(*out, rep, cluster_count, layout, "prf", "compressed", config.queries_per_cluster_count,
-				            PRFBytes(info), info.mode == CompressionMode::DIRECT_RANGES ? "direct_ranges" : "bitmap",
-				            info.shift, info.range_count, info.active_buckets, ns, matches);
+					info = compressed_prf.filter->GetCompressionInfo();
+					ns = TimeQueries(*workload.ranges, config.queries_per_cluster_count, matches,
+					                 [&](const QueryRange &range) {
+						                 return compressed_prf.filter->LookupRange(Value::UBIGINT(range.lower),
+						                                                           Value::UBIGINT(range.upper)) !=
+						                        FilterPropagateResult::FILTER_ALWAYS_FALSE;
+					                 });
+					WriteResult(*out, rep, cluster_count, *workload.ranges, workload.name, "prf", "compressed",
+					            config.max_false_positive_rate, config.queries_per_cluster_count, PRFBytes(info),
+					            info.mode == CompressionMode::DIRECT_RANGES ? "direct_ranges" : "bitmap", info.shift,
+					            info.range_count, info.active_buckets, compressed_prf.post_processing_ns,
+					            info.range_index_count, info.range_index_bytes, ns, matches, workload.expected_overlap);
+				}
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
 				GrafiteBenchmarkFilter grafite;
 				grafite.Build(layout.keys, config.grafite_bits_per_key);
-				ns = TimeQueries(layout.gaps, config.queries_per_cluster_count, matches,
-				                 [&](const QueryRange &gap) { return grafite.RangeProbe(gap.lower, gap.upper); });
-				WriteResult(*out, rep, cluster_count, layout, "grafite", "na", config.queries_per_cluster_count,
-				            UnsafeNumericCast<idx_t>(grafite.SizeBytes()), "na", 0, 0, 0, ns, matches);
+				idx_t grafite_matches;
+				auto grafite_ns =
+				    TimeQueries(layout.gaps, config.queries_per_cluster_count, grafite_matches,
+				                [&](const QueryRange &gap) { return grafite.RangeProbe(gap.lower, gap.upper); });
+				WriteResult(*out, rep, cluster_count, layout.gaps, "empty", "grafite", "na",
+				            config.max_false_positive_rate, config.queries_per_cluster_count,
+				            UnsafeNumericCast<idx_t>(grafite.SizeBytes()), "na", 0, 0, 0, 0, 0, 0, grafite_ns,
+				            grafite_matches, false);
 #endif
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
 				DivaBenchmarkFilter diva;
 				diva.Build(layout.keys, config.diva_bits_per_key);
-				ns = TimeQueries(layout.gaps, config.queries_per_cluster_count, matches,
-				                 [&](const QueryRange &gap) { return diva.RangeProbe(gap.lower, gap.upper); });
-				WriteResult(*out, rep, cluster_count, layout, "diva", "na", config.queries_per_cluster_count,
-				            UnsafeNumericCast<idx_t>(diva.SizeBytes()), "na", 0, 0, 0, ns, matches);
+				idx_t diva_matches;
+				auto diva_ns =
+				    TimeQueries(layout.gaps, config.queries_per_cluster_count, diva_matches,
+				                [&](const QueryRange &gap) { return diva.RangeProbe(gap.lower, gap.upper); });
+				WriteResult(*out, rep, cluster_count, layout.gaps, "empty", "diva", "na",
+				            config.max_false_positive_rate, config.queries_per_cluster_count,
+				            UnsafeNumericCast<idx_t>(diva.SizeBytes()), "na", 0, 0, 0, 0, 0, 0, diva_ns, diva_matches,
+				            false);
 #endif
 			}
 		}
