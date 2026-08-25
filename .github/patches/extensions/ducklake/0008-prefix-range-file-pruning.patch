@@ -1,0 +1,384 @@
+diff --git a/src/storage/ducklake_metadata_manager.cpp b/src/storage/ducklake_metadata_manager.cpp
+index fd86dd06..26c0b15b 100644
+--- a/src/storage/ducklake_metadata_manager.cpp
++++ b/src/storage/ducklake_metadata_manager.cpp
+@@ -1370,10 +1370,11 @@ DuckLakeMetadataManager::GenerateFilterPushdownComponents(const FilterPushdownIn
+ 	return result;
+ }
+ 
+-struct DynamicFilterColumn {
++struct FileStatisticsFilterColumn {
+ 	idx_t column_field_index;
+ 	ExpressionType comparison_type;
+ 	LogicalType column_type;
++	bool order_files;
+ };
+ 
+ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLakeTableEntry &table,
+@@ -1381,20 +1382,27 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
+                                                                         const FilterPushdownInfo *filter_info) {
+ 	auto table_id = table.GetTableId();
+ 
+-	// If we have Top-N dynamic filter pushdown, include file-level min/max stats for pruning and ordering
+-	vector<DynamicFilterColumn> dynamic_filter_columns;
++	// Runtime filters need file-level min/max stats to prune files before opening them. Top-N dynamic filters also use
++	// these statistics to order files. Prefix range filters use the full PRF in DuckLakeMultiFileReader.
++	vector<FileStatisticsFilterColumn> statistics_filter_columns;
+ 	if (filter_info) {
+ 		for (auto &entry : filter_info->column_filters) {
+ 			auto &col_filter = entry.second;
+ 			auto dynamic_filter_data = DuckLakeUtil::GetOptionalDynamicFilterData(*col_filter.table_filter);
++			auto has_prefix_range_filter = col_filter.table_filter->expr &&
++			                               ExpressionFilter::ContainsInternalFunction(*col_filter.table_filter->expr,
++			                                                                          PrefixRangeScalarFun::NAME);
+ 			if (dynamic_filter_data) {
+ 				ExpressionType comparison_type;
+ 				{
+ 					lock_guard<mutex> l(dynamic_filter_data->lock);
+ 					comparison_type = dynamic_filter_data->comparison_type;
+ 				}
+-				dynamic_filter_columns.push_back(
+-				    {col_filter.column_field_index, comparison_type, col_filter.column_type});
++				statistics_filter_columns.push_back(
++				    {col_filter.column_field_index, comparison_type, col_filter.column_type, true});
++			} else if (has_prefix_range_filter) {
++				statistics_filter_columns.push_back(
++				    {col_filter.column_field_index, ExpressionType::INVALID, col_filter.column_type, false});
+ 			}
+ 		}
+ 	}
+@@ -1402,8 +1410,8 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
+ 	string stats_select_list;
+ 	string stats_join_list;
+ 	string order_by_clause;
+-	for (idx_t i = 0; i < dynamic_filter_columns.size(); i++) {
+-		auto &dfc = dynamic_filter_columns[i];
++	for (idx_t i = 0; i < statistics_filter_columns.size(); i++) {
++		auto &dfc = statistics_filter_columns[i];
+ 		auto alias = StringUtil::Format("stats_%d", NumericCast<int64_t>(i));
+ 		stats_select_list += StringUtil::Format(", %s.min_value, %s.max_value", alias.c_str(), alias.c_str());
+ 		stats_join_list += StringUtil::Format(
+@@ -1415,7 +1423,7 @@ vector<DuckLakeFileListEntry> DuckLakeMetadataManager::GetFilesForTable(DuckLake
+ 		// so we find satisfying rows early and can skip remaining files via dynamic filter pruning.
+ 		// We only order by the first dynamic filter column: Top-N typically has a single ordering column,
+ 		// and multiple columns would have conflicting requirements (e.g., ORDER BY a DESC, b ASC).
+-		if (order_by_clause.empty()) {
++		if (dfc.order_files && order_by_clause.empty()) {
+ 			const bool seeking_high_values = dfc.comparison_type == ExpressionType::COMPARE_GREATERTHAN ||
+ 			                                 dfc.comparison_type == ExpressionType::COMPARE_GREATERTHANOREQUALTO;
+ 			const bool seeking_low_values = dfc.comparison_type == ExpressionType::COMPARE_LESSTHAN ||
+@@ -1496,7 +1504,7 @@ WHERE data.table_id=%d AND {SNAPSHOT_ID} >= data.begin_snapshot AND ({SNAPSHOT_I
+ 		}
+ 		col_idx++;
+ 		file_entry.delete_file = ReadDeleteFile(table, row, col_idx, IsEncrypted());
+-		for (auto &dfc : dynamic_filter_columns) {
++		for (auto &dfc : statistics_filter_columns) {
+ 			string min_val;
+ 			string max_val;
+ 			if (!row.IsNull(col_idx)) {
+diff --git a/src/storage/ducklake_multi_file_reader.cpp b/src/storage/ducklake_multi_file_reader.cpp
+index 4fc11c8c..70757e35 100644
+--- a/src/storage/ducklake_multi_file_reader.cpp
++++ b/src/storage/ducklake_multi_file_reader.cpp
+@@ -19,6 +19,7 @@
+ #include "duckdb/planner/expression/bound_constant_expression.hpp"
+ #include "duckdb/planner/expression/bound_function_expression.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
++#include "duckdb/planner/expression_iterator.hpp"
+ #include "duckdb/parser/parsed_expression.hpp"
+ #include "duckdb/planner/binder.hpp"
+ #include "duckdb/planner/operator/logical_get.hpp"
+@@ -83,13 +84,65 @@ static void NormalizeListChildNames(vector<MultiFileColumnDefinition> &columns,
+ 	}
+ }
+ 
+-static bool CanSkipFileByTopNDynamicFilter(const DuckLakeFileListEntry &file_entry,
+-                                           const FilterPushdownInfo &filter_info, ClientContext &context) {
++static optional_ptr<const PrefixRangeFunctionData> GetPrefixRangeFunctionData(const Expression &expr) {
++	if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
++		auto &function = expr.Cast<BoundFunctionExpression>();
++		if (function.function.GetName() == PrefixRangeScalarFun::NAME && function.bind_info) {
++			return &function.bind_info->Cast<PrefixRangeFunctionData>();
++		}
++		if (function.function.GetName() == OptionalFilterScalarFun::NAME && function.bind_info) {
++			auto &data = function.bind_info->Cast<OptionalFilterFunctionData>();
++			if (data.child_filter_expr) {
++				return GetPrefixRangeFunctionData(*data.child_filter_expr);
++			}
++		}
++		if (function.function.GetName() == SelectivityOptionalFilterScalarFun::NAME && function.bind_info) {
++			auto &data = function.bind_info->Cast<SelectivityOptionalFilterFunctionData>();
++			if (data.child_filter_expr) {
++				return GetPrefixRangeFunctionData(*data.child_filter_expr);
++			}
++		}
++	}
++
++	optional_ptr<const PrefixRangeFunctionData> result;
++	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
++		if (!result) {
++			result = GetPrefixRangeFunctionData(child);
++		}
++	});
++	return result;
++}
++
++static bool CanSkipFileByRuntimeFilter(const DuckLakeFileListEntry &file_entry,
++                                       const FilterPushdownInfo &filter_info, ClientContext &context) {
+ 	if (file_entry.data_type != DuckLakeDataType::DATA_FILE) {
+ 		return false;
+ 	}
+ 	for (auto &it : filter_info.column_filters) {
+ 		auto &col_filter = it.second;
++		auto mm_it = file_entry.column_min_max.find(col_filter.column_field_index);
++		if (mm_it == file_entry.column_min_max.end()) {
++			continue;
++		}
++
++		if (col_filter.table_filter->expr) {
++			auto prefix_range_data = GetPrefixRangeFunctionData(*col_filter.table_filter->expr);
++			if (prefix_range_data && prefix_range_data->filter && prefix_range_data->filter->IsInitialized()) {
++				const auto &min_str = mm_it->second.first;
++				const auto &max_str = mm_it->second.second;
++				Value file_min;
++				Value file_max;
++				if (!min_str.empty() && !max_str.empty() &&
++				    Value(min_str).DefaultTryCastAs(prefix_range_data->key_type, file_min, nullptr) &&
++				    Value(max_str).DefaultTryCastAs(prefix_range_data->key_type, file_max, nullptr) &&
++				    file_min <= file_max &&
++				    prefix_range_data->filter->LookupRange(file_min, file_max) ==
++				        FilterPropagateResult::FILTER_ALWAYS_FALSE) {
++					return true;
++				}
++			}
++		}
++
+ 		auto filter_data = DuckLakeUtil::GetOptionalDynamicFilterData(*col_filter.table_filter);
+ 		if (!filter_data) {
+ 			continue;
+@@ -105,11 +158,6 @@ static bool CanSkipFileByTopNDynamicFilter(const DuckLakeFileListEntry &file_ent
+ 			constant = filter_data->constant;
+ 		}
+ 
+-		auto mm_it = file_entry.column_min_max.find(col_filter.column_field_index);
+-		if (mm_it == file_entry.column_min_max.end()) {
+-			continue;
+-		}
+-
+ 		// from here we'll try to cast and compare with the dynamic filter values
+ 		// if casts fail, just skip pruning
+ 		Value casted_constant;
+@@ -248,7 +296,7 @@ ReaderInitializeType DuckLakeMultiFileReader::InitializeReader(MultiFileReaderDa
+ 	auto file_idx = reader.file_list_idx.GetIndex();
+ 
+ 	auto &file_entry = file_list.GetFileEntry(file_idx);
+-	if (file_list.GetFilterInfo() && CanSkipFileByTopNDynamicFilter(file_entry, *file_list.GetFilterInfo(), context)) {
++	if (file_list.GetFilterInfo() && CanSkipFileByRuntimeFilter(file_entry, *file_list.GetFilterInfo(), context)) {
+ 		return ReaderInitializeType::SKIP_READING_FILE;
+ 	}
+ 	if (!file_list.IsDeleteScan()) {
+diff --git a/test/sql/stats/prefix_range_filter_file_pruning.test b/test/sql/stats/prefix_range_filter_file_pruning.test
+new file mode 100644
+index 00000000..716e2a6a
+--- /dev/null
++++ b/test/sql/stats/prefix_range_filter_file_pruning.test
+@@ -0,0 +1,199 @@
++# name: test/sql/stats/prefix_range_filter_file_pruning.test
++# description: Test prefix range filters against DuckLake file-level min/max statistics
++# group: [stats]
++
++require ducklake
++
++require parquet
++
++test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
++
++test-env DATA_PATH {TEST_DIR}
++
++statement ok
++ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake
++    (DATA_PATH '{DATA_PATH}/ducklake_prf_file_pruning', DATA_INLINING_ROW_LIMIT 0,
++     METADATA_CATALOG 'ducklake_meta')
++
++statement ok
++SET disabled_optimizers = 'join_order,build_side_probe_side,compressed_materialization'
++
++statement ok
++SET threads = 1
++
++statement ok
++SET dynamic_or_filter_threshold = 0
++
++statement ok
++SET enable_join_bloom_filter_pushdown = false
++
++statement ok
++SET enable_perfect_hash_join_filter_pushdown = false
++
++# Disable min/max pushdown explicitly: this test must prune files with the PRF itself.
++statement ok
++SET enable_join_min_max_filter_pushdown = false
++
++statement ok
++CREATE TABLE ducklake.prf_probe(k INTEGER)
++
++# Four separate files. The build keys overlap the first and third files. The second file is inside the
++# overall build-key min/max interval but covers only empty PRF buckets; the fourth is outside that interval.
++statement ok
++INSERT INTO ducklake.prf_probe SELECT i::INTEGER FROM range(0, 1000) t(i)
++
++statement ok
++INSERT INTO ducklake.prf_probe SELECT i::INTEGER FROM range(10000, 11000) t(i)
++
++statement ok
++INSERT INTO ducklake.prf_probe SELECT i::INTEGER FROM range(20000, 21000) t(i)
++
++statement ok
++INSERT INTO ducklake.prf_probe SELECT i::INTEGER FROM range(30000, 31000) t(i)
++
++statement ok
++CREATE TABLE prf_build(k INTEGER)
++
++statement ok
++INSERT INTO prf_build VALUES (100), (20100)
++
++query I
++SELECT count(*)
++FROM ducklake.prf_probe probe
++JOIN prf_build build USING (k)
++----
++2
++
++query II
++EXPLAIN ANALYZE
++SELECT count(*)
++FROM ducklake.prf_probe probe
++JOIN prf_build build USING (k)
++----
++analyzed_plan	<REGEX>:.*IN PRF\(k\).*
++
++# Both the file in an empty PRF range and the file outside the PRF domain are skipped before Parquet opens.
++query II
++EXPLAIN ANALYZE
++SELECT count(*)
++FROM ducklake.prf_probe probe
++JOIN prf_build build USING (k)
++----
++analyzed_plan	<REGEX>:.*Total Files Read: 2.*
++
++query II
++EXPLAIN ANALYZE
++SELECT count(*)
++FROM ducklake.prf_probe probe
++JOIN prf_build build USING (k)
++----
++analyzed_plan	<REGEX>:.*Total Files Skipped:.*1.*
++
++statement ok
++SET enable_prefix_range_filter = false
++
++# The regular optimizer range excludes the fourth file, but without PRF the file in the empty bucket range is opened.
++query II
++EXPLAIN ANALYZE
++SELECT count(*)
++FROM ducklake.prf_probe probe
++JOIN prf_build build USING (k)
++----
++analyzed_plan	<REGEX>:.*Total Files Read: 3.*
++
++statement ok
++RESET enable_prefix_range_filter
++
++# Missing statistics must retain the file. Remove the statistics for the file in the empty PRF range and verify that it
++# is opened again even though the PRF can still prune files whose statistics are available.
++statement ok
++UPDATE ducklake_meta.ducklake_file_column_stats
++SET min_value = NULL, max_value = NULL
++WHERE min_value = '10000' AND max_value = '10999'
++
++query I
++SELECT count(*)
++FROM ducklake.prf_probe probe
++JOIN prf_build build USING (k)
++----
++2
++
++query II
++EXPLAIN ANALYZE
++SELECT count(*)
++FROM ducklake.prf_probe probe
++JOIN prf_build build USING (k)
++----
++analyzed_plan	<REGEX>:.*Total Files Read: 3.*
++
++statement ok
++UPDATE ducklake_meta.ducklake_file_column_stats
++SET min_value = '10000', max_value = '10999'
++WHERE min_value IS NULL AND max_value IS NULL
++
++statement ok
++CREATE TABLE ducklake.prf_string_probe(k VARCHAR)
++
++statement ok
++INSERT INTO ducklake.prf_string_probe SELECT printf('%06d', i) FROM range(0, 1000) t(i)
++
++statement ok
++INSERT INTO ducklake.prf_string_probe SELECT printf('%06d', i) FROM range(100000, 101000) t(i)
++
++statement ok
++INSERT INTO ducklake.prf_string_probe SELECT printf('%06d', i) FROM range(200000, 201000) t(i)
++
++statement ok
++CREATE TABLE prf_string_build(k VARCHAR)
++
++statement ok
++INSERT INTO prf_string_build VALUES ('000100'), ('200100')
++
++query I
++SELECT count(*)
++FROM ducklake.prf_string_probe probe
++JOIN prf_string_build build USING (k)
++----
++2
++
++query II
++EXPLAIN ANALYZE
++SELECT count(*)
++FROM ducklake.prf_string_probe probe
++JOIN prf_string_build build USING (k)
++----
++analyzed_plan	<REGEX>:.*IN PRF\(k\).*
++
++query II
++EXPLAIN ANALYZE
++SELECT count(*)
++FROM ducklake.prf_string_probe probe
++JOIN prf_string_build build USING (k)
++----
++analyzed_plan	<REGEX>:.*Total Files Read: 2.*
++
++query II
++EXPLAIN ANALYZE
++SELECT count(*)
++FROM ducklake.prf_string_probe probe
++JOIN prf_string_build build USING (k)
++----
++analyzed_plan	<REGEX>:.*Total Files Skipped:.*1.*
++
++statement ok
++RESET enable_join_min_max_filter_pushdown
++
++statement ok
++RESET enable_join_bloom_filter_pushdown
++
++statement ok
++RESET enable_perfect_hash_join_filter_pushdown
++
++statement ok
++RESET dynamic_or_filter_threshold
++
++statement ok
++RESET threads
++
++statement ok
++SET disabled_optimizers = ''
