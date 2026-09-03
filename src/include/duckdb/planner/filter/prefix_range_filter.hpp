@@ -24,6 +24,8 @@ struct SelectionVector;
 //! Runtime prefix-range filter state used by join pushdown and internal tablefilter functions.
 class PrefixRangeFilter {
 public:
+	static constexpr double DEFAULT_FALSE_POSITIVE_RATE = 0.001;
+
 	struct Sizing {
 		uhugeint_t span;
 		idx_t shift = 0;
@@ -69,7 +71,7 @@ public:
 	virtual void InsertKeys(Vector &keys, BuildState &state) const = 0;
 	virtual void InsertKeysParallel(Vector &keys, BuildState &state) const = 0;
 	virtual void MergeBuildState(BuildState &state) = 0;
-	virtual void Finalize() = 0;
+	virtual Analysis Compress(ClientContext &context, double max_false_positive_rate) = 0;
 	virtual idx_t GetBuildStateSize() const = 0;
 	virtual idx_t LookupKeys(Vector &keys, SelectionVector &result_sel, idx_t count) const = 0;
 	//! result_sel contains local positions into sel rather than source row ids.
@@ -83,7 +85,7 @@ public:
 	static unique_ptr<PrefixRangeFilter> CreatePrefixRangeFilter(const LogicalType &key_type);
 	static bool TryComputeSpan(const Value &lower_bound, const Value &upper_bound, uhugeint_t &result);
 	static bool TryComputeSizing(const Value &min, const Value &max, idx_t count, Sizing &sizing,
-	                             double false_positive_rate = 0.001);
+	                             double false_positive_rate = DEFAULT_FALSE_POSITIVE_RATE);
 	static bool TryComputeFixedSizeSizing(const Value &min, const Value &max, idx_t bucket_count_limit, Sizing &sizing);
 	static bool TryComputeBucketCount(const uhugeint_t &span, idx_t shift, idx_t &bucket_count);
 	static double ComputeFalsePositiveRateUpperBound(const uhugeint_t &span, idx_t count, idx_t shift);

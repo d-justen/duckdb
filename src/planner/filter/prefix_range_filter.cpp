@@ -22,7 +22,6 @@
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/uhugeint.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
@@ -70,8 +69,12 @@ public:
 		buf_ = AllocateBitmap(context, word_count, bitmap);
 		mode = Mode::BITMAP;
 		range_count = 0;
+		base_active_buckets = 0;
+		cached_active_buckets = 0;
+		cached_run_count = 0;
+		cached_false_positive_rate = 0;
 		analysis_cached = false;
-		finalized = false;
+		compression_finalized = false;
 
 		// Only mark initialized as true when local bitmaps are merged.
 		initialized = false;
@@ -108,7 +111,7 @@ public:
 	}
 
 	void MergeBuildState(PrefixRangeBitmapBuildState &state) {
-		if (finalized || mode != Mode::BITMAP) {
+		if (compression_finalized || mode != Mode::BITMAP) {
 			throw InternalException("Cannot merge into a finalized prefix range filter");
 		}
 		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
@@ -118,17 +121,74 @@ public:
 		analysis_cached = false;
 	}
 
-	void Finalize() {
-		if (!initialized || finalized) {
-			return;
+	PrefixRangeFilter::Analysis Compress(ClientContext &context, double max_false_positive_rate) {
+		D_ASSERT(max_false_positive_rate >= 0);
+		if (!initialized || compression_finalized || mode != Mode::BITMAP) {
+			return Analyze();
 		}
 
-		const auto metrics = AnalyzeBitmap();
-		CacheAnalysis(metrics);
-		if (metrics.HasExactRanges()) {
-			SetDirectRanges(metrics);
+		auto current_metrics = AnalyzeBitmap();
+		base_active_buckets = current_metrics.active_buckets;
+		auto current_false_positive_rate = FalsePositiveRate(current_metrics.active_buckets, shift);
+		CacheAnalysis(current_metrics, current_false_positive_rate);
+		if (current_false_positive_rate > max_false_positive_rate || current_metrics.active_buckets == 0) {
+			compression_finalized = true;
+			return Analyze();
 		}
-		finalized = true;
+		if (current_metrics.HasExactRanges()) {
+			SetDirectRanges(current_metrics);
+			compression_finalized = true;
+			return Analyze();
+		}
+
+		BitmapStorage current;
+		current.data = std::move(buf_);
+		current.bitmap = bitmap;
+		current.word_capacity = word_count;
+		bitmap = nullptr;
+
+		BitmapStorage scratch;
+		while (word_count * sizeof(uint64_t) > BITMAP_CACHE_TARGET_BYTES && logical_bucket_count > 1 &&
+		       shift + 1 < sizeof(U) * 8) {
+			const auto candidate_logical_bucket_count = (logical_bucket_count + 1) / 2;
+			const auto candidate_word_count =
+			    candidate_logical_bucket_count / 64 + (candidate_logical_bucket_count % 64 != 0);
+			if (!scratch.data.IsSet()) {
+				scratch.data = AllocateBitmap(context, candidate_word_count, scratch.bitmap);
+				scratch.word_capacity = candidate_word_count;
+			}
+			D_ASSERT(scratch.word_capacity >= candidate_word_count);
+			ReduceBitmap(current.bitmap, word_count, scratch.bitmap, candidate_word_count,
+			             candidate_logical_bucket_count);
+
+			const auto candidate_metrics =
+			    AnalyzeBitmap(scratch.bitmap, candidate_word_count, candidate_logical_bucket_count);
+			const auto candidate_shift = shift + 1;
+			const auto candidate_false_positive_rate =
+			    FalsePositiveRate(candidate_metrics.active_buckets, candidate_shift);
+			if (candidate_false_positive_rate > max_false_positive_rate) {
+				break;
+			}
+
+			std::swap(current, scratch);
+			word_count = candidate_word_count;
+			logical_bucket_count = candidate_logical_bucket_count;
+			shift = candidate_shift;
+			current_metrics = candidate_metrics;
+			current_false_positive_rate = candidate_false_positive_rate;
+			CacheAnalysis(current_metrics, current_false_positive_rate);
+			if (current_metrics.HasExactRanges()) {
+				buf_ = std::move(current.data);
+				bitmap = current.bitmap;
+				SetDirectRanges(current_metrics);
+				compression_finalized = true;
+				return Analyze();
+			}
+		}
+
+		SetBitmapStorage(context, current, scratch);
+		compression_finalized = true;
+		return Analyze();
 	}
 
 	idx_t GetBuildStateSize() const {
@@ -267,9 +327,11 @@ public:
 
 	PrefixRangeFilter::Analysis Analyze() const {
 		const auto metrics = CurrentMetrics();
-		return {metrics.active_buckets,
-		        PrefixRangeFilter::EstimateFalsePositiveRate(Uhugeint::Convert(span), metrics.active_buckets,
-		                                                     metrics.active_buckets, shift)};
+		const auto false_positive_rate =
+		    analysis_cached ? cached_false_positive_rate
+		                    : PrefixRangeFilter::EstimateFalsePositiveRate(
+		                          Uhugeint::Convert(span), metrics.active_buckets, metrics.active_buckets, shift);
+		return {metrics.active_buckets, false_positive_rate};
 	}
 
 	PrefixRangeFilter::CompressionInfo GetCompressionInfo() const {
@@ -283,8 +345,10 @@ public:
 		result.run_count = metrics.run_count;
 		result.logical_bucket_count = logical_bucket_count;
 		result.bitmap_allocation_bytes = mode == Mode::BITMAP ? buf_.GetSize() : 0;
-		result.false_positive_rate = PrefixRangeFilter::EstimateFalsePositiveRate(
-		    Uhugeint::Convert(span), metrics.active_buckets, metrics.active_buckets, shift);
+		result.false_positive_rate =
+		    analysis_cached ? cached_false_positive_rate
+		                    : PrefixRangeFilter::EstimateFalsePositiveRate(
+		                          Uhugeint::Convert(span), metrics.active_buckets, metrics.active_buckets, shift);
 		return result;
 	}
 
@@ -300,6 +364,7 @@ private:
 	static constexpr idx_t WORD_SHIFT = 6;
 	static constexpr idx_t WORD_MASK = 63;
 	static constexpr idx_t MAX_DIRECT_RANGES = 4;
+	static constexpr idx_t BITMAP_CACHE_TARGET_BYTES = 16384;
 
 	enum class Mode : uint8_t { BITMAP, DIRECT_RANGES };
 
@@ -322,11 +387,44 @@ private:
 		}
 	};
 
+	struct BitmapStorage {
+		AllocatedData data;
+		uint64_t *bitmap = nullptr;
+		idx_t word_capacity = 0;
+	};
+
 	static uint64_t MaskForValidBits(idx_t valid_bits) {
+		D_ASSERT(valid_bits > 0);
 		if (valid_bits == 64) {
 			return ~0ULL;
 		}
 		return (1ULL << valid_bits) - 1;
+	}
+
+	static uint64_t PackMergedPairsTo32(uint64_t word) {
+		auto packed = (word | (word >> 1)) & 0x5555555555555555ULL;
+		packed = (packed | (packed >> 1)) & 0x3333333333333333ULL;
+		packed = (packed | (packed >> 2)) & 0x0F0F0F0F0F0F0F0FULL;
+		packed = (packed | (packed >> 4)) & 0x00FF00FF00FF00FFULL;
+		packed = (packed | (packed >> 8)) & 0x0000FFFF0000FFFFULL;
+		return (packed | (packed >> 16)) & 0x00000000FFFFFFFFULL;
+	}
+
+	static void ReduceBitmap(const uint64_t *source, idx_t source_word_count, uint64_t *destination,
+	                         idx_t destination_word_count, idx_t destination_logical_bucket_count) {
+		for (idx_t destination_word_idx = 0; destination_word_idx < destination_word_count; destination_word_idx++) {
+			const auto first_source_word_idx = destination_word_idx * 2;
+			D_ASSERT(first_source_word_idx < source_word_count);
+			const auto low = PackMergedPairsTo32(source[first_source_word_idx]);
+			uint64_t high = 0;
+			if (first_source_word_idx + 1 < source_word_count) {
+				high = PackMergedPairsTo32(source[first_source_word_idx + 1]) << 32;
+			}
+
+			const auto word_base = destination_word_idx << WORD_SHIFT;
+			const auto valid_bits = MinValue<idx_t>(64, destination_logical_bucket_count - word_base);
+			destination[destination_word_idx] = (low | high) & MaskForValidBits(valid_bits);
+		}
 	}
 
 	static void RecordPositions(uint64_t positions, idx_t word_base, array<idx_t, MAX_DIRECT_RANGES> &result,
@@ -341,16 +439,21 @@ private:
 	BitmapMetrics AnalyzeBitmap() const {
 		D_ASSERT(mode == Mode::BITMAP);
 		D_ASSERT(bitmap);
+		return AnalyzeBitmap(bitmap, word_count, logical_bucket_count);
+	}
+
+	BitmapMetrics AnalyzeBitmap(const uint64_t *source, idx_t source_word_count,
+	                            idx_t source_logical_bucket_count) const {
 		BitmapMetrics result;
 		uint8_t previous_word_last_bit = 0;
-		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
+		for (idx_t word_idx = 0; word_idx < source_word_count; word_idx++) {
 			const auto word_base = word_idx << WORD_SHIFT;
-			const auto valid_bits = MinValue<idx_t>(64, logical_bucket_count - word_base);
+			const auto valid_bits = MinValue<idx_t>(64, source_logical_bucket_count - word_base);
 			const auto valid_mask = MaskForValidBits(valid_bits);
-			const auto word = bitmap[word_idx] & valid_mask;
+			const auto word = source[word_idx] & valid_mask;
 			const auto previous_bits = (word << 1) | previous_word_last_bit;
 			auto next_bits = word >> 1;
-			if (valid_bits == 64 && word_idx + 1 < word_count && (bitmap[word_idx + 1] & 1ULL)) {
+			if (valid_bits == 64 && word_idx + 1 < source_word_count && (source[word_idx + 1] & 1ULL)) {
 				next_bits |= 1ULL << WORD_MASK;
 			}
 
@@ -375,10 +478,31 @@ private:
 		return AnalyzeBitmap();
 	}
 
-	void CacheAnalysis(const BitmapMetrics &metrics) {
+	void CacheAnalysis(const BitmapMetrics &metrics, double false_positive_rate) {
 		cached_active_buckets = metrics.active_buckets;
 		cached_run_count = metrics.run_count;
+		cached_false_positive_rate = false_positive_rate;
 		analysis_cached = true;
+	}
+
+	double FalsePositiveRate(idx_t active_buckets, idx_t value_shift) const {
+		return PrefixRangeFilter::EstimateFalsePositiveRate(Uhugeint::Convert(span), base_active_buckets,
+		                                                    active_buckets, value_shift);
+	}
+
+	void SetBitmapStorage(ClientContext &context, BitmapStorage &current, BitmapStorage &scratch) {
+		scratch.data.Reset();
+		if (current.word_capacity == word_count) {
+			bitmap = current.bitmap;
+			buf_ = std::move(current.data);
+			return;
+		}
+
+		uint64_t *final_bitmap;
+		auto final_buf = AllocateBitmap(context, word_count, final_bitmap);
+		std::copy_n(current.bitmap, word_count, final_bitmap);
+		bitmap = final_bitmap;
+		buf_ = std::move(final_buf);
 	}
 
 	U BucketLowerOffset(idx_t bucket_idx) const {
@@ -511,7 +635,7 @@ private:
 	}
 
 	bool initialized = false;
-	bool finalized = false;
+	bool compression_finalized = false;
 	bool analysis_cached = false;
 	Mode mode = Mode::BITMAP;
 	U min;
@@ -519,9 +643,11 @@ private:
 	idx_t shift;
 	idx_t word_count;
 	idx_t logical_bucket_count;
+	idx_t base_active_buckets = 0;
 	idx_t range_count = 0;
 	idx_t cached_active_buckets = 0;
 	idx_t cached_run_count = 0;
+	double cached_false_positive_rate = 0;
 	array<DirectRange, MAX_DIRECT_RANGES> ranges;
 	AllocatedData buf_;
 	uint64_t *bitmap = nullptr;
@@ -600,8 +726,8 @@ public:
 		bitmap.MergeBuildState(state.Cast<PrefixRangeBitmapBuildState>());
 	}
 
-	void Finalize() override {
-		bitmap.Finalize();
+	Analysis Compress(ClientContext &context, double max_false_positive_rate) override {
+		return bitmap.Compress(context, max_false_positive_rate);
 	}
 
 	idx_t GetBuildStateSize() const override {
@@ -688,8 +814,8 @@ public:
 		bitmap.MergeBuildState(state.Cast<PrefixRangeBitmapBuildState>());
 	}
 
-	void Finalize() override {
-		bitmap.Finalize();
+	Analysis Compress(ClientContext &context, double max_false_positive_rate) override {
+		return bitmap.Compress(context, max_false_positive_rate);
 	}
 
 	idx_t GetBuildStateSize() const override {

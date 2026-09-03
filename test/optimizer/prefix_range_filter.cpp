@@ -8,7 +8,8 @@ using namespace duckdb;
 namespace {
 
 unique_ptr<PrefixRangeFilter> BuildFinalizedInt32PrefixRangeFilter(ClientContext &context, const vector<int32_t> &keys,
-                                                                   int32_t min, int32_t max, idx_t shift) {
+                                                                   int32_t min, int32_t max, idx_t shift,
+                                                                   double max_false_positive_rate = 1.0) {
 	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::INTEGER);
 	PrefixRangeFilter::Sizing sizing;
 	REQUIRE(PrefixRangeFilter::TryComputeSpan(Value::INTEGER(min), Value::INTEGER(max), sizing.span));
@@ -24,7 +25,7 @@ unique_ptr<PrefixRangeFilter> BuildFinalizedInt32PrefixRangeFilter(ClientContext
 	FlatVector::SetSize(key_vector, count_t(keys.size()));
 	filter->InsertKeys(key_vector, *state);
 	filter->MergeBuildState(*state);
-	filter->Finalize();
+	filter->Compress(context, max_false_positive_rate);
 	return filter;
 }
 
@@ -34,6 +35,17 @@ bool ContainsKey(const PrefixRangeFilter &filter, int32_t key) {
 	FlatVector::SetSize(key_vector, 1);
 	SelectionVector result_sel(1);
 	return filter.LookupKeys(key_vector, result_sel, 1) == 1;
+}
+
+bool ContainsAllKeys(const PrefixRangeFilter &filter, const vector<int32_t> &keys) {
+	Vector key_vector(LogicalType::INTEGER, keys.size());
+	auto key_data = FlatVector::GetDataMutable<int32_t>(key_vector);
+	for (idx_t i = 0; i < keys.size(); i++) {
+		key_data[i] = keys[i];
+	}
+	FlatVector::SetSize(key_vector, count_t(keys.size()));
+	SelectionVector result_sel(keys.size());
+	return filter.LookupKeys(key_vector, result_sel, keys.size()) == keys.size();
 }
 
 } // namespace
@@ -47,7 +59,7 @@ TEST_CASE("Prefix range filter finalizes one exact run as a direct range", "[opt
 		keys.push_back(key);
 	}
 	auto filter = BuildFinalizedInt32PrefixRangeFilter(*con.context, keys, 100, 199, 0);
-	filter->Finalize();
+	filter->Compress(*con.context, 1.0);
 
 	const auto info = filter->GetCompressionInfo();
 	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::DIRECT_RANGES);
@@ -173,4 +185,134 @@ TEST_CASE("Prefix range filter direct lookup preserves selection positions", "[o
 	SelectionVector result_sel(3);
 	REQUIRE(filter->LookupKeys(key_vector, input_sel, result_sel, 3) == 1);
 	REQUIRE(result_sel.get_index(0) == 1);
+}
+
+TEST_CASE("Prefix range filter stops at the exact cache target", "[optimizer][prefix_range_filter]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	vector<int32_t> keys;
+	for (int32_t key = 0; key < 131072; key += 32) {
+		keys.push_back(key);
+	}
+	auto filter = BuildFinalizedInt32PrefixRangeFilter(*con.context, keys, 0, 131071, 0, 1.0);
+	const auto info = filter->GetCompressionInfo();
+	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::BITMAP);
+	REQUIRE(info.shift == 0);
+	REQUIRE(info.logical_bucket_count == 131072);
+	REQUIRE(info.bitmap_allocation_bytes == 64 + 2048 * sizeof(uint64_t));
+	REQUIRE(info.run_count == keys.size());
+	REQUIRE(info.false_positive_rate == 0);
+	REQUIRE(ContainsAllKeys(*filter, keys));
+}
+
+TEST_CASE("Prefix range filter rejects compression above its false-positive budget",
+          "[optimizer][prefix_range_filter]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	static constexpr double MAX_FALSE_POSITIVE_RATE = 0.5;
+	auto filter =
+	    BuildFinalizedInt32PrefixRangeFilter(*con.context, {0, 16, 32, 48}, 0, 64, 4, MAX_FALSE_POSITIVE_RATE);
+	const auto info = filter->GetCompressionInfo();
+	const auto analysis = filter->Analyze();
+	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::BITMAP);
+	REQUIRE(info.shift == 4);
+	REQUIRE(info.active_buckets == 4);
+	REQUIRE(info.run_count == 1);
+	REQUIRE(info.false_positive_rate > MAX_FALSE_POSITIVE_RATE);
+	REQUIRE(analysis.active_buckets == info.active_buckets);
+	REQUIRE(analysis.false_positive_rate == Approx(info.false_positive_rate));
+}
+
+TEST_CASE("Prefix range filter stops lossless compression at the cache target", "[optimizer][prefix_range_filter]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	vector<int32_t> keys;
+	for (int32_t base : {0, 4, 8, 12, 16}) {
+		keys.push_back(base);
+		keys.push_back(base + 1);
+	}
+	static constexpr double MAX_FALSE_POSITIVE_RATE = 0.1;
+	auto filter = BuildFinalizedInt32PrefixRangeFilter(*con.context, keys, 0, 17, 0, MAX_FALSE_POSITIVE_RATE);
+	const auto info = filter->GetCompressionInfo();
+	const auto analysis = filter->Analyze();
+	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::BITMAP);
+	REQUIRE(info.shift == 0);
+	REQUIRE(info.active_buckets == keys.size());
+	REQUIRE(info.run_count == 5);
+	REQUIRE(info.false_positive_rate == 0);
+	REQUIRE(analysis.active_buckets == info.active_buckets);
+	REQUIRE(analysis.false_positive_rate == info.false_positive_rate);
+	for (auto key : keys) {
+		REQUIRE(ContainsKey(*filter, key));
+	}
+	REQUIRE_FALSE(ContainsKey(*filter, 2));
+	REQUIRE_FALSE(ContainsKey(*filter, 6));
+}
+
+TEST_CASE("Prefix range filter discovers direct ranges at a coarser level", "[optimizer][prefix_range_filter]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	const vector<int32_t> keys {0, 1, 3, 4, 6, 7, 9, 10, 12, 13};
+	auto filter = BuildFinalizedInt32PrefixRangeFilter(*con.context, keys, 0, 200000, 0, 0.001);
+	const auto info = filter->GetCompressionInfo();
+	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::DIRECT_RANGES);
+	REQUIRE(info.shift == 1);
+	REQUIRE(info.range_count == 1);
+	REQUIRE(info.run_count == 1);
+	REQUIRE(info.bitmap_allocation_bytes == 0);
+	REQUIRE(info.false_positive_rate == Approx(4.0 / 199991.0));
+	for (auto key : keys) {
+		REQUIRE(ContainsKey(*filter, key));
+	}
+}
+
+TEST_CASE("Prefix range filter retains the last candidate within its false-positive budget",
+          "[optimizer][prefix_range_filter]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	vector<int32_t> keys;
+	for (int32_t key = 0; key < 1048576; key += 32) {
+		keys.push_back(key);
+	}
+	auto filter = BuildFinalizedInt32PrefixRangeFilter(*con.context, keys, 0, 1048575, 0, 0.05);
+	const auto info = filter->GetCompressionInfo();
+	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::BITMAP);
+	REQUIRE(info.shift == 1);
+	REQUIRE(info.logical_bucket_count == 524288);
+	REQUIRE(info.bitmap_allocation_bytes == 64 + 8192 * sizeof(uint64_t));
+	REQUIRE(info.false_positive_rate < 0.05);
+	REQUIRE(ContainsAllKeys(*filter, keys));
+}
+
+TEST_CASE("Prefix range filter reuses storage and right-sizes the retained bitmap",
+          "[optimizer][prefix_range_filter]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	vector<int32_t> keys;
+	for (int32_t key = 0; key < 1048576; key += 32) {
+		keys.push_back(key);
+	}
+	auto filter = BuildFinalizedInt32PrefixRangeFilter(*con.context, keys, 0, 1048575, 0, 1.0);
+	const auto info = filter->GetCompressionInfo();
+	const auto first_analysis = filter->Analyze();
+	const auto second_analysis = filter->Compress(*con.context, 1.0);
+	const auto repeated_info = filter->GetCompressionInfo();
+
+	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::BITMAP);
+	REQUIRE(info.shift == 3);
+	REQUIRE(info.logical_bucket_count == 131072);
+	REQUIRE(info.bitmap_allocation_bytes == 64 + 2048 * sizeof(uint64_t));
+	REQUIRE(first_analysis.active_buckets == info.active_buckets);
+	REQUIRE(first_analysis.false_positive_rate == Approx(info.false_positive_rate));
+	REQUIRE(second_analysis.active_buckets == first_analysis.active_buckets);
+	REQUIRE(second_analysis.false_positive_rate == Approx(first_analysis.false_positive_rate));
+	REQUIRE(repeated_info.shift == info.shift);
+	REQUIRE(repeated_info.bitmap_allocation_bytes == info.bitmap_allocation_bytes);
+	REQUIRE(ContainsAllKeys(*filter, keys));
 }

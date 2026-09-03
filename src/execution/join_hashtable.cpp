@@ -1048,7 +1048,7 @@ void JoinHashTable::MergePrefixRangeBuildState(PrefixRangeFilter::BuildState &st
 
 void JoinHashTable::FinalizePrefixRangeFilter() {
 	if (ShouldBuildPrefixRangeFilter()) {
-		prefix_range_filter->Finalize();
+		prefix_range_filter->Compress(context, PrefixRangeFilter::DEFAULT_FALSE_POSITIVE_RATE);
 	}
 }
 
