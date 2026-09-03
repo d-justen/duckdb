@@ -15,13 +15,13 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/scalar/tablefilter_functions.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/planner/filter/prefix_range_filter.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 
 namespace duckdb {
 
 class BaseStatistics;
 class Expression;
-class PrefixRangeFilter;
 struct DynamicFilterData;
 
 struct SelectivityOptionalFilterState final : public TableFilterState {
@@ -133,42 +133,6 @@ struct BloomFilterFunctionData : public FunctionData {
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other) const override;
-};
-
-//! Runtime prefix-range filter state used by join pushdown and internal tablefilter functions.
-class PrefixRangeFilter {
-public:
-	struct BuildState {
-		virtual ~BuildState() = default;
-		template <class TARGET>
-
-		TARGET &Cast() {
-			DynamicCastCheck<TARGET>(this);
-			return reinterpret_cast<TARGET &>(*this);
-		}
-		template <class TARGET>
-		const TARGET &Cast() const {
-			DynamicCastCheck<TARGET>(this);
-			return reinterpret_cast<const TARGET &>(*this);
-		}
-	};
-
-	virtual ~PrefixRangeFilter() = default;
-	virtual void Initialize(ClientContext &context, idx_t number_of_rows, Value min, Value max, idx_t max_bits) = 0;
-	virtual unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const = 0;
-	virtual void InsertKeys(Vector &keys, BuildState &state) const = 0;
-	virtual void InsertKeysParallel(Vector &keys, BuildState &state) const = 0;
-	virtual void MergeBuildState(BuildState &state) = 0;
-	virtual idx_t GetBuildStateSize() const = 0;
-	virtual idx_t LookupKeys(Vector &keys, SelectionVector &result_sel, idx_t count) const = 0;
-	//! result_sel contains local positions into sel rather than source row ids.
-	virtual idx_t LookupKeys(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel,
-	                         idx_t count) const = 0;
-	virtual FilterPropagateResult LookupRange(const Value &lower_bound, const Value &upper_bound) const = 0;
-	virtual bool IsInitialized() const = 0;
-	static bool SupportedType(const LogicalType &type);
-	static unique_ptr<PrefixRangeFilter> CreatePrefixRangeFilter(const LogicalType &key_type);
-	static bool TryComputeSpan(const Value &lower_bound, const Value &upper_bound, uhugeint_t &result);
 };
 
 //! FunctionData for prefix range internal function
