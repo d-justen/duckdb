@@ -611,6 +611,7 @@ public:
 	void InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx_t count, PrefixRangeFilter::BuildState &state,
 	                            bool parallel = false);
 	void MergePrefixRangeBuildState(PrefixRangeFilter::BuildState &state);
+	void FinalizePrefixRangeFilter();
 
 	//! Get total size of HT if all partitions would be built
 	idx_t GetTotalSize(const vector<reference<JoinHashTable>> &local_hts, idx_t &max_partition_size,

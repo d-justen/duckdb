@@ -1130,6 +1130,7 @@ private:
 		for (auto &lane : prefix_range_lanes) {
 			sink.hash_table->MergePrefixRangeBuildState(*lane->state);
 		}
+		sink.hash_table->FinalizePrefixRangeFilter();
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
 
 		// Both finalize paths finish writing the chains before reaching here,

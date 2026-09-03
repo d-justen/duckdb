@@ -64,9 +64,14 @@ public:
 		if (!PrefixRangeFilter::TryComputeBucketCount(Uhugeint::Convert(span), shift, buckets)) {
 			throw InternalException("Invalid prefix range filter sizing");
 		}
+		logical_bucket_count = buckets;
 		word_count = buckets / 64 + (buckets % 64 != 0);
 
 		buf_ = AllocateBitmap(context, word_count, bitmap);
+		mode = Mode::BITMAP;
+		range_count = 0;
+		analysis_cached = false;
+		finalized = false;
 
 		// Only mark initialized as true when local bitmaps are merged.
 		initialized = false;
@@ -103,10 +108,27 @@ public:
 	}
 
 	void MergeBuildState(PrefixRangeBitmapBuildState &state) {
+		if (finalized || mode != Mode::BITMAP) {
+			throw InternalException("Cannot merge into a finalized prefix range filter");
+		}
 		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
 			bitmap[word_idx] |= state.bitmap[word_idx];
 		}
 		initialized = true;
+		analysis_cached = false;
+	}
+
+	void Finalize() {
+		if (!initialized || finalized) {
+			return;
+		}
+
+		const auto metrics = AnalyzeBitmap();
+		CacheAnalysis(metrics);
+		if (metrics.HasExactRanges()) {
+			SetDirectRanges(metrics);
+		}
+		finalized = true;
 	}
 
 	idx_t GetBuildStateSize() const {
@@ -121,6 +143,9 @@ public:
 
 		const U comparable = CONVERTER::Convert(value.GetValueUnsafe<T>());
 		const U y = comparable - min;
+		if (mode == Mode::DIRECT_RANGES) {
+			return y <= span && DirectRangeLookup(y);
+		}
 		const U bit_idx = y >> shift;
 		const uint8_t in_range = y <= span;
 		const uint32_t word_idx = (bit_idx >> WORD_SHIFT) & (0U - in_range);
@@ -130,6 +155,10 @@ public:
 
 	template <typename T, typename CONVERTER>
 	idx_t LookupKeys(Vector &keys, SelectionVector &result_sel, idx_t count) const {
+		if (mode == Mode::DIRECT_RANGES) {
+			return LookupKeysDirect<T, CONVERTER>(keys, result_sel, count);
+		}
+
 		idx_t found_count = 0;
 		for (const auto &entry : keys.template ValidValues<T>()) {
 			const U comparable = CONVERTER::Convert(entry.GetValue());
@@ -147,6 +176,10 @@ public:
 
 	template <typename T, typename CONVERTER>
 	idx_t LookupKeys(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel, idx_t count) const {
+		if (mode == Mode::DIRECT_RANGES) {
+			return LookupKeysDirect<T, CONVERTER>(keys, sel, result_sel, count);
+		}
+
 		UnifiedVectorFormat key_data;
 		keys.ToUnifiedFormat(key_data);
 
@@ -172,6 +205,22 @@ public:
 	}
 
 	FilterPropagateResult LookupRange(U lower_bound, U upper_bound) const {
+		if (mode == Mode::DIRECT_RANGES) {
+			const U lower_offset = lower_bound - min;
+			const U upper_offset = upper_bound - min;
+			for (idx_t range_idx = 0; range_idx < range_count; range_idx++) {
+				const auto &range = ranges[range_idx];
+				if (range.upper < lower_offset) {
+					continue;
+				}
+				if (range.lower > upper_offset) {
+					break;
+				}
+				return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+			}
+			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+		}
+
 		const U lb_y = lower_bound - min;
 		const U lb_bit_idx = lb_y >> shift;
 		const auto lb_word_idx = lb_bit_idx >> WORD_SHIFT;
@@ -217,12 +266,26 @@ public:
 	}
 
 	PrefixRangeFilter::Analysis Analyze() const {
-		idx_t active_buckets = 0;
-		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
-			active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(bitmap[word_idx]));
-		}
-		return {active_buckets, PrefixRangeFilter::EstimateFalsePositiveRate(Uhugeint::Convert(span), active_buckets,
-		                                                                     active_buckets, shift)};
+		const auto metrics = CurrentMetrics();
+		return {metrics.active_buckets,
+		        PrefixRangeFilter::EstimateFalsePositiveRate(Uhugeint::Convert(span), metrics.active_buckets,
+		                                                     metrics.active_buckets, shift)};
+	}
+
+	PrefixRangeFilter::CompressionInfo GetCompressionInfo() const {
+		const auto metrics = CurrentMetrics();
+		PrefixRangeFilter::CompressionInfo result;
+		result.mode = mode == Mode::DIRECT_RANGES ? PrefixRangeFilter::CompressionMode::DIRECT_RANGES
+		                                          : PrefixRangeFilter::CompressionMode::BITMAP;
+		result.shift = shift;
+		result.range_count = range_count;
+		result.active_buckets = metrics.active_buckets;
+		result.run_count = metrics.run_count;
+		result.logical_bucket_count = logical_bucket_count;
+		result.bitmap_allocation_bytes = mode == Mode::BITMAP ? buf_.GetSize() : 0;
+		result.false_positive_rate = PrefixRangeFilter::EstimateFalsePositiveRate(
+		    Uhugeint::Convert(span), metrics.active_buckets, metrics.active_buckets, shift);
+		return result;
 	}
 
 	U Min() const {
@@ -236,14 +299,232 @@ public:
 private:
 	static constexpr idx_t WORD_SHIFT = 6;
 	static constexpr idx_t WORD_MASK = 63;
+	static constexpr idx_t MAX_DIRECT_RANGES = 4;
+
+	enum class Mode : uint8_t { BITMAP, DIRECT_RANGES };
+
+	struct DirectRange {
+		U lower;
+		U upper;
+	};
+
+	struct BitmapMetrics {
+		idx_t active_buckets = 0;
+		idx_t run_count = 0;
+		idx_t recorded_starts = 0;
+		idx_t recorded_ends = 0;
+		array<idx_t, MAX_DIRECT_RANGES> run_starts;
+		array<idx_t, MAX_DIRECT_RANGES> run_ends;
+
+		bool HasExactRanges() const {
+			return run_count > 0 && run_count <= MAX_DIRECT_RANGES && recorded_starts == run_count &&
+			       recorded_ends == run_count;
+		}
+	};
+
+	static uint64_t MaskForValidBits(idx_t valid_bits) {
+		if (valid_bits == 64) {
+			return ~0ULL;
+		}
+		return (1ULL << valid_bits) - 1;
+	}
+
+	static void RecordPositions(uint64_t positions, idx_t word_base, array<idx_t, MAX_DIRECT_RANGES> &result,
+	                            idx_t &count) {
+		while (positions != 0 && count < MAX_DIRECT_RANGES) {
+			const auto bit = UnsafeNumericCast<idx_t>(__builtin_ctzll(positions));
+			result[count++] = word_base + bit;
+			positions &= positions - 1;
+		}
+	}
+
+	BitmapMetrics AnalyzeBitmap() const {
+		D_ASSERT(mode == Mode::BITMAP);
+		D_ASSERT(bitmap);
+		BitmapMetrics result;
+		uint8_t previous_word_last_bit = 0;
+		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
+			const auto word_base = word_idx << WORD_SHIFT;
+			const auto valid_bits = MinValue<idx_t>(64, logical_bucket_count - word_base);
+			const auto valid_mask = MaskForValidBits(valid_bits);
+			const auto word = bitmap[word_idx] & valid_mask;
+			const auto previous_bits = (word << 1) | previous_word_last_bit;
+			auto next_bits = word >> 1;
+			if (valid_bits == 64 && word_idx + 1 < word_count && (bitmap[word_idx + 1] & 1ULL)) {
+				next_bits |= 1ULL << WORD_MASK;
+			}
+
+			const auto starts = word & ~previous_bits & valid_mask;
+			const auto ends = word & ~next_bits & valid_mask;
+			result.active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(word));
+			result.run_count += UnsafeNumericCast<idx_t>(__builtin_popcountll(starts));
+			RecordPositions(starts, word_base, result.run_starts, result.recorded_starts);
+			RecordPositions(ends, word_base, result.run_ends, result.recorded_ends);
+			previous_word_last_bit = static_cast<uint8_t>((word >> (valid_bits - 1)) & 1ULL);
+		}
+		return result;
+	}
+
+	BitmapMetrics CurrentMetrics() const {
+		if (analysis_cached) {
+			BitmapMetrics result;
+			result.active_buckets = cached_active_buckets;
+			result.run_count = cached_run_count;
+			return result;
+		}
+		return AnalyzeBitmap();
+	}
+
+	void CacheAnalysis(const BitmapMetrics &metrics) {
+		cached_active_buckets = metrics.active_buckets;
+		cached_run_count = metrics.run_count;
+		analysis_cached = true;
+	}
+
+	U BucketLowerOffset(idx_t bucket_idx) const {
+		return UnsafeNumericCast<U>(bucket_idx) << shift;
+	}
+
+	U BucketUpperOffset(idx_t bucket_idx) const {
+		if (bucket_idx + 1 == logical_bucket_count) {
+			return span;
+		}
+		return (UnsafeNumericCast<U>(bucket_idx + 1) << shift) - 1;
+	}
+
+	void SetDirectRanges(const BitmapMetrics &metrics) {
+		D_ASSERT(metrics.HasExactRanges());
+		range_count = metrics.run_count;
+		for (idx_t range_idx = 0; range_idx < range_count; range_idx++) {
+			ranges[range_idx] = {BucketLowerOffset(metrics.run_starts[range_idx]),
+			                     BucketUpperOffset(metrics.run_ends[range_idx])};
+		}
+		mode = Mode::DIRECT_RANGES;
+		buf_.Reset();
+		bitmap = nullptr;
+		word_count = 0;
+	}
+
+	static uint8_t ValueInDirectRange(U value, const DirectRange &range) {
+		const U offset = value - range.lower;
+		const U width = range.upper - range.lower;
+		return offset <= width;
+	}
+
+	template <idx_t RANGE_COUNT>
+	uint8_t DirectRangeLookup(U value) const {
+		if constexpr (RANGE_COUNT == 1) {
+			return ValueInDirectRange(value, ranges[0]);
+		} else if constexpr (RANGE_COUNT == 2) {
+			return ValueInDirectRange(value, ranges[0]) | ValueInDirectRange(value, ranges[1]);
+		} else if constexpr (RANGE_COUNT == 3) {
+			return ValueInDirectRange(value, ranges[0]) | ValueInDirectRange(value, ranges[1]) |
+			       ValueInDirectRange(value, ranges[2]);
+		} else if constexpr (RANGE_COUNT == 4) {
+			return ValueInDirectRange(value, ranges[0]) | ValueInDirectRange(value, ranges[1]) |
+			       ValueInDirectRange(value, ranges[2]) | ValueInDirectRange(value, ranges[3]);
+		} else {
+			return 0;
+		}
+	}
+
+	bool DirectRangeLookup(U value) const {
+		switch (range_count) {
+		case 1:
+			return DirectRangeLookup<1>(value);
+		case 2:
+			return DirectRangeLookup<2>(value);
+		case 3:
+			return DirectRangeLookup<3>(value);
+		case 4:
+			return DirectRangeLookup<4>(value);
+		default:
+			throw InternalException("Invalid prefix range filter range count");
+		}
+	}
+
+	template <typename T, typename CONVERTER, idx_t RANGE_COUNT>
+	idx_t LookupKeysDirect(Vector &keys, SelectionVector &result_sel, idx_t count) const {
+		idx_t found_count = 0;
+		for (const auto &entry : keys.template ValidValues<T>()) {
+			const U comparable = CONVERTER::Convert(entry.GetValue());
+			const U offset = comparable - min;
+			const uint8_t in_range = offset <= span;
+			result_sel.set_index(found_count, entry.GetIndex());
+			found_count += in_range & DirectRangeLookup<RANGE_COUNT>(offset);
+		}
+		return found_count;
+	}
+
+	template <typename T, typename CONVERTER>
+	idx_t LookupKeysDirect(Vector &keys, SelectionVector &result_sel, idx_t count) const {
+		switch (range_count) {
+		case 1:
+			return LookupKeysDirect<T, CONVERTER, 1>(keys, result_sel, count);
+		case 2:
+			return LookupKeysDirect<T, CONVERTER, 2>(keys, result_sel, count);
+		case 3:
+			return LookupKeysDirect<T, CONVERTER, 3>(keys, result_sel, count);
+		case 4:
+			return LookupKeysDirect<T, CONVERTER, 4>(keys, result_sel, count);
+		default:
+			throw InternalException("Invalid prefix range filter range count");
+		}
+	}
+
+	template <typename T, typename CONVERTER, idx_t RANGE_COUNT>
+	idx_t LookupKeysDirect(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel, idx_t count) const {
+		UnifiedVectorFormat key_data;
+		keys.ToUnifiedFormat(key_data);
+
+		const auto keys_data = UnifiedVectorFormat::GetData<T>(key_data);
+		idx_t found_count = 0;
+		for (idx_t i = 0; i < count; i++) {
+			const auto idx = sel.get_index_unsafe(i);
+			const auto key_idx = key_data.sel->get_index(idx);
+			if (!key_data.validity.RowIsValid(key_idx)) {
+				continue;
+			}
+			const U comparable = CONVERTER::Convert(keys_data[key_idx]);
+			const U offset = comparable - min;
+			const uint8_t in_range = offset <= span;
+			result_sel.set_index(found_count, i);
+			found_count += in_range & DirectRangeLookup<RANGE_COUNT>(offset);
+		}
+		return found_count;
+	}
+
+	template <typename T, typename CONVERTER>
+	idx_t LookupKeysDirect(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel, idx_t count) const {
+		switch (range_count) {
+		case 1:
+			return LookupKeysDirect<T, CONVERTER, 1>(keys, sel, result_sel, count);
+		case 2:
+			return LookupKeysDirect<T, CONVERTER, 2>(keys, sel, result_sel, count);
+		case 3:
+			return LookupKeysDirect<T, CONVERTER, 3>(keys, sel, result_sel, count);
+		case 4:
+			return LookupKeysDirect<T, CONVERTER, 4>(keys, sel, result_sel, count);
+		default:
+			throw InternalException("Invalid prefix range filter range count");
+		}
+	}
 
 	bool initialized = false;
+	bool finalized = false;
+	bool analysis_cached = false;
+	Mode mode = Mode::BITMAP;
 	U min;
 	U span;
 	idx_t shift;
 	idx_t word_count;
+	idx_t logical_bucket_count;
+	idx_t range_count = 0;
+	idx_t cached_active_buckets = 0;
+	idx_t cached_run_count = 0;
+	array<DirectRange, MAX_DIRECT_RANGES> ranges;
 	AllocatedData buf_;
-	uint64_t *bitmap;
+	uint64_t *bitmap = nullptr;
 };
 
 template <typename T>
@@ -319,6 +600,10 @@ public:
 		bitmap.MergeBuildState(state.Cast<PrefixRangeBitmapBuildState>());
 	}
 
+	void Finalize() override {
+		bitmap.Finalize();
+	}
+
 	idx_t GetBuildStateSize() const override {
 		return bitmap.GetBuildStateSize();
 	}
@@ -361,6 +646,10 @@ public:
 		return bitmap.Analyze();
 	}
 
+	CompressionInfo GetCompressionInfo() const override {
+		return bitmap.GetCompressionInfo();
+	}
+
 private:
 	PrefixRangeBitmap<Comparable> bitmap;
 };
@@ -397,6 +686,10 @@ public:
 
 	void MergeBuildState(BuildState &state) override {
 		bitmap.MergeBuildState(state.Cast<PrefixRangeBitmapBuildState>());
+	}
+
+	void Finalize() override {
+		bitmap.Finalize();
 	}
 
 	idx_t GetBuildStateSize() const override {
@@ -442,6 +735,10 @@ public:
 
 	Analysis Analyze() const override {
 		return bitmap.Analyze();
+	}
+
+	CompressionInfo GetCompressionInfo() const override {
+		return bitmap.GetCompressionInfo();
 	}
 
 private:

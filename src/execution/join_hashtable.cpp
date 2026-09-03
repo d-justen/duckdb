@@ -1024,6 +1024,7 @@ void JoinHashTable::BuildPrefixRangeFilter() {
 		InsertPrefixRangeChunk(iterator.GetChunkState(), count, *prefix_range_state);
 	} while (iterator.Next());
 	MergePrefixRangeBuildState(*prefix_range_state);
+	FinalizePrefixRangeFilter();
 }
 
 void JoinHashTable::InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx_t count,
@@ -1043,6 +1044,12 @@ void JoinHashTable::InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx
 void JoinHashTable::MergePrefixRangeBuildState(PrefixRangeFilter::BuildState &state) {
 	D_ASSERT(prefix_range_filter);
 	prefix_range_filter->MergeBuildState(state);
+}
+
+void JoinHashTable::FinalizePrefixRangeFilter() {
+	if (ShouldBuildPrefixRangeFilter()) {
+		prefix_range_filter->Finalize();
+	}
 }
 
 void JoinHashTable::AllocatePointerTable() {
