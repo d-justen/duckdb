@@ -72,6 +72,7 @@ public:
 		base_active_buckets = 0;
 		cached_active_buckets = 0;
 		cached_run_count = 0;
+		cached_run_count_is_exact = true;
 		cached_false_positive_rate = 0;
 		analysis_cached = false;
 		compression_finalized = false;
@@ -158,11 +159,8 @@ public:
 				scratch.word_capacity = candidate_word_count;
 			}
 			D_ASSERT(scratch.word_capacity >= candidate_word_count);
-			ReduceBitmap(current.bitmap, word_count, scratch.bitmap, candidate_word_count,
-			             candidate_logical_bucket_count);
-
-			const auto candidate_metrics =
-			    AnalyzeBitmap(scratch.bitmap, candidate_word_count, candidate_logical_bucket_count);
+			const auto candidate_metrics = ReduceAndAnalyzeBitmap(current.bitmap, word_count, scratch.bitmap,
+			                                                      candidate_word_count, candidate_logical_bucket_count);
 			const auto candidate_shift = shift + 1;
 			const auto candidate_false_positive_rate =
 			    FalsePositiveRate(candidate_metrics.active_buckets, candidate_shift);
@@ -342,7 +340,7 @@ public:
 		result.shift = shift;
 		result.range_count = range_count;
 		result.active_buckets = metrics.active_buckets;
-		result.run_count = metrics.run_count;
+		result.run_count = metrics.run_count_is_exact ? metrics.run_count : CountRuns();
 		result.logical_bucket_count = logical_bucket_count;
 		result.bitmap_allocation_bytes = mode == Mode::BITMAP ? buf_.GetSize() : 0;
 		result.false_positive_rate =
@@ -378,12 +376,13 @@ private:
 		idx_t run_count = 0;
 		idx_t recorded_starts = 0;
 		idx_t recorded_ends = 0;
+		bool run_count_is_exact = true;
 		array<idx_t, MAX_DIRECT_RANGES> run_starts;
 		array<idx_t, MAX_DIRECT_RANGES> run_ends;
 
 		bool HasExactRanges() const {
-			return run_count > 0 && run_count <= MAX_DIRECT_RANGES && recorded_starts == run_count &&
-			       recorded_ends == run_count;
+			return run_count_is_exact && run_count > 0 && run_count <= MAX_DIRECT_RANGES &&
+			       recorded_starts == run_count && recorded_ends == run_count;
 		}
 	};
 
@@ -410,8 +409,72 @@ private:
 		return (packed | (packed >> 16)) & 0x00000000FFFFFFFFULL;
 	}
 
-	static void ReduceBitmap(const uint64_t *source, idx_t source_word_count, uint64_t *destination,
-	                         idx_t destination_word_count, idx_t destination_logical_bucket_count) {
+	static void RecordPositions(uint64_t positions, idx_t word_base, array<idx_t, MAX_DIRECT_RANGES> &result,
+	                            idx_t &count) {
+		while (positions != 0 && count < MAX_DIRECT_RANGES) {
+			const auto bit = UnsafeNumericCast<idx_t>(__builtin_ctzll(positions));
+			result[count++] = word_base + bit;
+			positions &= positions - 1;
+		}
+	}
+
+	class BitmapMetricsBuilder {
+	public:
+		void PushWord(uint64_t word, idx_t valid_bits, idx_t word_base) {
+			if (has_pending) {
+				ConsumePending(static_cast<uint8_t>(word & 1ULL));
+			}
+			pending_word = word;
+			pending_valid_bits = valid_bits;
+			pending_word_base = word_base;
+			has_pending = true;
+		}
+
+		BitmapMetrics Finish() {
+			D_ASSERT(has_pending);
+			ConsumePending(0);
+			has_pending = false;
+			return metrics;
+		}
+
+	private:
+		void ConsumePending(uint8_t next_word_first_bit) {
+			const auto valid_mask = MaskForValidBits(pending_valid_bits);
+			const auto word = pending_word & valid_mask;
+			metrics.active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(word));
+			if (!metrics.run_count_is_exact) {
+				return;
+			}
+
+			const auto previous_bits = (word << 1) | previous_word_last_bit;
+			auto next_bits = word >> 1;
+			if (pending_valid_bits == 64 && next_word_first_bit) {
+				next_bits |= 1ULL << WORD_MASK;
+			}
+
+			const auto starts = word & ~previous_bits & valid_mask;
+			const auto ends = word & ~next_bits & valid_mask;
+			metrics.run_count += UnsafeNumericCast<idx_t>(__builtin_popcountll(starts));
+			RecordPositions(starts, pending_word_base, metrics.run_starts, metrics.recorded_starts);
+			RecordPositions(ends, pending_word_base, metrics.run_ends, metrics.recorded_ends);
+			previous_word_last_bit = static_cast<uint8_t>((word >> (pending_valid_bits - 1)) & 1ULL);
+			if (metrics.run_count > MAX_DIRECT_RANGES) {
+				metrics.run_count_is_exact = false;
+			}
+		}
+
+	private:
+		BitmapMetrics metrics;
+		uint64_t pending_word = 0;
+		idx_t pending_valid_bits = 0;
+		idx_t pending_word_base = 0;
+		uint8_t previous_word_last_bit = 0;
+		bool has_pending = false;
+	};
+
+	BitmapMetrics ReduceAndAnalyzeBitmap(const uint64_t *source, idx_t source_word_count, uint64_t *destination,
+	                                     idx_t destination_word_count, idx_t destination_logical_bucket_count) const {
+		BitmapMetricsBuilder builder;
 		for (idx_t destination_word_idx = 0; destination_word_idx < destination_word_count; destination_word_idx++) {
 			const auto first_source_word_idx = destination_word_idx * 2;
 			D_ASSERT(first_source_word_idx < source_word_count);
@@ -423,17 +486,11 @@ private:
 
 			const auto word_base = destination_word_idx << WORD_SHIFT;
 			const auto valid_bits = MinValue<idx_t>(64, destination_logical_bucket_count - word_base);
-			destination[destination_word_idx] = (low | high) & MaskForValidBits(valid_bits);
+			const auto word = (low | high) & MaskForValidBits(valid_bits);
+			destination[destination_word_idx] = word;
+			builder.PushWord(word, valid_bits, word_base);
 		}
-	}
-
-	static void RecordPositions(uint64_t positions, idx_t word_base, array<idx_t, MAX_DIRECT_RANGES> &result,
-	                            idx_t &count) {
-		while (positions != 0 && count < MAX_DIRECT_RANGES) {
-			const auto bit = UnsafeNumericCast<idx_t>(__builtin_ctzll(positions));
-			result[count++] = word_base + bit;
-			positions &= positions - 1;
-		}
+		return builder.Finish();
 	}
 
 	BitmapMetrics AnalyzeBitmap() const {
@@ -444,28 +501,15 @@ private:
 
 	BitmapMetrics AnalyzeBitmap(const uint64_t *source, idx_t source_word_count,
 	                            idx_t source_logical_bucket_count) const {
-		BitmapMetrics result;
-		uint8_t previous_word_last_bit = 0;
+		D_ASSERT(source_word_count > 0);
+		D_ASSERT(source_logical_bucket_count > 0);
+		BitmapMetricsBuilder builder;
 		for (idx_t word_idx = 0; word_idx < source_word_count; word_idx++) {
 			const auto word_base = word_idx << WORD_SHIFT;
 			const auto valid_bits = MinValue<idx_t>(64, source_logical_bucket_count - word_base);
-			const auto valid_mask = MaskForValidBits(valid_bits);
-			const auto word = source[word_idx] & valid_mask;
-			const auto previous_bits = (word << 1) | previous_word_last_bit;
-			auto next_bits = word >> 1;
-			if (valid_bits == 64 && word_idx + 1 < source_word_count && (source[word_idx + 1] & 1ULL)) {
-				next_bits |= 1ULL << WORD_MASK;
-			}
-
-			const auto starts = word & ~previous_bits & valid_mask;
-			const auto ends = word & ~next_bits & valid_mask;
-			result.active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(word));
-			result.run_count += UnsafeNumericCast<idx_t>(__builtin_popcountll(starts));
-			RecordPositions(starts, word_base, result.run_starts, result.recorded_starts);
-			RecordPositions(ends, word_base, result.run_ends, result.recorded_ends);
-			previous_word_last_bit = static_cast<uint8_t>((word >> (valid_bits - 1)) & 1ULL);
+			builder.PushWord(source[word_idx], valid_bits, word_base);
 		}
-		return result;
+		return builder.Finish();
 	}
 
 	BitmapMetrics CurrentMetrics() const {
@@ -473,6 +517,7 @@ private:
 			BitmapMetrics result;
 			result.active_buckets = cached_active_buckets;
 			result.run_count = cached_run_count;
+			result.run_count_is_exact = cached_run_count_is_exact;
 			return result;
 		}
 		return AnalyzeBitmap();
@@ -481,8 +526,25 @@ private:
 	void CacheAnalysis(const BitmapMetrics &metrics, double false_positive_rate) {
 		cached_active_buckets = metrics.active_buckets;
 		cached_run_count = metrics.run_count;
+		cached_run_count_is_exact = metrics.run_count_is_exact;
 		cached_false_positive_rate = false_positive_rate;
 		analysis_cached = true;
+	}
+
+	idx_t CountRuns() const {
+		D_ASSERT(mode == Mode::BITMAP);
+		idx_t result = 0;
+		uint8_t previous_word_last_bit = 0;
+		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
+			const auto word_base = word_idx << WORD_SHIFT;
+			const auto valid_bits = MinValue<idx_t>(64, logical_bucket_count - word_base);
+			const auto valid_mask = MaskForValidBits(valid_bits);
+			const auto word = bitmap[word_idx] & valid_mask;
+			const auto previous_bits = (word << 1) | previous_word_last_bit;
+			result += UnsafeNumericCast<idx_t>(__builtin_popcountll(word & ~previous_bits & valid_mask));
+			previous_word_last_bit = static_cast<uint8_t>((word >> (valid_bits - 1)) & 1ULL);
+		}
+		return result;
 	}
 
 	double FalsePositiveRate(idx_t active_buckets, idx_t value_shift) const {
@@ -647,6 +709,7 @@ private:
 	idx_t range_count = 0;
 	idx_t cached_active_buckets = 0;
 	idx_t cached_run_count = 0;
+	bool cached_run_count_is_exact = true;
 	double cached_false_positive_rate = 0;
 	array<DirectRange, MAX_DIRECT_RANGES> ranges;
 	AllocatedData buf_;

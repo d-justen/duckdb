@@ -256,7 +256,7 @@ TEST_CASE("Prefix range filter discovers direct ranges at a coarser level", "[op
 	DuckDB db(nullptr);
 	Connection con(db);
 
-	const vector<int32_t> keys {0, 1, 3, 4, 6, 7, 9, 10, 12, 13};
+	const vector<int32_t> keys {120, 121, 123, 124, 126, 127, 129, 130, 132, 133};
 	auto filter = BuildFinalizedInt32PrefixRangeFilter(*con.context, keys, 0, 200000, 0, 0.001);
 	const auto info = filter->GetCompressionInfo();
 	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::DIRECT_RANGES);
@@ -268,6 +268,9 @@ TEST_CASE("Prefix range filter discovers direct ranges at a coarser level", "[op
 	for (auto key : keys) {
 		REQUIRE(ContainsKey(*filter, key));
 	}
+	REQUIRE_FALSE(ContainsKey(*filter, 119));
+	REQUIRE(ContainsKey(*filter, 122));
+	REQUIRE_FALSE(ContainsKey(*filter, 134));
 }
 
 TEST_CASE("Prefix range filter retains the last candidate within its false-positive budget",
