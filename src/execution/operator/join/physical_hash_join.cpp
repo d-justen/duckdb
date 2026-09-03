@@ -1404,12 +1404,12 @@ bool JoinFilterPushdownInfo::TryRegisterPrefixRangeFilter(const JoinFilterPushdo
                                                           JoinHashTable &ht, const PhysicalOperator &op,
                                                           const JoinFilterPushdownColumn &column,
                                                           ProjectionIndex filter_col_idx, const Value &min_val,
-                                                          const Value &max_val, idx_t max_bits,
+                                                          const Value &max_val, const PrefixRangeFilter::Sizing &sizing,
                                                           JoinFilterGlobalState &gstate) const {
 	if (!ht.GetPrefixRangeFilter()) {
 		const auto key_type = ht.conditions[0].GetLHS().GetReturnType();
 		auto prefix_filter = PrefixRangeFilter::CreatePrefixRangeFilter(key_type);
-		prefix_filter->Initialize(context, ht.Count(), min_val, max_val, max_bits);
+		prefix_filter->Initialize(context, ht.Count(), min_val, max_val, sizing);
 		ht.SetPrefixRangeFilter(std::move(prefix_filter));
 		ht.SetBuildPrefixRangeFilter();
 	}
@@ -1781,10 +1781,12 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(ClientContext &con
 				}
 
 				static constexpr idx_t SMALL_EXACT_PRF_BITS = 1ULL << 26;
+				PrefixRangeFilter::Sizing sizing;
 				if (can_emit_prf && span < SMALL_EXACT_PRF_BITS &&
+				    PrefixRangeFilter::TryComputeFixedSizeSizing(min_val_before_cast, max_val_before_cast,
+				                                                 SMALL_EXACT_PRF_BITS, sizing) &&
 				    TryRegisterPrefixRangeFilter(info, context, *ht, op, pushdown_column, filter_col_idx,
-				                                 min_val_before_cast, max_val_before_cast, SMALL_EXACT_PRF_BITS,
-				                                 *gstate)) {
+				                                 min_val_before_cast, max_val_before_cast, sizing, *gstate)) {
 					continue;
 				}
 
@@ -1795,9 +1797,10 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(ClientContext &con
 					}
 					const auto bloom_filter_bits = BloomFilterBitBudget(build_count);
 					if (span <= bloom_filter_bits &&
+					    PrefixRangeFilter::TryComputeFixedSizeSizing(min_val_before_cast, max_val_before_cast,
+					                                                 bloom_filter_bits, sizing) &&
 					    TryRegisterPrefixRangeFilter(info, context, *ht, op, pushdown_column, filter_col_idx,
-					                                 min_val_before_cast, max_val_before_cast, bloom_filter_bits,
-					                                 *gstate)) {
+					                                 min_val_before_cast, max_val_before_cast, sizing, *gstate)) {
 						continue;
 					}
 				}

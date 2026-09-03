@@ -12,6 +12,7 @@
 #include "duckdb/common/array.hpp"
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/enums/vector_type.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/operator/subtract.hpp"
@@ -51,17 +52,19 @@ struct PrefixRangeBitmapBuildState : public PrefixRangeFilter::BuildState {
 template <typename U>
 class PrefixRangeBitmap {
 public:
-	void Initialize(ClientContext &context, U min_p, U span_p, idx_t max_bits) {
+	void Initialize(ClientContext &context, U min_p, U span_p, idx_t shift_p) {
 		min = min_p;
 		span = span_p;
-		shift = 0;
-
-		while ((span >> shift) >= max_bits) {
-			shift++;
+		shift = shift_p;
+		if (shift >= sizeof(U) * 8) {
+			throw InternalException("Invalid prefix range filter shift");
 		}
 
-		const idx_t buckets = UnsafeNumericCast<idx_t>((span >> shift) + 1);
-		word_count = buckets == 0 ? 1 : (buckets + 63) >> WORD_SHIFT;
+		idx_t buckets;
+		if (!PrefixRangeFilter::TryComputeBucketCount(Uhugeint::Convert(span), shift, buckets)) {
+			throw InternalException("Invalid prefix range filter sizing");
+		}
+		word_count = buckets / 64 + (buckets % 64 != 0);
 
 		buf_ = AllocateBitmap(context, word_count, bitmap);
 
@@ -213,6 +216,15 @@ public:
 		return initialized;
 	}
 
+	PrefixRangeFilter::Analysis Analyze() const {
+		idx_t active_buckets = 0;
+		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
+			active_buckets += UnsafeNumericCast<idx_t>(__builtin_popcountll(bitmap[word_idx]));
+		}
+		return {active_buckets, PrefixRangeFilter::EstimateFalsePositiveRate(Uhugeint::Convert(span), active_buckets,
+		                                                                     active_buckets, shift)};
+	}
+
 	U Min() const {
 		return min;
 	}
@@ -276,12 +288,17 @@ private:
 
 public:
 	void Initialize(ClientContext &context, idx_t number_of_rows, Value min_val, Value max_val,
-	                idx_t max_bits) override {
+	                const Sizing &sizing) override {
 		D_ASSERT(min_val <= max_val);
 		D_ASSERT(number_of_rows > 0);
 		const auto min = NumericConverter<T>::Convert(min_val.GetValueUnsafe<T>());
 		const auto max = NumericConverter<T>::Convert(max_val.GetValueUnsafe<T>());
-		bitmap.Initialize(context, min, max - min, max_bits);
+		const Comparable comparable_span = max - min;
+		Comparable span;
+		if (!Uhugeint::TryCast(sizing.span, span) || span != comparable_span) {
+			throw InternalException("Prefix range filter sizing does not match its value bounds");
+		}
+		bitmap.Initialize(context, min, span, sizing.shift);
 	}
 
 	unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const override {
@@ -340,6 +357,10 @@ public:
 		return bitmap.IsInitialized();
 	}
 
+	Analysis Analyze() const override {
+		return bitmap.Analyze();
+	}
+
 private:
 	PrefixRangeBitmap<Comparable> bitmap;
 };
@@ -347,13 +368,17 @@ private:
 class StringPrefixRangeFilter : public PrefixRangeFilter {
 public:
 	void Initialize(ClientContext &context, idx_t number_of_rows, Value min_val, Value max_val,
-	                idx_t max_bits) override {
+	                const Sizing &sizing) override {
 		D_ASSERT(min_val <= max_val);
 		D_ASSERT(number_of_rows > 0);
 		const auto min = StringPrefixConverter::Convert(min_val.GetValueUnsafe<string_t>());
 		const auto max = StringPrefixConverter::Convert(max_val.GetValueUnsafe<string_t>());
 		D_ASSERT(min <= max);
-		bitmap.Initialize(context, min, max - min, max_bits);
+		uint32_t span;
+		if (!Uhugeint::TryCast(sizing.span, span) || span != max - min) {
+			throw InternalException("Prefix range filter sizing does not match its value bounds");
+		}
+		bitmap.Initialize(context, min, span, sizing.shift);
 	}
 
 	unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const override {
@@ -415,6 +440,10 @@ public:
 		return bitmap.IsInitialized();
 	}
 
+	Analysis Analyze() const override {
+		return bitmap.Analyze();
+	}
+
 private:
 	PrefixRangeBitmap<uint32_t> bitmap;
 };
@@ -446,6 +475,92 @@ bool ComputeStringPrefixSpan(const Value &lower_bound, const Value &upper_bound,
 		return false;
 	}
 #endif
+}
+
+idx_t MaximumPrefixRangeShift(const LogicalType &type) {
+	if (type.InternalType() == PhysicalType::VARCHAR) {
+		return sizeof(uint32_t) * 8 - 1;
+	}
+	return GetTypeIdSize(type.InternalType()) * 8 - 1;
+}
+
+bool PrefixRangeFilter::TryComputeBucketCount(const uhugeint_t &span, idx_t shift, idx_t &bucket_count) {
+	if (shift >= 64) {
+		return false;
+	}
+	const auto shifted_span = span >> uhugeint_t(shift);
+	auto bucket_count_huge = shifted_span;
+	if (!Uhugeint::TryAddInPlace(bucket_count_huge, 1)) {
+		return false;
+	}
+	return Uhugeint::TryCast(bucket_count_huge, bucket_count);
+}
+
+double PrefixRangeFilter::EstimateFalsePositiveRate(const uhugeint_t &span, idx_t positive_lower_bound,
+                                                    idx_t active_buckets, idx_t shift) {
+	const auto domain_size = span + 1;
+	const auto represented_values = Uhugeint::Convert(positive_lower_bound);
+	if (Uhugeint::LessThanEquals(domain_size, represented_values)) {
+		return 0;
+	}
+
+	D_ASSERT(shift < 64);
+	const auto bucket_width = uhugeint_t(1) << uhugeint_t(shift);
+	auto covered_values = Uhugeint::Convert(active_buckets) * bucket_width;
+	if (Uhugeint::GreaterThan(covered_values, domain_size)) {
+		covered_values = domain_size;
+	}
+	if (Uhugeint::LessThanEquals(covered_values, represented_values)) {
+		return 0;
+	}
+
+	const auto false_positives = covered_values - represented_values;
+	const auto negative_values = domain_size - represented_values;
+	return Uhugeint::Cast<double>(false_positives) / Uhugeint::Cast<double>(negative_values);
+}
+
+double PrefixRangeFilter::ComputeFalsePositiveRateUpperBound(const uhugeint_t &span, idx_t count, idx_t shift) {
+	return EstimateFalsePositiveRate(span, count, count, shift);
+}
+
+bool PrefixRangeFilter::TryComputeSizing(const Value &min, const Value &max, idx_t count, Sizing &sizing,
+                                         double false_positive_rate) {
+	if (count == 0 || false_positive_rate < 0 || !TryComputeSpan(min, max, sizing.span)) {
+		return false;
+	}
+
+	sizing.shift = 0;
+	bool found_sizing = false;
+	const auto maximum_shift = MaximumPrefixRangeShift(min.type());
+	for (idx_t shift = 0; shift <= maximum_shift; shift++) {
+		idx_t bucket_count;
+		if (!TryComputeBucketCount(sizing.span, shift, bucket_count)) {
+			continue;
+		}
+		if (ComputeFalsePositiveRateUpperBound(sizing.span, count, shift) > false_positive_rate) {
+			break;
+		}
+		sizing.shift = shift;
+		found_sizing = true;
+	}
+	return found_sizing;
+}
+
+bool PrefixRangeFilter::TryComputeFixedSizeSizing(const Value &min, const Value &max, idx_t bucket_count_limit,
+                                                  Sizing &sizing) {
+	if (bucket_count_limit == 0 || !TryComputeSpan(min, max, sizing.span)) {
+		return false;
+	}
+
+	const auto maximum_shift = MaximumPrefixRangeShift(min.type());
+	for (idx_t shift = 0; shift <= maximum_shift; shift++) {
+		idx_t bucket_count;
+		if (TryComputeBucketCount(sizing.span, shift, bucket_count) && bucket_count <= bucket_count_limit) {
+			sizing.shift = shift;
+			return true;
+		}
+	}
+	return false;
 }
 
 unique_ptr<PrefixRangeFilter> PrefixRangeFilter::CreatePrefixRangeFilter(const LogicalType &key_type) {
