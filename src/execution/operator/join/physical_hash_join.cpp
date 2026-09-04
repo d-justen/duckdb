@@ -1131,6 +1131,9 @@ private:
 			sink.hash_table->MergePrefixRangeBuildState(*lane->state);
 		}
 		sink.hash_table->FinalizePrefixRangeFilter();
+		if (sink.hash_table->RequiresBloomFilterFallback()) {
+			sink.hash_table->BuildBloomFilter();
+		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
 
 		// Both finalize paths finish writing the chains before reaching here,
@@ -1397,8 +1400,10 @@ static unique_ptr<Expression> PreserveRuntimeFilterCastErrors(unique_ptr<Express
 void JoinFilterPushdownInfo::DeferRuntimeFilter(DeferredRuntimeFilterType type, const PhysicalOperator &op,
                                                 const JoinFilterPushdownFilter &info,
                                                 const JoinFilterPushdownColumn &column, ProjectionIndex filter_col_idx,
-                                                JoinFilterGlobalState &gstate) const {
-	gstate.deferred_runtime_filters.push_back({type, &op, info.dynamic_filters, column, filter_col_idx});
+                                                JoinFilterGlobalState &gstate, bool bloom_fallback) const {
+	D_ASSERT(!bloom_fallback || type == DeferredRuntimeFilterType::PREFIX_RANGE);
+	gstate.deferred_runtime_filters.push_back(
+	    {type, &op, info.dynamic_filters, column, filter_col_idx, bloom_fallback});
 }
 
 bool JoinFilterPushdownInfo::TryRegisterPrefixRangeFilter(const JoinFilterPushdownFilter &info, ClientContext &context,
@@ -1406,7 +1411,7 @@ bool JoinFilterPushdownInfo::TryRegisterPrefixRangeFilter(const JoinFilterPushdo
                                                           const JoinFilterPushdownColumn &column,
                                                           ProjectionIndex filter_col_idx, const Value &min_val,
                                                           const Value &max_val, const PrefixRangeFilter::Sizing &sizing,
-                                                          JoinFilterGlobalState &gstate) const {
+                                                          bool bloom_fallback, JoinFilterGlobalState &gstate) const {
 	if (!ht.GetPrefixRangeFilter()) {
 		const auto key_type = ht.conditions[0].GetLHS().GetReturnType();
 		auto prefix_filter = PrefixRangeFilter::CreatePrefixRangeFilter(key_type);
@@ -1414,8 +1419,12 @@ bool JoinFilterPushdownInfo::TryRegisterPrefixRangeFilter(const JoinFilterPushdo
 		ht.SetPrefixRangeFilter(std::move(prefix_filter));
 		ht.SetBuildPrefixRangeFilter();
 	}
+	if (bloom_fallback) {
+		ht.SetPrefixRangeFilterBloomFallback();
+	}
 
-	DeferRuntimeFilter(DeferredRuntimeFilterType::PREFIX_RANGE, op, info, column, filter_col_idx, gstate);
+	DeferRuntimeFilter(DeferredRuntimeFilterType::PREFIX_RANGE, op, info, column, filter_col_idx, gstate,
+	                   bloom_fallback);
 	return true;
 }
 
@@ -1477,7 +1486,8 @@ static const char *GetRuntimeFilterReconstructionModeName(JoinFilterPushdownMode
 
 static unique_ptr<Expression> CreateRuntimeFilterExpression(ClientContext &context, JoinHashTable &ht,
                                                             const DeferredRuntimeFilterPushdown &deferred,
-                                                            float selectivity_threshold, idx_t n_vectors_to_check) {
+                                                            DeferredRuntimeFilterType type, float selectivity_threshold,
+                                                            idx_t n_vectors_to_check) {
 	const auto key_name = ht.conditions[0].GetRHS().ToString();
 	const auto key_type = ht.conditions[0].GetLHS().GetReturnType();
 	auto filter_input_type = RuntimeFilterCastUtil::GetRuntimeFilterInputType(deferred.column, key_type);
@@ -1487,7 +1497,7 @@ static unique_ptr<Expression> CreateRuntimeFilterExpression(ClientContext &conte
 	children.push_back(std::move(input.expression));
 
 	unique_ptr<Expression> filter_expr;
-	switch (deferred.type) {
+	switch (type) {
 	case DeferredRuntimeFilterType::BLOOM_FILTER: {
 		D_ASSERT(ht.GetBloomFilter().IsInitialized());
 		if (!ht.GetBloomFilter().IsInitialized()) {
@@ -1508,7 +1518,8 @@ static unique_ptr<Expression> CreateRuntimeFilterExpression(ClientContext &conte
 		filter_expr = make_uniq<BoundFunctionExpression>(
 		    BoundScalarFunction(PrefixRangeScalarFun::GetFunction(filter_input_type)), std::move(children),
 		    make_uniq<PrefixRangeFunctionData>(prefix_range_filter, filters_null_values, key_name, key_type,
-		                                       selectivity_threshold, n_vectors_to_check));
+		                                       selectivity_threshold, n_vectors_to_check,
+		                                       ht.PrefixRangeFilterAllowsTupleFiltering()));
 		break;
 	}
 	default:
@@ -1517,32 +1528,39 @@ static unique_ptr<Expression> CreateRuntimeFilterExpression(ClientContext &conte
 	return filter_expr;
 }
 
-static void PublishDeferredRuntimeFilters(ClientContext &context, JoinHashTable &ht, JoinFilterGlobalState &gstate) {
-	if (gstate.deferred_runtime_filters.empty()) {
+static void PublishDeferredRuntimeFilter(ClientContext &context, JoinHashTable &ht,
+                                         const DeferredRuntimeFilterPushdown &deferred,
+                                         DeferredRuntimeFilterType type) {
+	const auto filter_type = GetSelectivityOptionalFilterType(type);
+	float selectivity_threshold;
+	idx_t n_vectors_to_check;
+	GetThresholdAndVectorsToCheck(filter_type, selectivity_threshold, n_vectors_to_check);
+	auto filter_expr =
+	    CreateRuntimeFilterExpression(context, ht, deferred, type, selectivity_threshold, n_vectors_to_check);
+	if (!filter_expr) {
 		return;
 	}
+	deferred.dynamic_filters->PushFilter(
+	    *deferred.op, deferred.filter_col_idx,
+	    CreateSelectivityOptionalExpressionFilter(std::move(filter_expr), deferred.column.storage_type, filter_type));
+	DUCKDB_LOG(context, PhysicalOperatorLogType, *deferred.op, "PhysicalHashJoin", "PublishRuntimeFilter",
+	           {{"kind", GetRuntimeFilterTypeName(type)},
+	            {"storage_type", deferred.column.storage_type.ToString()},
+	            {"reconstruction_mode", GetRuntimeFilterReconstructionModeName(deferred.column.mode)},
+	            {"uses_try_cast", to_string(RuntimeFilterCastUtil::RuntimeFilterUsesTryCast(deferred.column))}});
+}
+
+static void PublishDeferredRuntimeFilters(ClientContext &context, JoinHashTable &ht, JoinFilterGlobalState &gstate) {
 	for (auto &deferred : gstate.deferred_runtime_filters) {
 		D_ASSERT(deferred.op);
 		if (!deferred.op || !deferred.dynamic_filters) {
 			continue;
 		}
-		const auto filter_type = GetSelectivityOptionalFilterType(deferred.type);
-		float selectivity_threshold;
-		idx_t n_vectors_to_check;
-		GetThresholdAndVectorsToCheck(filter_type, selectivity_threshold, n_vectors_to_check);
-		auto filter_expr =
-		    CreateRuntimeFilterExpression(context, ht, deferred, selectivity_threshold, n_vectors_to_check);
-		if (!filter_expr) {
-			continue;
+		PublishDeferredRuntimeFilter(context, ht, deferred, deferred.type);
+		if (deferred.bloom_fallback && ht.RequiresBloomFilterFallback()) {
+			D_ASSERT(deferred.type == DeferredRuntimeFilterType::PREFIX_RANGE);
+			PublishDeferredRuntimeFilter(context, ht, deferred, DeferredRuntimeFilterType::BLOOM_FILTER);
 		}
-		deferred.dynamic_filters->PushFilter(*deferred.op, deferred.filter_col_idx,
-		                                     CreateSelectivityOptionalExpressionFilter(
-		                                         std::move(filter_expr), deferred.column.storage_type, filter_type));
-		DUCKDB_LOG(context, PhysicalOperatorLogType, *deferred.op, "PhysicalHashJoin", "PublishRuntimeFilter",
-		           {{"kind", GetRuntimeFilterTypeName(deferred.type)},
-		            {"storage_type", deferred.column.storage_type.ToString()},
-		            {"reconstruction_mode", GetRuntimeFilterReconstructionModeName(deferred.column.mode)},
-		            {"uses_try_cast", to_string(RuntimeFilterCastUtil::RuntimeFilterUsesTryCast(deferred.column))}});
 	}
 	gstate.deferred_runtime_filters.clear();
 }
@@ -1781,13 +1799,13 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(ClientContext &con
 					    PushInFilter(context, info, pushdown_column, *ht, op, filter_idx, filter_col_idx);
 				}
 
-				static constexpr idx_t SMALL_EXACT_PRF_BITS = 1ULL << 26;
+				static constexpr idx_t MAX_PREFIX_RANGE_FILTER_BITS = 1ULL << 26;
 				PrefixRangeFilter::Sizing sizing;
-				if (can_emit_prf && span < SMALL_EXACT_PRF_BITS &&
+				if (can_emit_prf && span < MAX_PREFIX_RANGE_FILTER_BITS &&
 				    PrefixRangeFilter::TryComputeFixedSizeSizing(min_val_before_cast, max_val_before_cast,
-				                                                 SMALL_EXACT_PRF_BITS, sizing) &&
+				                                                 MAX_PREFIX_RANGE_FILTER_BITS, sizing) &&
 				    TryRegisterPrefixRangeFilter(info, context, *ht, op, pushdown_column, filter_col_idx,
-				                                 min_val_before_cast, max_val_before_cast, sizing, *gstate)) {
+				                                 min_val_before_cast, max_val_before_cast, sizing, false, *gstate)) {
 					continue;
 				}
 
@@ -1796,12 +1814,13 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::FinalizeFilters(ClientContext &con
 					if (build_count == 0) {
 						build_count = ht->GetSinkCollection().Count();
 					}
-					const auto bloom_filter_bits = BloomFilterBitBudget(build_count);
-					if (span <= bloom_filter_bits &&
-					    PrefixRangeFilter::TryComputeFixedSizeSizing(min_val_before_cast, max_val_before_cast,
-					                                                 bloom_filter_bits, sizing) &&
+					const auto prefix_range_filter_bits =
+					    MinValue<idx_t>(BloomFilterBitBudget(build_count), MAX_PREFIX_RANGE_FILTER_BITS);
+					if (PrefixRangeFilter::TryComputeFixedSizeSizing(min_val_before_cast, max_val_before_cast,
+					                                                 prefix_range_filter_bits, sizing) &&
 					    TryRegisterPrefixRangeFilter(info, context, *ht, op, pushdown_column, filter_col_idx,
-					                                 min_val_before_cast, max_val_before_cast, sizing, *gstate)) {
+					                                 min_val_before_cast, max_val_before_cast, sizing,
+					                                 allow_bloom_filters, *gstate)) {
 						continue;
 					}
 				}

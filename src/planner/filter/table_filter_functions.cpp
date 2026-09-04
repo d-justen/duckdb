@@ -118,7 +118,7 @@ unique_ptr<FunctionData> TableFilterFunctionDeserialize(Deserializer &deserializ
 		return make_uniq<BloomFilterFunctionData>(nullptr, false, string(), key_type, 0.0f, idx_t(0));
 	}
 	if (function.GetName() == PrefixRangeScalarFun::NAME) {
-		return make_uniq<PrefixRangeFunctionData>(nullptr, true, string(), key_type, 0.0f, idx_t(0));
+		return make_uniq<PrefixRangeFunctionData>(nullptr, true, string(), key_type, 0.0f, idx_t(0), true);
 	}
 	if (function.GetName() == DynamicFilterScalarFun::NAME) {
 		return make_uniq<DynamicFilterFunctionData>(nullptr);

@@ -56,6 +56,7 @@ struct DeferredRuntimeFilterPushdown {
 	shared_ptr<DynamicTableFilterSet> dynamic_filters;
 	JoinFilterPushdownColumn column;
 	ProjectionIndex filter_col_idx;
+	bool bloom_fallback = false;
 };
 
 struct JoinFilterGlobalState {
@@ -126,11 +127,13 @@ private:
 
 	void DeferRuntimeFilter(DeferredRuntimeFilterType type, const PhysicalOperator &op,
 	                        const JoinFilterPushdownFilter &info, const JoinFilterPushdownColumn &column,
-	                        ProjectionIndex filter_col_idx, JoinFilterGlobalState &gstate) const;
+	                        ProjectionIndex filter_col_idx, JoinFilterGlobalState &gstate,
+	                        bool bloom_fallback = false) const;
 	bool TryRegisterPrefixRangeFilter(const JoinFilterPushdownFilter &info, ClientContext &context, JoinHashTable &ht,
 	                                  const PhysicalOperator &op, const JoinFilterPushdownColumn &column,
 	                                  ProjectionIndex filter_col_idx, const Value &min_val, const Value &max_val,
-	                                  const PrefixRangeFilter::Sizing &sizing, JoinFilterGlobalState &gstate) const;
+	                                  const PrefixRangeFilter::Sizing &sizing, bool bloom_fallback,
+	                                  JoinFilterGlobalState &gstate) const;
 
 	bool CanUseInFilter(const ClientContext &context, optional_ptr<JoinHashTable> ht, const ExpressionType &cmp) const;
 	bool CanUseBloomFilter(const ClientContext &context, const PhysicalComparisonJoin &op, const ExpressionType &cmp,

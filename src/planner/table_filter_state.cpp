@@ -360,8 +360,8 @@ private:
 class PrefixRangeFilterExecutor final : public ExpressionFilterExecutor {
 public:
 	PrefixRangeFilterExecutor(const PrefixRangeFunctionData &data, bool inside_selectivity_optional)
-	    : filter(data.filter), filters_null_values(data.filters_null_values) {
-		if (!inside_selectivity_optional && data.n_vectors_to_check != 0) {
+	    : filter(data.filter), filters_null_values(data.filters_null_values), filters_tuples(data.filters_tuples) {
+		if (filters_tuples && !inside_selectivity_optional && data.n_vectors_to_check != 0) {
 			stats = make_uniq<SelectivityOptionalFilterState::SelectivityStats>(data.n_vectors_to_check,
 			                                                                    data.selectivity_threshold);
 		}
@@ -372,7 +372,7 @@ public:
 		if (approved_tuple_count == 0) {
 			return 0;
 		}
-		if (!filter || !filter->IsInitialized()) {
+		if (!filter || !filter->IsInitialized() || !filters_tuples) {
 			return approved_tuple_count;
 		}
 		if (stats && !stats->IsActive()) {
@@ -448,6 +448,7 @@ private:
 
 	optional_ptr<PrefixRangeFilter> filter;
 	bool filters_null_values;
+	bool filters_tuples;
 	SelectionVector local_sel;
 	SelectionVector result_sel;
 	idx_t current_capacity = 0;

@@ -106,7 +106,54 @@ JOIN exact_prf_build b
 ----
 analyzed_plan	<!REGEX>:(?s).*Dynamic.*Filters:.*optional:.*\((k >=|k <=).*
 
-# A small sparse hash table with a large range produces an InFilter and Bloom filter.
+# A bounded approximate PRF with acceptable measured quality does not build its Bloom fallback.
+# This domain has 2,047 buckets at shift 30, of which only two are active.
+statement ok
+SET dynamic_or_filter_threshold=0;
+
+statement ok
+CREATE TABLE approximate_prf_probe AS
+SELECT CASE WHEN i = 99999 THEN 2197949513727 ELSE i END::BIGINT AS k, (i % 7)::INTEGER AS g
+FROM range(100000) t(i);
+
+statement ok
+CREATE TABLE approximate_prf_build AS
+SELECT CASE WHEN i % 2 = 0 THEN 0 ELSE 2197949513727 END::BIGINT AS k, 0::INTEGER AS g
+FROM range(100) t(i);
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM approximate_prf_probe p
+JOIN approximate_prf_build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN.*PRF.*\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM approximate_prf_probe p
+JOIN approximate_prf_build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*IN.*BF.*\(k.*
+
+query I
+SELECT count(*)
+FROM approximate_prf_probe p
+JOIN approximate_prf_build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+100
+
+# A small sparse hash table with a large range produces an InFilter and the PRF/Bloom fallback pair.
+statement ok
+SET dynamic_or_filter_threshold=1000;
+
 statement ok
 CREATE TABLE in_filter_probe AS
 SELECT (-1000000000000 + i * 20000000)::BIGINT AS k, (i % 7)::INTEGER AS g
@@ -136,7 +183,7 @@ JOIN in_filter_build b
   ON p.k = b.k
  AND p.g >= b.g;
 ----
-analyzed_plan	<!REGEX>:.*IN.*PRF.*\(k\).*
+analyzed_plan	<REGEX>:.*IN.*PRF.*\(k\).*
 
 query II
 EXPLAIN ANALYZE
@@ -148,7 +195,7 @@ JOIN in_filter_build b
 ----
 analyzed_plan	<!REGEX>:(?s).*Dynamic.*Filters:.*optional:.*\((k >=|k <=).*
 
-# Above the InFilter threshold, a range too large for a PRF falls back to min/max and Bloom filters.
+# An approximate PRF with poor measured quality retains range pruning and builds its Bloom tuple fallback.
 statement ok
 SET dynamic_or_filter_threshold=0;
 
@@ -170,7 +217,7 @@ JOIN bloom_build b
   ON p.k = b.k
  AND p.g >= b.g;
 ----
-analyzed_plan	<REGEX>:(?s).*Dynamic.*Filters.*optional:.*\(k.*>=.*
+analyzed_plan	<!REGEX>:(?s).*Dynamic.*Filters.*optional:.*\(k.*>=.*
 
 query II
 EXPLAIN ANALYZE
@@ -180,7 +227,7 @@ JOIN bloom_build b
   ON p.k = b.k
  AND p.g >= b.g;
 ----
-analyzed_plan	<REGEX>:(?s).*Dynamic.*Filters.*optional:.*\(k.*<=.*
+analyzed_plan	<!REGEX>:(?s).*Dynamic.*Filters.*optional:.*\(k.*<=.*
 
 query II
 EXPLAIN ANALYZE
@@ -200,7 +247,7 @@ JOIN bloom_build b
   ON p.k = b.k
  AND p.g >= b.g;
 ----
-analyzed_plan	<!REGEX>:.*IN.*PRF.*\(k\).*
+analyzed_plan	<REGEX>:.*IN.*PRF.*\(k\).*
 
 query II
 EXPLAIN ANALYZE
@@ -211,6 +258,15 @@ JOIN bloom_build b
  AND p.g >= b.g;
 ----
 analyzed_plan	<!REGEX>:(?s).*Dynamic.*Filters:.*optional:.*\(k IN \(.*
+
+query I
+SELECT count(*)
+FROM bloom_probe p
+JOIN bloom_build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+100
 
 # Non-equality keys only receive the applicable selectivity-optional min/max filter.
 statement ok

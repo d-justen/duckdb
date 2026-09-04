@@ -502,6 +502,8 @@ private:
 
 	unique_ptr<PrefixRangeFilter> prefix_range_filter;
 	bool should_build_prefix_range_filter = false;
+	bool prefix_range_filter_has_bloom_fallback = false;
+	bool prefix_range_filter_allows_tuple_filtering = true;
 
 	//! Copying not allowed
 	JoinHashTable(const JoinHashTable &) = delete;
@@ -584,6 +586,8 @@ public:
 		this->should_build_bloom_filter = should_build;
 	}
 	void PrepareBloomFilterForFinalize();
+	//! Builds a deferred Bloom filter by re-hashing the stored build keys.
+	void BuildBloomFilter();
 
 	BloomFilter &GetBloomFilter() {
 		return bloom_filter;
@@ -596,6 +600,9 @@ public:
 	void SetBuildPrefixRangeFilter() {
 		should_build_prefix_range_filter = true;
 	}
+	void SetPrefixRangeFilterBloomFallback() {
+		prefix_range_filter_has_bloom_fallback = true;
+	}
 
 	optional_ptr<PrefixRangeFilter> GetPrefixRangeFilter() {
 		return prefix_range_filter;
@@ -603,6 +610,12 @@ public:
 
 	bool ShouldBuildPrefixRangeFilter() const {
 		return should_build_prefix_range_filter && prefix_range_filter;
+	}
+	bool PrefixRangeFilterAllowsTupleFiltering() const {
+		return prefix_range_filter_allows_tuple_filtering;
+	}
+	bool RequiresBloomFilterFallback() const {
+		return prefix_range_filter_has_bloom_fallback && !prefix_range_filter_allows_tuple_filtering;
 	}
 
 	void BuildPrefixRangeFilter();

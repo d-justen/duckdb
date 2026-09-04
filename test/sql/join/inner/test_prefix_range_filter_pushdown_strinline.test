@@ -65,8 +65,8 @@ JOIN prf_build_string b
 ----
 analyzed_plan	<REGEX>:(?s).*IN.*BF.*\(k.*
 
-# These short strings span a wide prefix domain from '' through 'abcf', so the exact string PRF is
-# not chosen here and the runtime filter falls back to Bloom.
+# These short strings span a wide prefix domain from '' through 'abcf'. The bounded approximate PRF
+# retains range pruning, while its poor measured tuple quality activates the Bloom fallback.
 query II
 EXPLAIN ANALYZE
 SELECT count(*)
@@ -75,7 +75,7 @@ JOIN prf_build_string b
   ON p.k = b.k
  AND p.g >= b.g;
 ----
-analyzed_plan	<!REGEX>:(?s).*IN.*PRF.*\(k\).*
+analyzed_plan	<REGEX>:(?s).*IN.*PRF.*\(k\).*
 
 statement ok
 CREATE OR REPLACE TABLE prf_probe_string_long AS

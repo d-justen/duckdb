@@ -19,20 +19,23 @@ namespace duckdb {
 
 PrefixRangeFunctionData::PrefixRangeFunctionData(optional_ptr<PrefixRangeFilter> filter_p, bool filters_null_values_p,
                                                  const string &key_column_name_p, const LogicalType &key_type_p,
-                                                 float selectivity_threshold_p, idx_t n_vectors_to_check_p)
-    : filter(filter_p), filters_null_values(filters_null_values_p), key_column_name(key_column_name_p),
-      key_type(key_type_p), selectivity_threshold(selectivity_threshold_p), n_vectors_to_check(n_vectors_to_check_p) {
+                                                 float selectivity_threshold_p, idx_t n_vectors_to_check_p,
+                                                 bool filters_tuples_p)
+    : filter(filter_p), filters_null_values(filters_null_values_p), filters_tuples(filters_tuples_p),
+      key_column_name(key_column_name_p), key_type(key_type_p), selectivity_threshold(selectivity_threshold_p),
+      n_vectors_to_check(n_vectors_to_check_p) {
 }
 
 unique_ptr<FunctionData> PrefixRangeFunctionData::Copy() const {
 	return make_uniq<PrefixRangeFunctionData>(filter, filters_null_values, key_column_name, key_type,
-	                                          selectivity_threshold, n_vectors_to_check);
+	                                          selectivity_threshold, n_vectors_to_check, filters_tuples);
 }
 
 bool PrefixRangeFunctionData::Equals(const FunctionData &other_p) const {
 	auto &other = other_p.Cast<PrefixRangeFunctionData>();
 	return filter.get() == other.filter.get() && filters_null_values == other.filters_null_values &&
-	       key_column_name == other.key_column_name && key_type == other.key_type;
+	       filters_tuples == other.filters_tuples && key_column_name == other.key_column_name &&
+	       key_type == other.key_type;
 }
 
 static idx_t SelectPrefixRange(Vector &input, const PrefixRangeFunctionData &func_data, SelectionVector &result_sel,
@@ -69,7 +72,7 @@ static idx_t SelectPrefixRange(Vector &input, const PrefixRangeFunctionData &fun
 static unique_ptr<FunctionLocalState>
 PrefixRangeInitLocalState(ExpressionState &state, const BoundFunctionExpression &expr, FunctionData *bind_data) {
 	auto &data = bind_data->Cast<PrefixRangeFunctionData>();
-	if (!data.filter) {
+	if (!data.filter || !data.filters_tuples) {
 		return nullptr;
 	}
 	return InitSelectivityTrackingLocalState(data.n_vectors_to_check, data.selectivity_threshold);
@@ -83,7 +86,7 @@ static idx_t PrefixRangeSelect(DataChunk &args, ExpressionState &state, optional
 	auto tracking_state = local_state_ptr ? &local_state_ptr->Cast<SelectivityTrackingLocalState>() : nullptr;
 
 	auto count = args.size();
-	if (!func_data.filter || !func_data.filter->IsInitialized()) {
+	if (!func_data.filter || !func_data.filter->IsInitialized() || !func_data.filters_tuples) {
 		return SetAllTrueSelection(count, sel, true_sel, false_sel);
 	}
 	if (tracking_state && !tracking_state->IsActive()) {

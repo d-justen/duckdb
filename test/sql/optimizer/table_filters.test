@@ -447,7 +447,7 @@ JOIN phj_build_narrow_cast b
 ----
 10
 
-# Force the Bloom-filter path with a range that is too wide for an exact PRF.
+# Force the approximate PRF/Bloom fallback path with a range that is too wide for an exact PRF.
 statement ok
 CREATE TABLE bf_build_narrow_cast_errors AS
 SELECT (i * 1000)::INTEGER AS k
@@ -467,7 +467,7 @@ FROM (
 JOIN bf_build_narrow_cast_errors b
   ON p.k::INTEGER = b.k
 ----
-analyzed_plan	<REGEX>:(?s).*TRY_CAST.*IN.*BF.*
+analyzed_plan	<REGEX>:(?s).*IN.*PRF.*IN.*BF.*
 
 statement error
 SELECT count(*)

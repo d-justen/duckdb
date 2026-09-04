@@ -1025,6 +1025,9 @@ void JoinHashTable::BuildPrefixRangeFilter() {
 	} while (iterator.Next());
 	MergePrefixRangeBuildState(*prefix_range_state);
 	FinalizePrefixRangeFilter();
+	if (RequiresBloomFilterFallback()) {
+		BuildBloomFilter();
+	}
 }
 
 void JoinHashTable::InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx_t count,
@@ -1047,8 +1050,15 @@ void JoinHashTable::MergePrefixRangeBuildState(PrefixRangeFilter::BuildState &st
 }
 
 void JoinHashTable::FinalizePrefixRangeFilter() {
-	if (ShouldBuildPrefixRangeFilter()) {
-		prefix_range_filter->Compress(context, PrefixRangeFilter::DEFAULT_FALSE_POSITIVE_RATE);
+	if (!ShouldBuildPrefixRangeFilter()) {
+		return;
+	}
+
+	const auto analysis = prefix_range_filter->Compress(context, PrefixRangeFilter::DEFAULT_FALSE_POSITIVE_RATE);
+	prefix_range_filter_allows_tuple_filtering =
+	    analysis.false_positive_rate <= PrefixRangeFilter::DEFAULT_FALSE_POSITIVE_RATE;
+	if (RequiresBloomFilterFallback()) {
+		should_build_bloom_filter = true;
 	}
 }
 
@@ -1109,6 +1119,29 @@ void JoinHashTable::PrepareBloomFilterForFinalize() {
 	bloom_filter.Reset();
 	bloom_filter_init_count = actual_init_count;
 	bloom_filter.Initialize(context, bloom_filter_init_count);
+}
+
+void JoinHashTable::BuildBloomFilter() {
+	D_ASSERT(should_build_bloom_filter);
+	D_ASSERT(equality_types.size() == 1);
+	PrepareBloomFilterForFinalize();
+	D_ASSERT(bloom_filter.IsInitialized());
+
+	Vector build_keys(layout_ptr->GetTypes()[0]);
+	Vector hashes(LogicalType::HASH);
+	TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, 0,
+	                                data_collection->ChunkCount(), false);
+	do {
+		const auto count = iterator.GetCurrentChunkCount();
+		if (count == 0) {
+			continue;
+		}
+		auto &sel = *FlatVector::IncrementalSelectionVector();
+		data_collection->Gather(iterator.GetChunkState().row_locations, sel, count, 0, build_keys, sel, nullptr);
+		FlatVector::SetSize(build_keys, count_t(count));
+		VectorOperations::Hash(build_keys, hashes, count);
+		bloom_filter.InsertHashes(hashes);
+	} while (iterator.Next());
 }
 
 void JoinHashTable::InitializePointerTable(idx_t entry_idx_from, idx_t entry_idx_to) {
@@ -2592,6 +2625,8 @@ void JoinHashTable::ResetForNewIterationSinglePartition() {
 	bloom_filter_init_count = 0;
 	prefix_range_filter.reset();
 	should_build_prefix_range_filter = false;
+	prefix_range_filter_has_bloom_fallback = false;
+	prefix_range_filter_allows_tuple_filtering = true;
 	ResetMarkJoinInfo(*this);
 	// The next iteration may rebuild a different small build side, so this iteration's dictionary
 	// state is stale. Keep in lock-step with BuildDictionaryArrays, which sets these four fields.
