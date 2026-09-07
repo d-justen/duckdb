@@ -77,6 +77,15 @@ JOIN prf_build_string b
 ----
 analyzed_plan	<REGEX>:(?s).*IN.*PRF.*\(k\).*
 
+query I
+SELECT count(*)
+FROM prf_probe_string p
+JOIN prf_build_string b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+5
+
 statement ok
 CREATE OR REPLACE TABLE prf_probe_string_long AS
 SELECT * FROM (VALUES

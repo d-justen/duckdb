@@ -1,0 +1,18 @@
+# name: benchmark/micro/pushdown/prefix_range_filter_string_fallback.benchmark
+# description: Prefix range filter fallback to Bloom on dispersed string keys
+# group: [pushdown]
+
+name Prefix Range Filter String Bloom Fallback
+group micro
+subgroup pushdown
+
+cache prefix_range_filter_string_fallback_v3.duckdb
+
+load
+CREATE TABLE prf_string_fallback_build AS SELECT chr((32 + i % 95)::INTEGER) || chr((32 + (i // 95) % 95)::INTEGER) || chr((32 + (i // 9025) % 95)::INTEGER) || chr((32 + (i // 857375) % 95)::INTEGER) || lpad(i::VARCHAR, 7, '0') AS k, 0::INTEGER AS g, i % 2 = 0 AS selected FROM range(4000000) t(i); CREATE TABLE prf_string_fallback_probe AS SELECT chr((32 + (i // 2) % 95)::INTEGER) || chr((32 + ((i // 2) // 95) % 95)::INTEGER) || chr((32 + ((i // 2) // 9025) % 95)::INTEGER) || chr((32 + ((i // 2) // 857375) % 95)::INTEGER) || lpad((i // 2)::VARCHAR, 7, '0') AS k, 0::INTEGER AS g FROM range(4000000) t(i);
+
+init
+SET dynamic_or_filter_threshold=0;
+
+run
+SELECT count(*) FROM prf_string_fallback_probe p JOIN prf_string_fallback_build b ON p.k = b.k AND p.g >= b.g AND b.selected;

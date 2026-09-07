@@ -1014,20 +1014,23 @@ void JoinHashTable::BuildPrefixRangeFilter() {
 	}
 
 	auto prefix_range_state = InitializePrefixRangeBuildState();
-	TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, 0,
-	                                data_collection->ChunkCount(), false);
+	BuildPrefixRangeFilter(0, data_collection->ChunkCount(), *prefix_range_state, false);
+	MergePrefixRangeBuildState(*prefix_range_state);
+	FinalizePrefixRangeFilter();
+}
+
+void JoinHashTable::BuildPrefixRangeFilter(idx_t chunk_idx_from, idx_t chunk_idx_to,
+                                           PrefixRangeFilter::BuildState &state, bool parallel) {
+	D_ASSERT(ShouldBuildPrefixRangeFilter());
+	TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, chunk_idx_from,
+	                                chunk_idx_to, false);
 	do {
 		const auto count = iterator.GetCurrentChunkCount();
 		if (count == 0) {
 			continue;
 		}
-		InsertPrefixRangeChunk(iterator.GetChunkState(), count, *prefix_range_state);
+		InsertPrefixRangeChunk(iterator.GetChunkState(), count, state, parallel);
 	} while (iterator.Next());
-	MergePrefixRangeBuildState(*prefix_range_state);
-	FinalizePrefixRangeFilter();
-	if (RequiresBloomFilterFallback()) {
-		BuildBloomFilter();
-	}
 }
 
 void JoinHashTable::InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx_t count,
@@ -1121,38 +1124,13 @@ void JoinHashTable::PrepareBloomFilterForFinalize() {
 	bloom_filter.Initialize(context, bloom_filter_init_count);
 }
 
-void JoinHashTable::BuildBloomFilter() {
-	D_ASSERT(should_build_bloom_filter);
-	D_ASSERT(equality_types.size() == 1);
-	PrepareBloomFilterForFinalize();
-	D_ASSERT(bloom_filter.IsInitialized());
-
-	Vector build_keys(layout_ptr->GetTypes()[0]);
-	Vector hashes(LogicalType::HASH);
-	TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, 0,
-	                                data_collection->ChunkCount(), false);
-	do {
-		const auto count = iterator.GetCurrentChunkCount();
-		if (count == 0) {
-			continue;
-		}
-		auto &sel = *FlatVector::IncrementalSelectionVector();
-		data_collection->Gather(iterator.GetChunkState().row_locations, sel, count, 0, build_keys, sel, nullptr);
-		FlatVector::SetSize(build_keys, count_t(count));
-		VectorOperations::Hash(build_keys, hashes, count);
-		bloom_filter.InsertHashes(hashes);
-	} while (iterator.Next());
-}
-
 void JoinHashTable::InitializePointerTable(idx_t entry_idx_from, idx_t entry_idx_to) {
 	// initialize HT with all-zero entries
 	auto entries = GetEntries();
 	std::fill_n(entries.get() + entry_idx_from, entry_idx_to - entry_idx_from, ht_entry_t());
 }
 
-void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel,
-                             optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state,
-                             bool prefix_range_parallel) {
+void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel) {
 	// Pointer table should be allocated
 	D_ASSERT(hash_map.get());
 
@@ -1172,9 +1150,6 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
 		TupleDataChunkState &chunk_state = iterator.GetChunkState();
 
 		InsertHashes(hashes, chunk_state, insert_state, parallel);
-		if (prefix_range_state) {
-			InsertPrefixRangeChunk(chunk_state, count, *prefix_range_state, prefix_range_parallel);
-		}
 	} while (iterator.Next());
 }
 

@@ -262,9 +262,7 @@ public:
 	//! Finalize the build of the HT, constructing the actual hash table and making the HT ready for probing.
 	//! Finalize must be called before any call to Probe, and after Finalize is called Build should no longer be
 	//! ever called.
-	void Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel,
-	              optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state = nullptr,
-	              bool prefix_range_parallel = false);
+	void Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel);
 	//! Probe the HT with the given input chunk, resulting in the given result
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
 	           optional_ptr<Vector> precomputed_hashes = nullptr);
@@ -586,8 +584,6 @@ public:
 		this->should_build_bloom_filter = should_build;
 	}
 	void PrepareBloomFilterForFinalize();
-	//! Builds a deferred Bloom filter by re-hashing the stored build keys.
-	void BuildBloomFilter();
 
 	BloomFilter &GetBloomFilter() {
 		return bloom_filter;
@@ -619,6 +615,8 @@ public:
 	}
 
 	void BuildPrefixRangeFilter();
+	void BuildPrefixRangeFilter(idx_t chunk_idx_from, idx_t chunk_idx_to, PrefixRangeFilter::BuildState &state,
+	                            bool parallel);
 	unique_ptr<PrefixRangeFilter::BuildState> InitializePrefixRangeBuildState();
 	idx_t GetPrefixRangeBuildStateSize() const;
 	void InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx_t count, PrefixRangeFilter::BuildState &state,

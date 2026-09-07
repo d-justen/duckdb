@@ -100,6 +100,25 @@ TEST_CASE("Prefix range filter preserves four exact ranges", "[optimizer][prefix
 	REQUIRE_FALSE(ContainsKey(*filter, 500));
 }
 
+TEST_CASE("Prefix range filter detects direct ranges across word boundaries", "[optimizer][prefix_range_filter]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto filter = BuildFinalizedInt32PrefixRangeFilter(*con.context, {63, 64, 127, 128, 191, 192, 255, 256}, 0, 319, 0);
+	const auto info = filter->GetCompressionInfo();
+	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::DIRECT_RANGES);
+	REQUIRE(info.range_count == 4);
+	REQUIRE(info.run_count == 4);
+	REQUIRE(info.active_buckets == 8);
+	REQUIRE(info.bitmap_allocation_bytes == 0);
+	REQUIRE(ContainsKey(*filter, 63));
+	REQUIRE(ContainsKey(*filter, 64));
+	REQUIRE_FALSE(ContainsKey(*filter, 65));
+	REQUIRE_FALSE(ContainsKey(*filter, 126));
+	REQUIRE(ContainsKey(*filter, 127));
+	REQUIRE(ContainsKey(*filter, 128));
+}
+
 TEST_CASE("Prefix range filter retains bitmaps with more than four runs", "[optimizer][prefix_range_filter]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -206,8 +225,7 @@ TEST_CASE("Prefix range filter stops at the exact cache target", "[optimizer][pr
 	REQUIRE(ContainsAllKeys(*filter, keys));
 }
 
-TEST_CASE("Prefix range filter rejects compression above its false-positive budget",
-          "[optimizer][prefix_range_filter]") {
+TEST_CASE("Prefix range filter converts exact runs before rejecting quality", "[optimizer][prefix_range_filter]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 
@@ -216,13 +234,17 @@ TEST_CASE("Prefix range filter rejects compression above its false-positive budg
 	    BuildFinalizedInt32PrefixRangeFilter(*con.context, {0, 16, 32, 48}, 0, 64, 4, MAX_FALSE_POSITIVE_RATE);
 	const auto info = filter->GetCompressionInfo();
 	const auto analysis = filter->Analyze();
-	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::BITMAP);
+	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::DIRECT_RANGES);
 	REQUIRE(info.shift == 4);
 	REQUIRE(info.active_buckets == 4);
 	REQUIRE(info.run_count == 1);
+	REQUIRE(info.range_count == 1);
+	REQUIRE(info.bitmap_allocation_bytes == 0);
 	REQUIRE(info.false_positive_rate > MAX_FALSE_POSITIVE_RATE);
 	REQUIRE(analysis.active_buckets == info.active_buckets);
 	REQUIRE(analysis.false_positive_rate == Approx(info.false_positive_rate));
+	REQUIRE(ContainsKey(*filter, 63));
+	REQUIRE_FALSE(ContainsKey(*filter, 64));
 }
 
 TEST_CASE("Prefix range filter stops lossless compression at the cache target", "[optimizer][prefix_range_filter]") {
@@ -318,4 +340,40 @@ TEST_CASE("Prefix range filter reuses storage and right-sizes the retained bitma
 	REQUIRE(repeated_info.shift == info.shift);
 	REQUIRE(repeated_info.bitmap_allocation_bytes == info.bitmap_allocation_bytes);
 	REQUIRE(ContainsAllKeys(*filter, keys));
+}
+
+TEST_CASE("Prefix range filter masks a partial final word after reduction", "[optimizer][prefix_range_filter]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	const vector<int32_t> keys {0, 10000, 30000, 70000, 100000, 131072};
+	auto filter = BuildFinalizedInt32PrefixRangeFilter(*con.context, keys, 0, 131072, 0, 1.0);
+	const auto info = filter->GetCompressionInfo();
+	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::BITMAP);
+	REQUIRE(info.shift == 1);
+	REQUIRE(info.logical_bucket_count == 65537);
+	REQUIRE(info.active_buckets == keys.size());
+	REQUIRE(info.run_count == keys.size());
+	REQUIRE(ContainsAllKeys(*filter, keys));
+	REQUIRE_FALSE(ContainsKey(*filter, 131071));
+	REQUIRE(filter->LookupRange(Value::INTEGER(131071), Value::INTEGER(131071)) ==
+	        FilterPropagateResult::FILTER_ALWAYS_FALSE);
+}
+
+TEST_CASE("Prefix range filter bounds bitmap range scans", "[optimizer][prefix_range_filter]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto filter = BuildFinalizedInt32PrefixRangeFilter(*con.context, {0, 2, 4, 6, 8}, 0, 200000, 0, 0.0);
+	const auto info = filter->GetCompressionInfo();
+	REQUIRE(info.mode == PrefixRangeFilter::CompressionMode::BITMAP);
+	REQUIRE(info.shift == 0);
+
+	static constexpr int32_t LOWER_BOUND = 100 * 64;
+	static constexpr int32_t MAX_SCANNED_UPPER_BOUND = (100 + 2048) * 64 - 1;
+	static constexpr int32_t TOO_WIDE_UPPER_BOUND = (100 + 2049) * 64 - 1;
+	REQUIRE(filter->LookupRange(Value::INTEGER(LOWER_BOUND), Value::INTEGER(MAX_SCANNED_UPPER_BOUND)) ==
+	        FilterPropagateResult::FILTER_ALWAYS_FALSE);
+	REQUIRE(filter->LookupRange(Value::INTEGER(LOWER_BOUND), Value::INTEGER(TOO_WIDE_UPPER_BOUND)) ==
+	        FilterPropagateResult::NO_PRUNING_POSSIBLE);
 }

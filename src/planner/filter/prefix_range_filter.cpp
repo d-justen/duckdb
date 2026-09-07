@@ -93,7 +93,7 @@ public:
 		const auto word_idx = bit_idx >> WORD_SHIFT;
 		const auto mask = 1ULL << (bit_idx & WORD_MASK);
 		if (PARALLEL) {
-			// Shared build lanes are published only after every finalize task completes.
+			// Shared build lanes are published only after every prefix-range task completes.
 			auto &slot = *reinterpret_cast<atomic<uint64_t> *>(&state_bitmap[word_idx]);
 			slot.fetch_or(mask, std::memory_order_relaxed);
 		} else {
@@ -132,12 +132,16 @@ public:
 		base_active_buckets = current_metrics.active_buckets;
 		auto current_false_positive_rate = FalsePositiveRate(current_metrics.active_buckets, shift);
 		CacheAnalysis(current_metrics, current_false_positive_rate);
-		if (current_false_positive_rate > max_false_positive_rate || current_metrics.active_buckets == 0) {
+		if (current_metrics.active_buckets == 0) {
 			compression_finalized = true;
 			return Analyze();
 		}
 		if (current_metrics.HasExactRanges()) {
 			SetDirectRanges(current_metrics);
+			compression_finalized = true;
+			return Analyze();
+		}
+		if (current_false_positive_rate > max_false_positive_rate) {
 			compression_finalized = true;
 			return Analyze();
 		}
@@ -286,6 +290,9 @@ public:
 		const U ub_y = upper_bound - min;
 		const U ub_bit_idx = ub_y >> shift;
 		const auto ub_word_idx = ub_bit_idx >> WORD_SHIFT;
+		if (ub_word_idx - lb_word_idx >= MAX_RANGE_SCAN_WORDS) {
+			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
 
 		const idx_t lb_bit_off = UnsafeNumericCast<idx_t>(lb_bit_idx & UnsafeNumericCast<U>(WORD_MASK));
 		const idx_t ub_bit_off = UnsafeNumericCast<idx_t>(ub_bit_idx & UnsafeNumericCast<U>(WORD_MASK));
@@ -362,6 +369,7 @@ private:
 	static constexpr idx_t WORD_SHIFT = 6;
 	static constexpr idx_t WORD_MASK = 63;
 	static constexpr idx_t MAX_DIRECT_RANGES = 4;
+	static constexpr idx_t MAX_RANGE_SCAN_WORDS = 2048;
 	static constexpr idx_t BITMAP_CACHE_TARGET_BYTES = 16384;
 
 	enum class Mode : uint8_t { BITMAP, DIRECT_RANGES };
