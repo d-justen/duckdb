@@ -11,7 +11,7 @@ namespace {
 
 unique_ptr<PrefixRangeFilter> BuildInt32PrefixRangeFilter(ClientContext &context, const vector<int32_t> &keys,
                                                           int32_t min, int32_t max, idx_t shift,
-                                                          double max_false_positive_rate) {
+                                                          double max_false_positive_rate, bool compress = true) {
 	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::INTEGER);
 	PrefixRangeFilter::Sizing sizing;
 	REQUIRE(PrefixRangeFilter::TryComputeSpan(Value::INTEGER(min), Value::INTEGER(max), sizing.span));
@@ -27,7 +27,9 @@ unique_ptr<PrefixRangeFilter> BuildInt32PrefixRangeFilter(ClientContext &context
 	FlatVector::SetSize(key_vector, count_t(keys.size()));
 	filter->InsertKeys(key_vector, keys.size(), *state);
 	filter->MergeBuildState(*state);
-	filter->Compress(context, max_false_positive_rate);
+	if (compress) {
+		filter->Compress(context, max_false_positive_rate);
+	}
 	return filter;
 }
 
@@ -74,6 +76,47 @@ BaseStatistics Int32Statistics(int32_t min, int32_t max) {
 }
 
 } // namespace
+
+TEST_CASE("Prefix range filter can retain its original uncompressed bitmap", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, {100, 101, 102, 103}, 100, 199, 0, 0.001, false);
+	const auto info = filter->GetCompressionInfo();
+
+	REQUIRE(info.mode == CompressionMode::BITMAP);
+	REQUIRE(info.shift == 0);
+	REQUIRE(info.logical_bucket_count == 100);
+	REQUIRE(info.bitmap_allocation_bytes > 0);
+	REQUIRE(info.range_index_count == 0);
+	REQUIRE(ContainsKey(*filter, 100));
+	REQUIRE(ContainsKey(*filter, 103));
+	REQUIRE(!ContainsKey(*filter, 104));
+	REQUIRE(filter->LookupStatistics(Int32Statistics(100, 103)) == FilterPropagateResult::FILTER_ALWAYS_TRUE);
+	REQUIRE(filter->LookupStatistics(Int32Statistics(104, 199)) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
+}
+
+TEST_CASE("Uncompressed prefix range filter retains the fixed-size initial bitmap", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	static constexpr idx_t MAX_BUCKET_COUNT = 1 << 26;
+	PrefixRangeFilter::Sizing sizing;
+	REQUIRE(PrefixRangeFilter::TryComputeFixedSizeSizing(Value::INTEGER(0), Value::INTEGER(1 << 28),
+	                                                    MAX_BUCKET_COUNT, sizing));
+	REQUIRE(sizing.shift > 0);
+
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, {0, 1 << 27, 1 << 28}, 0, 1 << 28, sizing.shift, 0.001,
+	                                          false);
+	const auto info = filter->GetCompressionInfo();
+	REQUIRE(info.mode == CompressionMode::BITMAP);
+	REQUIRE(info.shift == sizing.shift);
+	REQUIRE(info.logical_bucket_count <= MAX_BUCKET_COUNT);
+	REQUIRE(info.range_index_count == 0);
+	REQUIRE(ContainsKey(*filter, 0));
+	REQUIRE(ContainsKey(*filter, 1 << 27));
+	REQUIRE(ContainsKey(*filter, 1 << 28));
+}
 
 TEST_CASE("Prefix range filter direct compression uses one range for contiguous values", "[optimizer]") {
 	DuckDB db(nullptr);

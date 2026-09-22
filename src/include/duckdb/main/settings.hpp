@@ -953,6 +953,16 @@ struct EnablePrefixRangeFilterSetting {
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
+struct EnablePrefixRangeFilterCompressionSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_prefix_range_filter_compression";
+	static constexpr const char *Description = "Whether prefix range filters may be compressed after construction";
+	static constexpr const char *InputType = "BOOLEAN";
+	static constexpr const char *DefaultValue = "true";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
 struct EnableProfilingSetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "enable_profiling";

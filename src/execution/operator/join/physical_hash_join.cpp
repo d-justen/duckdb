@@ -1135,6 +1135,7 @@ JoinFilterPushdownSettings JoinFilterPushdownInfo::GetSettings(const ClientConte
 	settings.enable_bloom_filter_row_group_pruning =
 	    Settings::Get<EnableJoinBloomFilterRowGroupPruningSetting>(context);
 	settings.enable_prefix_range_filter_pushdown = Settings::Get<EnablePrefixRangeFilterSetting>(context);
+	settings.enable_prefix_range_filter_compression = Settings::Get<EnablePrefixRangeFilterCompressionSetting>(context);
 	settings.enable_perfect_hash_join_filter_pushdown =
 	    Settings::Get<EnablePerfectHashJoinFilterPushdownSetting>(context);
 	return settings;
@@ -1305,10 +1306,12 @@ JoinFilterPushdownInfo::PlanSummaryFilters(const JoinFilterPushdownSettings &set
 	if (settings.enable_prefix_range_filter_pushdown) {
 		result.prefix_range_plan = PlanPrefixRangeFilter(context, ht, op, cmp, min, max);
 		if (result.prefix_range_plan.HasFilter()) {
-			result.type = result.prefix_range_plan.NeedsPostBuildAnalysis() &&
-			                      (settings.enable_bloom_filter_pushdown || settings.enable_min_max_filter_pushdown)
-			                  ? JoinFilterSummaryPlanType::PREFIX_RANGE_WITH_FALLBACKS
-			                  : JoinFilterSummaryPlanType::PREFIX_RANGE;
+			const auto use_fallbacks =
+			    settings.enable_prefix_range_filter_compression &&
+			    result.prefix_range_plan.NeedsPostBuildAnalysis() &&
+			    (settings.enable_bloom_filter_pushdown || settings.enable_min_max_filter_pushdown);
+			result.type = use_fallbacks ? JoinFilterSummaryPlanType::PREFIX_RANGE_WITH_FALLBACKS
+			                            : JoinFilterSummaryPlanType::PREFIX_RANGE;
 			return result;
 		}
 	}
@@ -1370,7 +1373,8 @@ void JoinFilterPushdownInfo::PushPerfectHashJoinFilter(const PhysicalOperator &o
 void JoinFilterPushdownInfo::RegisterPrefixRangeFilter(const JoinFilterPushdownFilter &info, ClientContext &context,
                                                        JoinHashTable &ht, const PhysicalOperator &op,
                                                        ProjectionIndex filter_col_idx, const Value &min_val,
-                                                       const Value &max_val, const PrefixRangeFilterPlan &plan) const {
+                                                       const Value &max_val, const PrefixRangeFilterPlan &plan,
+                                                       bool enable_compression) const {
 	D_ASSERT(plan.HasFilter());
 	const auto key_type = ht.conditions[0].GetLHS().GetReturnType();
 	if (!ht.GetPrefixRangeFilter()) {
@@ -1378,8 +1382,10 @@ void JoinFilterPushdownInfo::RegisterPrefixRangeFilter(const JoinFilterPushdownF
 		prefix_filter->Initialize(context, ht.Count(), min_val, max_val, plan.sizing);
 		ht.SetPrefixRangeFilter(std::move(prefix_filter));
 		ht.SetBuildPrefixRangeFilter();
-		static constexpr double PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD = 0.001;
-		ht.SetAnalyzePrefixRangeFilter(PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD);
+		if (enable_compression) {
+			static constexpr double PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD = 0.001;
+			ht.SetAnalyzePrefixRangeFilter(PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD);
+		}
 	}
 
 	const auto key_name = ht.conditions[0].GetRHS().ToString();
@@ -1558,12 +1564,14 @@ JoinFilterPushdownInfo::FinalizeFilters(ClientContext &context, const PhysicalCo
 			case JoinFilterSummaryPlanType::PREFIX_RANGE:
 				D_ASSERT(runtime_filter_ht);
 				RegisterPrefixRangeFilter(info, context, *runtime_filter_ht, op, filter_col_idx, min_val_before_cast,
-				                          max_val_before_cast, filter_plan.prefix_range_plan);
+				                          max_val_before_cast, filter_plan.prefix_range_plan,
+				                          settings.enable_prefix_range_filter_compression);
 				break;
 			case JoinFilterSummaryPlanType::PREFIX_RANGE_WITH_FALLBACKS:
 				D_ASSERT(runtime_filter_ht);
 				RegisterPrefixRangeFilter(info, context, *runtime_filter_ht, op, filter_col_idx, min_val_before_cast,
-				                          max_val_before_cast, filter_plan.prefix_range_plan);
+				                          max_val_before_cast, filter_plan.prefix_range_plan,
+				                          settings.enable_prefix_range_filter_compression);
 				if (settings.enable_bloom_filter_pushdown) {
 					PushBloomFilter(op, *runtime_filter_ht, info, filter_col_idx,
 					                settings.enable_bloom_filter_row_group_pruning, false);

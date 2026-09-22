@@ -631,6 +631,13 @@
         "default_value": "true"
     },
     {
+        "name": "enable_prefix_range_filter_compression",
+        "description": "Whether prefix range filters may be compressed after construction",
+        "type": "BOOLEAN",
+        "default_scope": "local",
+        "default_value": "true"
+    },
+    {
         "name": "enable_profiling",
         "description": "Enables profiling, and sets the output format (JSON, QUERY_TREE, QUERY_TREE_OPTIMIZER)",
         "type": "VARCHAR",

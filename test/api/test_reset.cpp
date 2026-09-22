@@ -61,6 +61,7 @@ OptionValueSet GetValueForOption(const string &name, const LogicalType &type) {
 	    {"enable_join_min_max_filter_pushdown", {Value(false)}},
 	    {"enable_perfect_hash_join_filter_pushdown", {Value(false)}},
 	    {"enable_prefix_range_filter", {Value(false)}},
+	    {"enable_prefix_range_filter_compression", {Value(false)}},
 	    {"old_implicit_casting", {Value(true)}},
 	    {"prefer_range_joins", {Value(true)}},
 	    {"variant_minimum_shredding_size", {Value::INTEGER(-1)}},

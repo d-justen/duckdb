@@ -1,0 +1,74 @@
+# name: test/sql/join/inner/test_prefix_range_filter_compression_setting.test
+# description: Test disabling prefix range filter compression and fallback generation
+# group: [inner]
+
+statement ok
+SET disabled_optimizers = 'join_order,build_side_probe_side';
+
+statement ok
+CREATE TABLE probe AS
+SELECT (i * 1000000000)::BIGINT AS k, (i % 7)::INTEGER AS g
+FROM range(0, 100000) t(i);
+
+statement ok
+CREATE TABLE build AS
+SELECT (i * 2000000000)::BIGINT AS k, (i % 7)::INTEGER AS g
+FROM range(0, 30000) t(i);
+
+# Compression performs post-build analysis for this approximate PRF and activates its Bloom fallback.
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN PRF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN BF\(k\).*
+
+statement ok
+SET enable_prefix_range_filter_compression=false
+
+# The uncompressed mode keeps the PRF but skips analysis and does not register the fallback.
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<REGEX>:.*IN PRF\(k\).*
+
+query II
+EXPLAIN ANALYZE
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+analyzed_plan	<!REGEX>:.*IN BF\(k\).*
+
+query I
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+17144
+
+statement ok
+RESET enable_prefix_range_filter_compression
+
