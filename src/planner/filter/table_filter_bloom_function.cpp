@@ -239,10 +239,10 @@ FilterPropagateResult BloomFilterScalarFun::FilterPrune(const FunctionStatistics
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
 	auto &data = input.bind_data->Cast<BloomFilterFunctionData>();
-	if (!data.allow_row_group_pruning) {
-		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-	}
 	if (!data.filter || !data.filter->IsInitialized()) {
+		return FilterPropagateResult::FILTER_ALWAYS_TRUE;
+	}
+	if (!data.allow_row_group_pruning) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
 
