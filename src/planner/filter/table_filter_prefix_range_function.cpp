@@ -140,6 +140,14 @@ public:
 		return LookupKeysBitmap<T, CONVERTER>(keys, result_sel, count);
 	}
 
+	template <typename T, typename CONVERTER>
+	idx_t LookupKeys(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel, idx_t count) const {
+		if (mode == Mode::DIRECT_RANGES) {
+			return LookupKeysDirect<T, CONVERTER>(keys, sel, result_sel, count);
+		}
+		return LookupKeysBitmap<T, CONVERTER>(keys, sel, result_sel, count);
+	}
+
 	FilterPropagateResult LookupRange(U lower_bound, U upper_bound) const {
 		if (mode == Mode::DIRECT_RANGES) {
 			auto covered_until = lower_bound;
@@ -392,6 +400,30 @@ private:
 	}
 
 	template <typename T, typename CONVERTER>
+	idx_t LookupKeysBitmap(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel, idx_t count) const {
+		UnifiedVectorFormat key_data;
+		keys.ToUnifiedFormat(key_data);
+		const auto key_values = UnifiedVectorFormat::GetData<T>(key_data);
+		idx_t found_count = 0;
+		for (idx_t i = 0; i < count; i++) {
+			const auto row_idx = sel.get_index_unsafe(i);
+			const auto key_idx = key_data.sel->get_index(row_idx);
+			if (!key_data.validity.RowIsValid(key_idx)) {
+				continue;
+			}
+			const U comparable = CONVERTER::Convert(key_values[key_idx]);
+			const U y = comparable - min;
+			const uint8_t in_range = y <= span;
+			const U bit_idx = ShiftRight(y, shift);
+			const uint32_t word_idx = (bit_idx >> WORD_SHIFT) & (0U - in_range);
+			const uint8_t bit = (bitmap[word_idx] >> (bit_idx & WORD_MASK)) & 1ULL;
+			result_sel.set_index(found_count, row_idx);
+			found_count += bit & in_range;
+		}
+		return found_count;
+	}
+
+	template <typename T, typename CONVERTER>
 	idx_t LookupKeysDirect(Vector &keys, SelectionVector &result_sel, idx_t count) const {
 		switch (range_count) {
 		case 1:
@@ -407,6 +439,22 @@ private:
 		}
 	}
 
+	template <typename T, typename CONVERTER>
+	idx_t LookupKeysDirect(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel, idx_t count) const {
+		switch (range_count) {
+		case 1:
+			return LookupKeysDirect<T, CONVERTER, 1>(keys, sel, result_sel, count);
+		case 2:
+			return LookupKeysDirect<T, CONVERTER, 2>(keys, sel, result_sel, count);
+		case 3:
+			return LookupKeysDirect<T, CONVERTER, 3>(keys, sel, result_sel, count);
+		case 4:
+			return LookupKeysDirect<T, CONVERTER, 4>(keys, sel, result_sel, count);
+		default:
+			return 0;
+		}
+	}
+
 	template <typename T, typename CONVERTER, idx_t RANGE_COUNT>
 	idx_t LookupKeysDirect(Vector &keys, SelectionVector &result_sel, idx_t count) const {
 		idx_t found_count = 0;
@@ -415,6 +463,26 @@ private:
 			const uint8_t bit = DirectRangeLookup<RANGE_COUNT>(comparable);
 
 			result_sel.set_index(found_count, entry.GetIndex());
+			found_count += bit;
+		}
+		return found_count;
+	}
+
+	template <typename T, typename CONVERTER, idx_t RANGE_COUNT>
+	idx_t LookupKeysDirect(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel, idx_t count) const {
+		UnifiedVectorFormat key_data;
+		keys.ToUnifiedFormat(key_data);
+		const auto key_values = UnifiedVectorFormat::GetData<T>(key_data);
+		idx_t found_count = 0;
+		for (idx_t i = 0; i < count; i++) {
+			const auto row_idx = sel.get_index_unsafe(i);
+			const auto key_idx = key_data.sel->get_index(row_idx);
+			if (!key_data.validity.RowIsValid(key_idx)) {
+				continue;
+			}
+			const U comparable = CONVERTER::Convert(key_values[key_idx]);
+			const uint8_t bit = DirectRangeLookup<RANGE_COUNT>(comparable);
+			result_sel.set_index(found_count, row_idx);
 			found_count += bit;
 		}
 		return found_count;
@@ -1018,6 +1086,14 @@ public:
 		return bitmap.template LookupKeys<T, NumericConverter<T>>(keys, result_sel, count);
 	}
 
+	idx_t LookupKeys(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel,
+	                 idx_t count) const override {
+		if (keys.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+			return bitmap.template LookupOne<T, NumericConverter<T>>(keys.GetValue(0)) ? count : 0;
+		}
+		return bitmap.template LookupKeys<T, NumericConverter<T>>(keys, sel, result_sel, count);
+	}
+
 	FilterPropagateResult LookupRange(const Value &lower_bound, const Value &upper_bound) const override {
 		const auto lb = lower_bound.GetValueUnsafe<T>();
 		const auto ub = upper_bound.GetValueUnsafe<T>();
@@ -1099,6 +1175,14 @@ public:
 			return bitmap.template LookupOne<string_t, StringPrefixConverter>(keys.GetValue(0)) ? count : 0;
 		}
 		return bitmap.template LookupKeys<string_t, StringPrefixConverter>(keys, result_sel, count);
+	}
+
+	idx_t LookupKeys(Vector &keys, const SelectionVector &sel, SelectionVector &result_sel,
+	                 idx_t count) const override {
+		if (keys.GetVectorType() == VectorType::CONSTANT_VECTOR) {
+			return bitmap.template LookupOne<string_t, StringPrefixConverter>(keys.GetValue(0)) ? count : 0;
+		}
+		return bitmap.template LookupKeys<string_t, StringPrefixConverter>(keys, sel, result_sel, count);
 	}
 
 	FilterPropagateResult LookupRange(const Value &lower_bound, const Value &upper_bound) const override {

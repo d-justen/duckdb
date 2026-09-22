@@ -13,6 +13,17 @@
 
 namespace duckdb {
 
+struct SelectionVector;
+class Vector;
+struct UnifiedVectorFormat;
+
+struct ExpressionFilterExecutor {
+	virtual ~ExpressionFilterExecutor() = default;
+
+	virtual idx_t FilterSelection(SelectionVector &sel, Vector &vector, UnifiedVectorFormat &vdata, idx_t scan_count,
+	                              idx_t &approved_tuple_count) = 0;
+};
+
 //! Thread-local state for executing a table filter
 struct TableFilterState {
 public:
@@ -37,6 +48,7 @@ public:
 struct ExpressionFilterState : public TableFilterState {
 public:
 	ExpressionFilterState(ClientContext &context, const Expression &expression);
+	~ExpressionFilterState() override;
 
 	ClientContext &GetContext() {
 		D_ASSERT(executor);
@@ -44,6 +56,7 @@ public:
 	}
 
 	unique_ptr<ExpressionExecutor> executor;
+	unique_ptr<ExpressionFilterExecutor> fast_executor;
 };
 
 } // namespace duckdb
