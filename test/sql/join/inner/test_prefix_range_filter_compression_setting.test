@@ -15,7 +15,7 @@ CREATE TABLE build AS
 SELECT (i * 2000000000)::BIGINT AS k, (i % 7)::INTEGER AS g
 FROM range(0, 30000) t(i);
 
-# Compression performs post-build analysis for this approximate PRF and activates its Bloom fallback.
+# Compression performs post-build analysis and registers a deferred Bloom fallback.
 query II
 EXPLAIN ANALYZE
 SELECT count(*)
@@ -35,6 +35,59 @@ JOIN build b
  AND p.g >= b.g;
 ----
 analyzed_plan	<REGEX>:.*IN BF\(k\).*
+
+query I
+SELECT count(*)
+FROM probe p
+JOIN build b
+  ON p.k = b.k
+ AND p.g >= b.g;
+----
+17144
+
+# The sparse range exceeds the PRF's FPR threshold. Bloom must be filled from
+# the original build hashes before hash-table finalization overwrites them.
+statement ok
+SET enable_perfect_hash_join_filter_pushdown=false
+
+statement ok
+SET enable_join_min_max_filter_pushdown=false
+
+statement ok
+CREATE TABLE sparse_probe AS
+SELECT (i * 1000000000)::BIGINT AS k FROM range(0, 200000) t(i)
+
+statement ok
+CREATE TABLE sparse_build AS
+SELECT (i * 2000000000)::BIGINT AS k FROM range(0, 100000) t(i)
+
+query I
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k = b.k
+----
+100000
+
+statement ok
+CREATE TABLE sparse_build_second AS
+SELECT (i * 2000000000)::BIGINT AS k FROM range(0, 100000) t(i)
+
+query I
+SELECT count(*)
+FROM sparse_probe p
+JOIN sparse_build b ON p.k = b.k
+JOIN sparse_build_second c ON p.k = c.k
+----
+100000
+
+statement ok
+SET enable_join_bloom_filter_pushdown=false
+
+query I
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k = b.k
+----
+100000
+
+statement ok
+RESET enable_join_bloom_filter_pushdown
 
 statement ok
 SET enable_prefix_range_filter_compression=false
@@ -72,3 +125,8 @@ JOIN build b
 statement ok
 RESET enable_prefix_range_filter_compression
 
+statement ok
+RESET enable_perfect_hash_join_filter_pushdown
+
+statement ok
+RESET enable_join_min_max_filter_pushdown

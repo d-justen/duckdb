@@ -828,6 +828,8 @@ static bool NeedsRuntimeJoinFilterBuild(const JoinHashTable &ht) {
 	return ht.ShouldBuildPrefixRangeFilter() || ht.ShouldBuildBloomFilter();
 }
 
+static void ScheduleHashJoinTableFinalize(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event);
+
 class HashJoinRuntimeFilterTask : public ExecutorTask {
 public:
 	HashJoinRuntimeFilterTask(HashJoinGlobalSinkState &sink_p, shared_ptr<Event> event_p, idx_t chunk_idx_from_p,
@@ -857,8 +859,10 @@ private:
 
 class HashJoinRuntimeFilterEvent : public BasePipelineEvent {
 public:
-	HashJoinRuntimeFilterEvent(Pipeline &pipeline_p, HashJoinGlobalSinkState &sink_p, bool build_bloom_filter_p = false)
-	    : BasePipelineEvent(pipeline_p), sink(sink_p), build_bloom_filter(build_bloom_filter_p) {
+	HashJoinRuntimeFilterEvent(Pipeline &pipeline_p, HashJoinGlobalSinkState &sink_p, bool build_bloom_filter_p = false,
+	                           bool finalize_hash_table_p = false)
+	    : BasePipelineEvent(pipeline_p), sink(sink_p), build_bloom_filter(build_bloom_filter_p),
+	      finalize_hash_table(finalize_hash_table_p) {
 	}
 
 	void Schedule() override {
@@ -890,9 +894,22 @@ public:
 		for (auto &prefix_range_state : prefix_range_states) {
 			sink.hash_table->MergePrefixRangeBuildState(*prefix_range_state);
 		}
-		if (!build_bloom_filter && sink.hash_table->AnalyzePrefixRangeFilter()) {
-			auto bloom_filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(*pipeline, sink, true);
-			this->InsertEvent(std::move(bloom_filter_event));
+		if (!build_bloom_filter) {
+			sink.hash_table->CompletePrefixRangeFilterBuild();
+		}
+		if (!build_bloom_filter && sink.hash_table->AnalyzePrefixRangeFilter() &&
+		    sink.hash_table->HasDeferredBloomFilter()) {
+			if (finalize_hash_table) {
+				// Finalization will insert the saved build hashes into Bloom before replacing them with chain pointers.
+				sink.hash_table->SetBuildBloomFilter(true);
+			} else {
+				auto bloom_filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(*pipeline, sink, true);
+				this->InsertEvent(std::move(bloom_filter_event));
+				return;
+			}
+		}
+		if (finalize_hash_table) {
+			ScheduleHashJoinTableFinalize(*pipeline, sink, *this);
 			return;
 		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
@@ -907,6 +924,7 @@ private:
 
 	HashJoinGlobalSinkState &sink;
 	bool build_bloom_filter;
+	bool finalize_hash_table;
 	vector<unique_ptr<PrefixRangeFilter::BuildState>> prefix_range_states;
 };
 
@@ -972,8 +990,8 @@ private:
 		for (auto &prefix_range_state : prefix_range_states) {
 			sink.hash_table->MergePrefixRangeBuildState(*prefix_range_state);
 		}
-		if (sink.hash_table->AnalyzePrefixRangeFilter()) {
-			sink.hash_table->BuildBloomFilter(0U, sink.hash_table->GetDataCollection().ChunkCount());
+		if (!prefix_range_states.empty()) {
+			sink.hash_table->CompletePrefixRangeFilterBuild();
 		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
 
@@ -994,24 +1012,34 @@ private:
 	vector<unique_ptr<PrefixRangeFilter::BuildState>> prefix_range_states;
 };
 
-void HashJoinGlobalSinkState::ScheduleFinalize(Pipeline &pipeline, Event &event) {
-	if (hash_table->Count() == 0) {
-		hash_table->finalized = true;
-		return;
-	}
-	hash_table->AllocatePointerTable();
+static void ScheduleHashJoinTableFinalize(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event) {
+	sink.hash_table->AllocatePointerTable();
 
-	auto new_init_event = make_shared_ptr<HashJoinTableInitEvent>(pipeline, *this);
-	if (FinalizeSingleThreaded(*this, false)) {
+	auto new_init_event = make_shared_ptr<HashJoinTableInitEvent>(pipeline, sink);
+	if (FinalizeSingleThreaded(sink, false)) {
 		new_init_event->ExecuteDirectly();
-		auto new_finalize_event = make_shared_ptr<HashJoinFinalizeEvent>(pipeline, *this);
+		auto new_finalize_event = make_shared_ptr<HashJoinFinalizeEvent>(pipeline, sink);
 		new_finalize_event->ExecuteDirectly();
 		return;
 	}
 	event.InsertEvent(new_init_event);
 
-	auto new_finalize_event = make_shared_ptr<HashJoinFinalizeEvent>(pipeline, *this);
+	auto new_finalize_event = make_shared_ptr<HashJoinFinalizeEvent>(pipeline, sink);
 	new_init_event->InsertEvent(std::move(new_finalize_event));
+}
+
+void HashJoinGlobalSinkState::ScheduleFinalize(Pipeline &pipeline, Event &event) {
+	if (hash_table->Count() == 0) {
+		hash_table->finalized = true;
+		return;
+	}
+	if (hash_table->ShouldAnalyzePrefixRangeFilter()) {
+		// Decide whether Bloom is needed while the stored build hashes are still available.
+		auto filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(pipeline, *this, false, true);
+		event.InsertEvent(std::move(filter_event));
+		return;
+	}
+	ScheduleHashJoinTableFinalize(pipeline, *this, event);
 }
 
 void HashJoinGlobalSinkState::InitializeProbeSpill() {
@@ -1335,7 +1363,11 @@ void JoinFilterPushdownInfo::PushBloomFilter(const PhysicalOperator &op, JoinHas
 	auto filters_null_values = !ht.NullValuesAreEqual(0);
 	const auto key_name = ht.conditions[0].GetRHS().ToString();
 	const auto key_type = ht.conditions[0].GetLHS().GetReturnType();
-	ht.SetBuildBloomFilter(build_immediately);
+	if (build_immediately) {
+		ht.SetBuildBloomFilter(true);
+	} else {
+		ht.RegisterDeferredBloomFilter();
+	}
 	float selectivity_threshold;
 	idx_t n_vectors_to_check;
 	GetThresholdAndVectorsToCheck(SelectivityOptionalFilterType::BF, selectivity_threshold, n_vectors_to_check);

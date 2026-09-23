@@ -222,7 +222,6 @@ public:
 	void BuildRuntimeJoinFilters(idx_t chunk_idx_from, idx_t chunk_idx_to,
 	                             optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state = nullptr,
 	                             bool build_bloom_filter = false);
-	void BuildBloomFilter(idx_t chunk_idx_from, idx_t chunk_idx_to);
 	//! Probe the HT with the given input chunk, resulting in the given result
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
 	           optional_ptr<Vector> precomputed_hashes = nullptr);
@@ -426,6 +425,7 @@ private:
 	//! Whether or not to use a bloom filter will be determined by the operator
 	BloomFilter bloom_filter;
 	bool should_build_bloom_filter = false;
+	bool deferred_bloom_filter_registered = false;
 
 	unique_ptr<PrefixRangeFilter> prefix_range_filter;
 	bool should_build_prefix_range_filter = false;
@@ -515,6 +515,12 @@ public:
 	bool ShouldBuildBloomFilter() const {
 		return should_build_bloom_filter;
 	}
+	void RegisterDeferredBloomFilter() {
+		deferred_bloom_filter_registered = true;
+	}
+	bool HasDeferredBloomFilter() const {
+		return deferred_bloom_filter_registered;
+	}
 	void EnsureBloomFilterInitialized() {
 		if (!bloom_filter.IsInitialized()) {
 			bloom_filter.Initialize(context, Count());
@@ -531,6 +537,9 @@ public:
 
 	void SetBuildPrefixRangeFilter() {
 		should_build_prefix_range_filter = true;
+	}
+	void CompletePrefixRangeFilterBuild() {
+		should_build_prefix_range_filter = false;
 	}
 
 	void SetAnalyzePrefixRangeFilter(double false_positive_rate_threshold) {

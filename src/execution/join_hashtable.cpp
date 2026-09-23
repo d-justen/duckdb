@@ -741,10 +741,6 @@ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataC
 	}
 }
 
-void JoinHashTable::BuildBloomFilter(idx_t chunk_idx_from, idx_t chunk_idx_to) {
-	BuildRuntimeJoinFilters(chunk_idx_from, chunk_idx_to, nullptr, true);
-}
-
 void JoinHashTable::BuildRuntimeJoinFilters(idx_t chunk_idx_from, idx_t chunk_idx_to,
                                             optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state,
                                             bool build_bloom_filter) {
@@ -1948,6 +1944,7 @@ void JoinHashTable::ResetForNewIterationSinglePartition() {
 	total_probe_matches = 0;
 	load_factor = DEFAULT_LOAD_FACTOR;
 	should_build_bloom_filter = false;
+	deferred_bloom_filter_registered = false;
 	prefix_range_filter.reset();
 	should_build_prefix_range_filter = false;
 	ResetCorrelatedMarkJoinInfo(*this);
