@@ -76,7 +76,6 @@ public:
 		range_count = 0;
 		homogeneous_word_runs.clear();
 		range_index_built = false;
-		base_active_buckets = 0;
 		current_active_buckets = 0;
 		current_run_count = 0;
 		current_run_count_is_exact = false;
@@ -232,12 +231,26 @@ public:
 		return {current_active_buckets, FalsePositiveRate(current_active_buckets, shift, current_active_buckets)};
 	}
 
-	PrefixRangeFilter::Analysis Compress(ClientContext &context, double max_false_positive_rate) {
+	PrefixRangeFilter::Analysis Compress(ClientContext &context, double max_false_positive_rate,
+	                                     idx_t distinct_count_estimate) {
 		if (!initialized || compression_finalized || mode != Mode::BITMAP || max_false_positive_rate < 0) {
 			return Analyze();
 		}
-		CompressBitmap(context, max_false_positive_rate);
+		CompressBitmap(context, max_false_positive_rate, distinct_count_estimate);
 		return Analyze();
+	}
+
+	unique_ptr<PrefixRangeFilter::ParallelCompressionState>
+	InitializeParallelCompression(ClientContext &context, double max_false_positive_rate, idx_t distinct_count_estimate,
+	                              idx_t max_tasks) {
+		// The first pass reads the original bitmap and writes one half its size. Below this size,
+		// scheduling tasks costs more than the reduction is likely to save.
+		if (!initialized || compression_finalized || mode != Mode::BITMAP || max_false_positive_rate < 0 ||
+		    logical_bucket_count <= 1 || max_tasks <= 1 || word_count * sizeof(uint64_t) < PARALLEL_MIN_BYTES) {
+			return nullptr;
+		}
+		return make_uniq<ParallelBitmapCompressionState>(*this, context, max_false_positive_rate,
+		                                                 distinct_count_estimate, max_tasks);
 	}
 
 	PrefixRangeFilter::CompressionInfo GetCompressionInfo() const {
@@ -269,6 +282,8 @@ private:
 	static constexpr idx_t WORD_MASK = 63;
 	static constexpr idx_t MAX_DIRECT_RANGES = 4;
 	static constexpr idx_t METRICS_BLOCK_WORDS = 64;
+	static constexpr idx_t PARALLEL_MIN_BYTES = 4 * 1024 * 1024;
+	static constexpr idx_t PARALLEL_TASK_DESTINATION_WORDS = 32768;
 	static constexpr idx_t BITMAP_CACHE_TARGET_BYTES = 16 * 1024;
 	static constexpr idx_t RANGE_SCAN_WORD_LIMIT = 2048;
 
@@ -314,6 +329,9 @@ private:
 
 	class BitmapMetricsBuilder {
 	public:
+		explicit BitmapMetricsBuilder(uint8_t previous_bit = 0) : previous_word_last_bit(previous_bit) {
+		}
+
 		template <bool ANALYZE_RUNS>
 		void PushWord(uint64_t word, idx_t valid_bits, idx_t word_base) {
 			const auto first_bit = static_cast<uint8_t>(word & 1ULL);
@@ -327,9 +345,9 @@ private:
 		}
 
 		template <bool ANALYZE_RUNS>
-		BitmapMetrics Finish() {
+		BitmapMetrics Finish(uint8_t next_bit = 0) {
 			if (has_pending) {
-				ConsumePending<ANALYZE_RUNS>(0);
+				ConsumePending<ANALYZE_RUNS>(next_bit);
 				has_pending = false;
 			}
 			metrics.run_count_is_exact = ANALYZE_RUNS;
@@ -611,22 +629,30 @@ private:
 		return covered_values;
 	}
 
-	double FalsePositiveRate(idx_t active_buckets_p, idx_t shift_p, idx_t positive_lower_bound_p) const {
-		return ConservativeFalsePositiveRate(CoveredValues(active_buckets_p, shift_p), positive_lower_bound_p);
+	idx_t PositiveCountEstimate(idx_t active_buckets, idx_t shift_p, idx_t distinct_count_estimate) const {
+		idx_t covered_values;
+		if (Uhugeint::TryCast(CoveredValues(active_buckets, shift_p), covered_values)) {
+			distinct_count_estimate = MinValue(distinct_count_estimate, covered_values);
+		}
+		return MaxValue(active_buckets, distinct_count_estimate);
 	}
 
-	double ConservativeFalsePositiveRate(uhugeint_t covered_values, idx_t positive_lower_bound_p) const {
+	double FalsePositiveRate(idx_t active_buckets_p, idx_t shift_p, idx_t positive_count_p) const {
+		return DomainFalsePositiveRate(CoveredValues(active_buckets_p, shift_p), positive_count_p);
+	}
+
+	double DomainFalsePositiveRate(uhugeint_t covered_values, idx_t positive_count_p) const {
 		const auto domain_size = Uhugeint::Convert(span) + 1;
 		if (Uhugeint::GreaterThan(covered_values, domain_size)) {
 			covered_values = domain_size;
 		}
-		const auto positive_lower_bound = Uhugeint::Convert(positive_lower_bound_p);
-		if (Uhugeint::LessThanEquals(domain_size, positive_lower_bound) ||
-		    Uhugeint::LessThanEquals(covered_values, positive_lower_bound)) {
+		const auto positive_count = Uhugeint::Convert(positive_count_p);
+		if (Uhugeint::LessThanEquals(domain_size, positive_count) ||
+		    Uhugeint::LessThanEquals(covered_values, positive_count)) {
 			return 0;
 		}
-		const auto false_positives = covered_values - positive_lower_bound;
-		const auto negative_values = domain_size - positive_lower_bound;
+		const auto false_positives = covered_values - positive_count;
+		const auto negative_values = domain_size - positive_count;
 		return Uhugeint::Cast<double>(false_positives) / Uhugeint::Cast<double>(negative_values);
 	}
 
@@ -737,64 +763,84 @@ private:
 	template <bool ANALYZE_SOURCE>
 	DyadicPassResult AnalyzeAndReduceBitmap(const uint64_t *source, idx_t source_word_count,
 	                                        idx_t source_logical_bucket_count, uint64_t *destination,
-	                                        idx_t destination_word_count) const {
+	                                        idx_t destination_word_count, idx_t destination_word_begin = 0,
+	                                        idx_t destination_word_end = DConstants::INVALID_INDEX) const {
 		const auto destination_logical_bucket_count = (source_logical_bucket_count + 1) >> 1;
 		D_ASSERT(destination_word_count == ((destination_logical_bucket_count + 63) >> WORD_SHIFT));
+		if (destination_word_end == DConstants::INVALID_INDEX) {
+			destination_word_end = destination_word_count;
+		}
+		D_ASSERT(destination_word_begin < destination_word_end && destination_word_end <= destination_word_count);
 
-		BitmapMetricsBuilder source_builder;
-		BitmapMetricsBuilder destination_builder;
+		// Feed the boundary bits from the immutable source to each stripe. Thus starts and ends
+		// crossing a task boundary are counted exactly once, without inspecting concurrent writes.
+		auto source_bit = [&](idx_t bit_idx) -> uint8_t {
+			return bit_idx < source_logical_bucket_count
+			           ? static_cast<uint8_t>((source[bit_idx >> WORD_SHIFT] >> (bit_idx & WORD_MASK)) & 1ULL)
+			           : 0;
+		};
+		auto destination_bit = [&](idx_t bit_idx) -> uint8_t {
+			return bit_idx < destination_logical_bucket_count
+			           ? static_cast<uint8_t>(source_bit(bit_idx * 2) | source_bit(bit_idx * 2 + 1))
+			           : 0;
+		};
+		const auto first_destination_bit = destination_word_begin << WORD_SHIFT;
+		const auto after_destination_bit = destination_word_end << WORD_SHIFT;
+		const auto previous_source_bit = first_destination_bit ? source_bit(first_destination_bit * 2 - 1) : 0;
+		const auto previous_destination_bit = first_destination_bit ? destination_bit(first_destination_bit - 1) : 0;
+
+		BitmapMetricsBuilder source_builder(previous_source_bit);
+		BitmapMetricsBuilder destination_builder(previous_destination_bit);
 		bool analyze_source_runs = ANALYZE_SOURCE;
 		bool analyze_destination_runs = true;
-		for (idx_t destination_word_begin = 0; destination_word_begin < destination_word_count;
-		     destination_word_begin += METRICS_BLOCK_WORDS) {
-			const auto destination_word_end =
-			    MinValue<idx_t>(destination_word_begin + METRICS_BLOCK_WORDS, destination_word_count);
+		for (idx_t block_begin = destination_word_begin; block_begin < destination_word_end;
+		     block_begin += METRICS_BLOCK_WORDS) {
+			const auto block_end = MinValue<idx_t>(block_begin + METRICS_BLOCK_WORDS, destination_word_end);
 			if constexpr (ANALYZE_SOURCE) {
 				if (analyze_source_runs) {
 					if (analyze_destination_runs) {
 						AnalyzeAndReduceBlock<true, true, true>(source, source_word_count, source_logical_bucket_count,
 						                                        destination, destination_logical_bucket_count,
-						                                        destination_word_begin, destination_word_end,
-						                                        source_builder, destination_builder);
+						                                        block_begin, block_end, source_builder,
+						                                        destination_builder);
 					} else {
 						AnalyzeAndReduceBlock<true, true, false>(source, source_word_count, source_logical_bucket_count,
 						                                         destination, destination_logical_bucket_count,
-						                                         destination_word_begin, destination_word_end,
-						                                         source_builder, destination_builder);
+						                                         block_begin, block_end, source_builder,
+						                                         destination_builder);
 					}
 				} else if (analyze_destination_runs) {
 					AnalyzeAndReduceBlock<true, false, true>(source, source_word_count, source_logical_bucket_count,
-					                                         destination, destination_logical_bucket_count,
-					                                         destination_word_begin, destination_word_end,
-					                                         source_builder, destination_builder);
+					                                         destination, destination_logical_bucket_count, block_begin,
+					                                         block_end, source_builder, destination_builder);
 				} else {
-					AnalyzeAndReduceBlock<true, false, false>(source, source_word_count, source_logical_bucket_count,
-					                                          destination, destination_logical_bucket_count,
-					                                          destination_word_begin, destination_word_end,
-					                                          source_builder, destination_builder);
+					AnalyzeAndReduceBlock<true, false, false>(
+					    source, source_word_count, source_logical_bucket_count, destination,
+					    destination_logical_bucket_count, block_begin, block_end, source_builder, destination_builder);
 				}
 				analyze_source_runs &= source_builder.RunCount() <= MAX_DIRECT_RANGES;
 			} else if (analyze_destination_runs) {
 				AnalyzeAndReduceBlock<false, false, true>(source, source_word_count, source_logical_bucket_count,
-				                                          destination, destination_logical_bucket_count,
-				                                          destination_word_begin, destination_word_end, source_builder,
-				                                          destination_builder);
+				                                          destination, destination_logical_bucket_count, block_begin,
+				                                          block_end, source_builder, destination_builder);
 			} else {
 				AnalyzeAndReduceBlock<false, false, false>(source, source_word_count, source_logical_bucket_count,
-				                                           destination, destination_logical_bucket_count,
-				                                           destination_word_begin, destination_word_end, source_builder,
-				                                           destination_builder);
+				                                           destination, destination_logical_bucket_count, block_begin,
+				                                           block_end, source_builder, destination_builder);
 			}
 			analyze_destination_runs &= destination_builder.RunCount() <= MAX_DIRECT_RANGES;
 		}
 
 		DyadicPassResult result;
 		if constexpr (ANALYZE_SOURCE) {
-			result.source =
-			    analyze_source_runs ? source_builder.template Finish<true>() : source_builder.template Finish<false>();
+			const auto next_source_bit = source_bit(after_destination_bit * 2);
+			result.source = analyze_source_runs ? source_builder.template Finish<true>(next_source_bit)
+			                                    : source_builder.template Finish<false>(next_source_bit);
 		}
-		result.destination = analyze_destination_runs ? destination_builder.template Finish<true>()
-		                                              : destination_builder.template Finish<false>();
+		const auto next_destination_bit = destination_bit(after_destination_bit);
+		result.destination = analyze_destination_runs
+		                         ? destination_builder.template Finish<true>(next_destination_bit)
+		                         : destination_builder.template Finish<false>(next_destination_bit);
 		return result;
 	}
 
@@ -888,7 +934,7 @@ private:
 		}
 	}
 
-	void CompressBitmap(ClientContext &context, double max_false_positive_rate) {
+	void CompressBitmap(ClientContext &context, double max_false_positive_rate, idx_t distinct_count_estimate) {
 		BitmapStorage current;
 		current.data = std::move(buf_);
 		current.bitmap = bitmap;
@@ -899,6 +945,7 @@ private:
 		auto current_logical_buckets = logical_bucket_count;
 		auto current_shift = shift;
 		BitmapMetrics current_metrics;
+		idx_t positive_count_estimate = 0;
 
 		BitmapStorage scratch;
 		if (current_logical_buckets > 1) {
@@ -909,9 +956,10 @@ private:
 			                                                     scratch.bitmap, next_words);
 			current_metrics = first_pass.source;
 
-			base_active_buckets = current_metrics.active_buckets;
+			positive_count_estimate =
+			    PositiveCountEstimate(current_metrics.active_buckets, current_shift, distinct_count_estimate);
 			const auto initial_false_positive_rate =
-			    FalsePositiveRate(current_metrics.active_buckets, current_shift, base_active_buckets);
+			    FalsePositiveRate(current_metrics.active_buckets, current_shift, positive_count_estimate);
 			SetCachedAnalysis(current_metrics, initial_false_positive_rate);
 			if (initial_false_positive_rate > max_false_positive_rate) {
 				compression_finalized = true;
@@ -935,7 +983,7 @@ private:
 			while (true) {
 				const auto candidate_shift = current_shift + 1;
 				const auto candidate_false_positive_rate =
-				    FalsePositiveRate(candidate_metrics.active_buckets, candidate_shift, base_active_buckets);
+				    FalsePositiveRate(candidate_metrics.active_buckets, candidate_shift, positive_count_estimate);
 				const auto current_covered_values = CoveredValues(current_metrics.active_buckets, current_shift);
 				if (!ShouldAcceptDyadicLevel(current_words, candidate_metrics, candidate_shift,
 				                             candidate_false_positive_rate, current_covered_values,
@@ -971,9 +1019,10 @@ private:
 			}
 		} else {
 			current_metrics = AnalyzeBitmap(current.bitmap, current_words, current_logical_buckets);
-			base_active_buckets = current_metrics.active_buckets;
+			positive_count_estimate =
+			    PositiveCountEstimate(current_metrics.active_buckets, current_shift, distinct_count_estimate);
 			const auto initial_false_positive_rate =
-			    FalsePositiveRate(current_metrics.active_buckets, current_shift, base_active_buckets);
+			    FalsePositiveRate(current_metrics.active_buckets, current_shift, positive_count_estimate);
 			SetCachedAnalysis(current_metrics, initial_false_positive_rate);
 			if (initial_false_positive_rate <= max_false_positive_rate && current_metrics.HasExactRanges()) {
 				SetDirectRanges(current_metrics, current);
@@ -992,6 +1041,172 @@ private:
 		compression_finalized = true;
 	}
 
+	class ParallelBitmapCompressionState final : public PrefixRangeFilter::ParallelCompressionState {
+	public:
+		ParallelBitmapCompressionState(PrefixRangeBitmap &owner_p, ClientContext &context_p,
+		                               double max_false_positive_rate_p, idx_t distinct_count_estimate_p,
+		                               idx_t max_tasks_p)
+		    : owner(owner_p), context(context_p), max_false_positive_rate(max_false_positive_rate_p),
+		      distinct_count_estimate(distinct_count_estimate_p), max_tasks(max_tasks_p),
+		      current_words(owner.word_count), current_logical_buckets(owner.logical_bucket_count),
+		      current_shift(owner.shift) {
+			current.data = std::move(owner.buf_);
+			current.bitmap = owner.bitmap;
+			current.word_capacity = current_words;
+			owner.bitmap = nullptr;
+			PreparePass();
+		}
+
+		idx_t TaskCount() const override {
+			return results.size();
+		}
+
+		void ExecuteTask(idx_t task_idx) override {
+			D_ASSERT(task_idx < TaskCount());
+			const auto begin = task_idx * words_per_task;
+			const auto end = MinValue<idx_t>(begin + words_per_task, next_words);
+			if (first_pass) {
+				results[task_idx] = owner.template AnalyzeAndReduceBitmap<true>(
+				    current.bitmap, current_words, current_logical_buckets, scratch.bitmap, next_words, begin, end);
+			} else {
+				results[task_idx] = owner.template AnalyzeAndReduceBitmap<false>(
+				    current.bitmap, current_words, current_logical_buckets, scratch.bitmap, next_words, begin, end);
+			}
+		}
+
+		bool FinishPass() override {
+			if (first_pass) {
+				current_metrics = MergeMetrics(true);
+				positive_count_estimate =
+				    owner.PositiveCountEstimate(current_metrics.active_buckets, current_shift, distinct_count_estimate);
+				const auto initial_fpr =
+				    owner.FalsePositiveRate(current_metrics.active_buckets, current_shift, positive_count_estimate);
+				owner.SetCachedAnalysis(current_metrics, initial_fpr);
+				if (initial_fpr > max_false_positive_rate) {
+					owner.compression_finalized = true;
+					owner.SetBitmapStorage(context, current, scratch);
+					return false;
+				}
+				if (current_metrics.active_buckets == 0) {
+					FinishBitmap();
+					return false;
+				}
+				if (current_metrics.HasExactRanges()) {
+					FinishDirectRanges();
+					return false;
+				}
+				first_pass = false;
+			}
+
+			const auto candidate = MergeMetrics(false);
+			const auto candidate_shift = current_shift + 1;
+			const auto candidate_fpr =
+			    owner.FalsePositiveRate(candidate.active_buckets, candidate_shift, positive_count_estimate);
+			const auto covered_values = owner.CoveredValues(current_metrics.active_buckets, current_shift);
+			if (!owner.ShouldAcceptDyadicLevel(current_words, candidate, candidate_shift, candidate_fpr, covered_values,
+			                                   max_false_positive_rate)) {
+				FinishBitmap();
+				return false;
+			}
+
+			std::swap(current, scratch);
+			current_words = next_words;
+			current_logical_buckets = next_logical_buckets;
+			current_shift = candidate_shift;
+			current_metrics = candidate;
+			owner.word_count = current_words;
+			owner.logical_bucket_count = current_logical_buckets;
+			owner.shift = current_shift;
+			owner.SetCachedAnalysis(current_metrics, candidate_fpr);
+			if (current_metrics.HasExactRanges()) {
+				FinishDirectRanges();
+				return false;
+			}
+			if (current_logical_buckets <= 1) {
+				FinishBitmap();
+				return false;
+			}
+			PreparePass();
+			return true;
+		}
+
+		PrefixRangeFilter::Analysis GetAnalysis() const override {
+			D_ASSERT(owner.compression_finalized);
+			return owner.Analyze();
+		}
+
+	private:
+		static void AppendPositions(const BitmapMetrics &part, BitmapMetrics &combined) {
+			for (idx_t i = 0; i < part.recorded_starts && combined.recorded_starts < MAX_DIRECT_RANGES; i++) {
+				combined.run_starts[combined.recorded_starts++] = part.run_starts[i];
+			}
+			for (idx_t i = 0; i < part.recorded_ends && combined.recorded_ends < MAX_DIRECT_RANGES; i++) {
+				combined.run_ends[combined.recorded_ends++] = part.run_ends[i];
+			}
+		}
+
+		BitmapMetrics MergeMetrics(bool source) const {
+			BitmapMetrics combined;
+			for (const auto &result : results) {
+				const auto &part = source ? result.source : result.destination;
+				combined.active_buckets += part.active_buckets;
+				combined.run_count += part.run_count;
+				combined.run_count_is_exact &= part.run_count_is_exact;
+				AppendPositions(part, combined);
+			}
+			return combined;
+		}
+
+		void PreparePass() {
+			next_logical_buckets = (current_logical_buckets + 1) >> 1;
+			next_words = (next_logical_buckets + 63) >> WORD_SHIFT;
+			if (!scratch.bitmap) {
+				scratch = owner.AllocateBitmapStorage(context, next_words);
+			} else {
+				D_ASSERT(scratch.word_capacity >= next_words);
+			}
+			const auto ideal_words_per_task = (next_words + max_tasks - 1) / max_tasks;
+			words_per_task = MaxValue<idx_t>(PARALLEL_TASK_DESTINATION_WORDS,
+			                                 ((ideal_words_per_task + METRICS_BLOCK_WORDS - 1) / METRICS_BLOCK_WORDS) *
+			                                     METRICS_BLOCK_WORDS);
+			results.resize((next_words + words_per_task - 1) / words_per_task);
+		}
+
+		void FinishBitmap() {
+			owner.word_count = current_words;
+			owner.logical_bucket_count = current_logical_buckets;
+			owner.shift = current_shift;
+			owner.mode = Mode::BITMAP;
+			owner.range_count = 0;
+			owner.SetBitmapStorage(context, current, scratch);
+			owner.BuildHomogeneousWordRunIndex();
+			owner.compression_finalized = true;
+		}
+
+		void FinishDirectRanges() {
+			owner.SetDirectRanges(current_metrics, current);
+			owner.compression_finalized = true;
+		}
+
+		PrefixRangeBitmap &owner;
+		ClientContext &context;
+		double max_false_positive_rate;
+		idx_t distinct_count_estimate;
+		idx_t max_tasks;
+		BitmapStorage current;
+		BitmapStorage scratch;
+		idx_t current_words;
+		idx_t current_logical_buckets;
+		idx_t current_shift;
+		idx_t next_words = 0;
+		idx_t next_logical_buckets = 0;
+		idx_t words_per_task = 0;
+		idx_t positive_count_estimate = 0;
+		BitmapMetrics current_metrics;
+		vector<DyadicPassResult> results;
+		bool first_pass = true;
+	};
+
 	bool initialized = false;
 	Mode mode = Mode::BITMAP;
 	U min;
@@ -999,7 +1214,6 @@ private:
 	idx_t shift;
 	idx_t logical_bucket_count;
 	idx_t word_count;
-	idx_t base_active_buckets = 0;
 	idx_t current_active_buckets = 0;
 	idx_t current_run_count = 0;
 	bool current_run_count_is_exact = false;
@@ -1133,8 +1347,16 @@ public:
 		return bitmap.Analyze();
 	}
 
-	Analysis Compress(ClientContext &context, double max_false_positive_rate) override {
-		return bitmap.Compress(context, max_false_positive_rate);
+	Analysis Compress(ClientContext &context, double max_false_positive_rate, idx_t distinct_count_estimate) override {
+		return bitmap.Compress(context, max_false_positive_rate, distinct_count_estimate);
+	}
+
+	unique_ptr<ParallelCompressionState> InitializeParallelCompression(ClientContext &context,
+	                                                                   double max_false_positive_rate,
+	                                                                   idx_t distinct_count_estimate,
+	                                                                   idx_t max_tasks) override {
+		return bitmap.InitializeParallelCompression(context, max_false_positive_rate, distinct_count_estimate,
+		                                            max_tasks);
 	}
 
 	CompressionInfo GetCompressionInfo() const override {
@@ -1240,8 +1462,16 @@ public:
 		return bitmap.Analyze();
 	}
 
-	Analysis Compress(ClientContext &context, double max_false_positive_rate) override {
-		return bitmap.Compress(context, max_false_positive_rate);
+	Analysis Compress(ClientContext &context, double max_false_positive_rate, idx_t) override {
+		// Distinct full strings can still have the same PRF prefix.
+		return bitmap.Compress(context, max_false_positive_rate, 0);
+	}
+
+	unique_ptr<ParallelCompressionState> InitializeParallelCompression(ClientContext &context,
+	                                                                   double max_false_positive_rate, idx_t,
+	                                                                   idx_t max_tasks) override {
+		// Distinct full strings can still have the same PRF prefix.
+		return bitmap.InitializeParallelCompression(context, max_false_positive_rate, 0, max_tasks);
 	}
 
 	CompressionInfo GetCompressionInfo() const override {

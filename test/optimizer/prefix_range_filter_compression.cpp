@@ -11,7 +11,8 @@ namespace {
 
 unique_ptr<PrefixRangeFilter> BuildInt32PrefixRangeFilter(ClientContext &context, const vector<int32_t> &keys,
                                                           int32_t min, int32_t max, idx_t shift,
-                                                          double max_false_positive_rate, bool compress = true) {
+                                                          double max_false_positive_rate, bool compress = true,
+                                                          idx_t distinct_count_estimate = 0, idx_t parallel_tasks = 0) {
 	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::INTEGER);
 	PrefixRangeFilter::Sizing sizing;
 	REQUIRE(PrefixRangeFilter::TryComputeSpan(Value::INTEGER(min), Value::INTEGER(max), sizing.span));
@@ -28,7 +29,18 @@ unique_ptr<PrefixRangeFilter> BuildInt32PrefixRangeFilter(ClientContext &context
 	filter->InsertKeys(key_vector, keys.size(), *state);
 	filter->MergeBuildState(*state);
 	if (compress) {
-		filter->Compress(context, max_false_positive_rate);
+		if (parallel_tasks) {
+			auto compression = filter->InitializeParallelCompression(context, max_false_positive_rate,
+			                                                         distinct_count_estimate, parallel_tasks);
+			REQUIRE(compression);
+			do {
+				for (idx_t task_idx = 0; task_idx < compression->TaskCount(); task_idx++) {
+					compression->ExecuteTask(task_idx);
+				}
+			} while (compression->FinishPass());
+		} else {
+			filter->Compress(context, max_false_positive_rate, distinct_count_estimate);
+		}
 	}
 	return filter;
 }
@@ -76,6 +88,41 @@ BaseStatistics Int32Statistics(int32_t min, int32_t max) {
 }
 
 } // namespace
+
+TEST_CASE("Parallel prefix range compression matches serial across task boundaries", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	const int32_t maximum = (1 << 26) - 59; // Partial final words, with 8 MiB of bitmap storage.
+	vector<vector<int32_t>> key_sets = {{0, 1, 2, 16777214, 16777215, 16777216, 16777217, 33554431, maximum},
+	                                    {16777214, 16777215, 16777216, 16777217, 16777218, maximum},
+	                                    {0, 16777215, 16777217, 33554431, 33554433, 50331647, maximum}};
+	for (const auto &keys : key_sets) {
+		for (const auto threshold : {1.0, 0.001, 0.000001}) {
+			auto serial = BuildInt32PrefixRangeFilter(*con.context, keys, 0, maximum, 0, threshold);
+			auto parallel = BuildInt32PrefixRangeFilter(*con.context, keys, 0, maximum, 0, threshold, true, 0, 4);
+			const auto serial_info = serial->GetCompressionInfo();
+			const auto parallel_info = parallel->GetCompressionInfo();
+			REQUIRE(parallel_info.mode == serial_info.mode);
+			REQUIRE(parallel_info.shift == serial_info.shift);
+			REQUIRE(parallel_info.range_count == serial_info.range_count);
+			REQUIRE(parallel_info.active_buckets == serial_info.active_buckets);
+			REQUIRE(parallel_info.run_count == serial_info.run_count);
+			REQUIRE(parallel_info.logical_bucket_count == serial_info.logical_bucket_count);
+			REQUIRE(parallel_info.range_index_count == serial_info.range_index_count);
+			REQUIRE(parallel_info.false_positive_rate == Approx(serial_info.false_positive_rate));
+			for (const auto key : keys) {
+				REQUIRE(ContainsKey(*parallel, key));
+			}
+			for (int32_t key = 0; key <= maximum; key += 12731) {
+				REQUIRE(ContainsKey(*parallel, key) == ContainsKey(*serial, key));
+			}
+			for (const int32_t begin : {0, 16777210, maximum - 63}) {
+				const auto range = Int32Statistics(begin, MinValue<int32_t>(begin + 63, maximum));
+				REQUIRE(parallel->LookupStatistics(range) == serial->LookupStatistics(range));
+			}
+		}
+	}
+}
 
 TEST_CASE("Prefix range filter can retain its original uncompressed bitmap", "[optimizer]") {
 	DuckDB db(nullptr);
@@ -225,6 +272,36 @@ TEST_CASE("Prefix range filter rejects an initially oversized FPR before compres
 	REQUIRE(info.false_positive_rate > MAX_FALSE_POSITIVE_RATE);
 	REQUIRE(analysis.active_buckets == info.active_buckets);
 	REQUIRE(analysis.false_positive_rate == Approx(info.false_positive_rate));
+}
+
+TEST_CASE("Prefix range filter uses a distinct-count estimate for its FPR decision", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	const vector<int32_t> keys = {0, 1, 2, 3, 512, 513, 514, 515};
+	static constexpr double MAX_FALSE_POSITIVE_RATE = 0.001;
+	auto conservative = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 1023, 2, MAX_FALSE_POSITIVE_RATE);
+	auto estimated = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 1023, 2, MAX_FALSE_POSITIVE_RATE, true, 8);
+
+	REQUIRE(conservative->Analyze().active_buckets == 2);
+	REQUIRE(conservative->Analyze().false_positive_rate > MAX_FALSE_POSITIVE_RATE);
+	REQUIRE(estimated->Analyze().active_buckets == 2);
+	REQUIRE(estimated->Analyze().false_positive_rate == Approx(0.0));
+	REQUIRE(estimated->GetCompressionInfo().false_positive_rate == Approx(0.0));
+	for (const auto key : keys) {
+		REQUIRE(ContainsKey(*estimated, key));
+	}
+	REQUIRE(!ContainsKey(*estimated, 4));
+
+	const vector<int32_t> dyadic_keys = {0, 1, 4, 5, 8, 9, 12, 13, 16, 17};
+	auto conservative_dyadic = BuildInt32PrefixRangeFilter(*con.context, dyadic_keys, 0, 127, 1, 0.09);
+	auto estimated_dyadic = BuildInt32PrefixRangeFilter(*con.context, dyadic_keys, 0, 127, 1, 0.09, true, 10);
+	REQUIRE(conservative_dyadic->GetCompressionInfo().mode == CompressionMode::BITMAP);
+	REQUIRE(estimated_dyadic->GetCompressionInfo().mode == CompressionMode::DIRECT_RANGES);
+	REQUIRE(estimated_dyadic->GetCompressionInfo().false_positive_rate <= 0.09);
+	for (const auto key : dyadic_keys) {
+		REQUIRE(ContainsKey(*estimated_dyadic, key));
+	}
 }
 
 TEST_CASE("Prefix range filter dyadic analysis preserves original positive lower bound", "[optimizer]") {

@@ -1,0 +1,65 @@
+# name: test/sql/join/inner/test_prefix_range_filter_parallel_compression.test
+# description: Parallel PRF compression preserves join results across large bitmap stripes
+# group: [inner]
+
+statement ok
+SET threads=4
+
+statement ok
+SET disabled_optimizers='join_order,build_side_probe_side'
+
+statement ok
+SET enable_perfect_hash_join_filter_pushdown=false
+
+statement ok
+SET enable_join_bloom_filter_pushdown=false
+
+statement ok
+SET enable_join_min_max_filter_pushdown=false
+
+# The initial bitmap spans almost 8 MiB, across several compression tasks.
+statement ok
+CREATE TABLE prf_parallel_build AS
+SELECT i::INTEGER k FROM range(50000) t(i)
+UNION ALL
+SELECT (i + 66500000)::INTEGER k FROM range(50000) t(i)
+
+statement ok
+CREATE TABLE prf_parallel_probe AS
+SELECT k FROM prf_parallel_build
+UNION ALL
+SELECT (k + 500000)::INTEGER k FROM prf_parallel_build
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM prf_parallel_probe p JOIN prf_parallel_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*IN PRF\(k\).*
+
+query I
+SELECT count(*) FROM prf_parallel_probe p JOIN prf_parallel_build b ON p.k=b.k
+----
+100000
+
+# Five separated runs force several accepted dyadic passes before the serial-size cutoff.
+statement ok
+CREATE TABLE prf_parallel_multilevel_build AS
+SELECT (cluster * 16000000 + i)::INTEGER k FROM range(5) c(cluster), range(1000) t(i)
+
+statement ok
+CREATE TABLE prf_parallel_multilevel_probe AS
+SELECT k FROM prf_parallel_multilevel_build
+UNION ALL
+SELECT (k + 500000)::INTEGER k FROM prf_parallel_multilevel_build
+
+query I
+SELECT count(*) FROM prf_parallel_multilevel_probe p JOIN prf_parallel_multilevel_build b ON p.k=b.k
+----
+5000
+
+statement ok
+SET enable_prefix_range_filter_compression=false
+
+query I
+SELECT count(*) FROM prf_parallel_probe p JOIN prf_parallel_build b ON p.k=b.k
+----
+100000

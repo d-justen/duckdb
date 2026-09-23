@@ -431,6 +431,7 @@ private:
 	bool should_build_prefix_range_filter = false;
 	bool should_analyze_prefix_range_filter = false;
 	double prefix_range_filter_false_positive_rate_threshold = 0.0;
+	idx_t prefix_range_filter_distinct_count_estimate = 0;
 
 	//! Copying not allowed
 	JoinHashTable(const JoinHashTable &) = delete;
@@ -542,9 +543,10 @@ public:
 		should_build_prefix_range_filter = false;
 	}
 
-	void SetAnalyzePrefixRangeFilter(double false_positive_rate_threshold) {
+	void SetAnalyzePrefixRangeFilter(double false_positive_rate_threshold, idx_t distinct_count_estimate) {
 		should_analyze_prefix_range_filter = true;
 		prefix_range_filter_false_positive_rate_threshold = false_positive_rate_threshold;
+		prefix_range_filter_distinct_count_estimate = distinct_count_estimate;
 	}
 
 	optional_ptr<PrefixRangeFilter> GetPrefixRangeFilter() {
@@ -560,6 +562,8 @@ public:
 	}
 
 	bool AnalyzePrefixRangeFilter();
+	unique_ptr<PrefixRangeFilter::ParallelCompressionState> InitializeParallelPrefixRangeCompression(idx_t max_tasks);
+	bool CompletePrefixRangeFilterAnalysis(const PrefixRangeFilter::Analysis &analysis);
 
 	unique_ptr<PrefixRangeFilter::BuildState> InitializePrefixRangeBuildState();
 	void InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx_t count, PrefixRangeFilter::BuildState &state);

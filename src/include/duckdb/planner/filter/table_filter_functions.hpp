@@ -185,6 +185,16 @@ public:
 		}
 	};
 
+	//! A compression pass may be executed by several tasks. FinishPass is called only after all tasks complete.
+	struct ParallelCompressionState {
+		virtual ~ParallelCompressionState() = default;
+		virtual idx_t TaskCount() const = 0;
+		virtual void ExecuteTask(idx_t task_idx) = 0;
+		//! Returns true if another reduction pass is required.
+		virtual bool FinishPass() = 0;
+		virtual Analysis GetAnalysis() const = 0;
+	};
+
 	virtual ~PrefixRangeFilter() = default;
 	virtual void Initialize(ClientContext &context, idx_t number_of_rows, Value min, Value max,
 	                        const Sizing &sizing) = 0;
@@ -199,7 +209,14 @@ public:
 	virtual FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const = 0;
 	virtual bool IsInitialized() const = 0;
 	virtual Analysis Analyze() const = 0;
-	virtual Analysis Compress(ClientContext &context, double max_false_positive_rate) = 0;
+	//! An optional optimizer estimate of distinct represented keys; zero keeps the bitmap-only FPR bound.
+	virtual Analysis Compress(ClientContext &context, double max_false_positive_rate,
+	                          idx_t distinct_count_estimate = 0) = 0;
+	//! Returns nullptr when the serial compression path is preferable.
+	virtual unique_ptr<ParallelCompressionState> InitializeParallelCompression(ClientContext &context,
+	                                                                           double max_false_positive_rate,
+	                                                                           idx_t distinct_count_estimate,
+	                                                                           idx_t max_tasks) = 0;
 	virtual CompressionInfo GetCompressionInfo() const = 0;
 	static bool SupportedType(const LogicalType &type);
 	static unique_ptr<PrefixRangeFilter> CreatePrefixRangeFilter(const LogicalType &key_type);

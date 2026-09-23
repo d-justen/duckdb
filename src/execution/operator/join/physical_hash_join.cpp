@@ -829,6 +829,78 @@ static bool NeedsRuntimeJoinFilterBuild(const JoinHashTable &ht) {
 }
 
 static void ScheduleHashJoinTableFinalize(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event);
+static void ContinueAfterRuntimeFilterAnalysis(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event,
+                                               bool finalize_hash_table, bool exceeds_threshold);
+
+class HashJoinCompressionEvent;
+static void ScheduleHashJoinCompression(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event,
+                                        unique_ptr<PrefixRangeFilter::ParallelCompressionState> state,
+                                        bool finalize_hash_table);
+
+class HashJoinCompressionTask : public ExecutorTask {
+public:
+	HashJoinCompressionTask(HashJoinGlobalSinkState &sink_p, shared_ptr<Event> event_p,
+	                        PrefixRangeFilter::ParallelCompressionState &state_p, idx_t task_idx_p)
+	    : ExecutorTask(sink_p.context, std::move(event_p), sink_p.op), state(state_p), task_idx(task_idx_p) {
+	}
+
+	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		state.ExecuteTask(task_idx);
+		event->FinishTask();
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+	string TaskType() const override {
+		return "HashJoinCompressionTask";
+	}
+
+private:
+	PrefixRangeFilter::ParallelCompressionState &state;
+	idx_t task_idx;
+};
+
+class HashJoinCompressionEvent : public BasePipelineEvent {
+public:
+	HashJoinCompressionEvent(Pipeline &pipeline_p, HashJoinGlobalSinkState &sink_p,
+	                         unique_ptr<PrefixRangeFilter::ParallelCompressionState> state_p,
+	                         bool finalize_hash_table_p)
+	    : BasePipelineEvent(pipeline_p), sink(sink_p), state(std::move(state_p)),
+	      finalize_hash_table(finalize_hash_table_p) {
+	}
+
+	void Schedule() override {
+		vector<shared_ptr<Task>> tasks;
+		for (idx_t task_idx = 0; task_idx < state->TaskCount(); task_idx++) {
+			tasks.push_back(make_uniq<HashJoinCompressionTask>(sink, shared_from_this(), *state, task_idx));
+		}
+		SetTasks(std::move(tasks));
+	}
+
+	void FinishEvent() override {
+		while (state->FinishPass()) {
+			if (state->TaskCount() > 1) {
+				ScheduleHashJoinCompression(*pipeline, sink, *this, std::move(state), finalize_hash_table);
+				return;
+			}
+			// Once the bitmap is small, avoid scheduling an event for every remaining level.
+			state->ExecuteTask(0);
+		}
+		const auto exceeds_threshold = sink.hash_table->CompletePrefixRangeFilterAnalysis(state->GetAnalysis());
+		ContinueAfterRuntimeFilterAnalysis(*pipeline, sink, *this, finalize_hash_table, exceeds_threshold);
+	}
+
+private:
+	HashJoinGlobalSinkState &sink;
+	unique_ptr<PrefixRangeFilter::ParallelCompressionState> state;
+	bool finalize_hash_table;
+};
+
+static void ScheduleHashJoinCompression(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event,
+                                        unique_ptr<PrefixRangeFilter::ParallelCompressionState> state,
+                                        bool finalize_hash_table) {
+	auto compression_event =
+	    make_shared_ptr<HashJoinCompressionEvent>(pipeline, sink, std::move(state), finalize_hash_table);
+	event.InsertEvent(std::move(compression_event));
+}
 
 class HashJoinRuntimeFilterTask : public ExecutorTask {
 public:
@@ -897,23 +969,16 @@ public:
 		if (!build_bloom_filter) {
 			sink.hash_table->CompletePrefixRangeFilterBuild();
 		}
-		if (!build_bloom_filter && sink.hash_table->AnalyzePrefixRangeFilter() &&
-		    sink.hash_table->HasDeferredBloomFilter()) {
-			if (finalize_hash_table) {
-				// Finalization will insert the saved build hashes into Bloom before replacing them with chain pointers.
-				sink.hash_table->SetBuildBloomFilter(true);
-			} else {
-				auto bloom_filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(*pipeline, sink, true);
-				this->InsertEvent(std::move(bloom_filter_event));
+		bool exceeds_threshold = false;
+		if (!build_bloom_filter && sink.hash_table->ShouldAnalyzePrefixRangeFilter()) {
+			auto compression_state = sink.hash_table->InitializeParallelPrefixRangeCompression(sink.num_threads);
+			if (compression_state) {
+				ScheduleHashJoinCompression(*pipeline, sink, *this, std::move(compression_state), finalize_hash_table);
 				return;
 			}
+			exceeds_threshold = sink.hash_table->AnalyzePrefixRangeFilter();
 		}
-		if (finalize_hash_table) {
-			ScheduleHashJoinTableFinalize(*pipeline, sink, *this);
-			return;
-		}
-		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
-		sink.hash_table->finalized = true;
+		ContinueAfterRuntimeFilterAnalysis(*pipeline, sink, *this, finalize_hash_table, exceeds_threshold);
 	}
 
 private:
@@ -927,6 +992,26 @@ private:
 	bool finalize_hash_table;
 	vector<unique_ptr<PrefixRangeFilter::BuildState>> prefix_range_states;
 };
+
+static void ContinueAfterRuntimeFilterAnalysis(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event,
+                                               bool finalize_hash_table, bool exceeds_threshold) {
+	if (exceeds_threshold && sink.hash_table->HasDeferredBloomFilter()) {
+		if (finalize_hash_table) {
+			// Finalization will insert the saved build hashes into Bloom before replacing them with chain pointers.
+			sink.hash_table->SetBuildBloomFilter(true);
+		} else {
+			auto bloom_filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(pipeline, sink, true);
+			event.InsertEvent(std::move(bloom_filter_event));
+			return;
+		}
+	}
+	if (finalize_hash_table) {
+		ScheduleHashJoinTableFinalize(pipeline, sink, event);
+		return;
+	}
+	sink.hash_table->GetDataCollection().VerifyEverythingPinned();
+	sink.hash_table->finalized = true;
+}
 
 class HashJoinFinalizeEvent : public BasePipelineEvent {
 public:
@@ -1416,7 +1501,16 @@ void JoinFilterPushdownInfo::RegisterPrefixRangeFilter(const JoinFilterPushdownF
 		ht.SetBuildPrefixRangeFilter();
 		if (enable_compression) {
 			static constexpr double PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD = 0.001;
-			ht.SetAnalyzePrefixRangeFilter(PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD);
+			idx_t distinct_count_estimate = 0;
+			// Join-condition statistics may describe more rows than the build retained, so cap the estimate.
+			// String statistics count full values rather than the prefixes represented by the PRF.
+			if (key_type.InternalType() != PhysicalType::VARCHAR) {
+				const auto &build_key_stats = ht.conditions[0].GetRightStats();
+				if (build_key_stats) {
+					distinct_count_estimate = MinValue(build_key_stats->GetDistinctCount(), ht.Count());
+				}
+			}
+			ht.SetAnalyzePrefixRangeFilter(PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD, distinct_count_estimate);
 		}
 	}
 
