@@ -25,6 +25,7 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/operator/subtract.hpp"
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/profiler.hpp"
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
@@ -1740,6 +1741,11 @@ static idx_t PrefixRangeSelect(DataChunk &args, ExpressionState &state, optional
 		tracking_state->Update(0, 0);
 		return SetAllTrueSelection(count, sel, true_sel, false_sel);
 	}
+	auto telemetry = func_data.filter->GetTelemetry();
+	Profiler timer;
+	if (telemetry) {
+		timer.Start();
+	}
 
 	SelectionVector temp_true(count);
 	auto result_true_sel = (!true_sel || (sel && true_sel.get() == sel.get())) ? &temp_true : true_sel.get();
@@ -1747,6 +1753,12 @@ static idx_t PrefixRangeSelect(DataChunk &args, ExpressionState &state, optional
 	approved_count = TranslateSelection(count, sel, *result_true_sel, approved_count, true_sel, false_sel);
 	if (tracking_state) {
 		tracking_state->Update(approved_count, count);
+	}
+	if (telemetry) {
+		timer.End();
+		telemetry->probe_worker_ns.fetch_add(timer.ElapsedNanos(), std::memory_order_relaxed);
+		telemetry->probe_vectors.fetch_add(1, std::memory_order_relaxed);
+		telemetry->probe_tuples.fetch_add(count, std::memory_order_relaxed);
 	}
 	return approved_count;
 }
@@ -1774,7 +1786,18 @@ FilterPropagateResult PrefixRangeScalarFun::FilterPrune(const FunctionStatistics
 	if (!data.filter || !data.filter->IsInitialized()) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
-	return data.filter->LookupStatistics(input.stats);
+	auto telemetry = data.filter->GetTelemetry();
+	Profiler timer;
+	if (telemetry) {
+		timer.Start();
+	}
+	auto result = data.filter->LookupStatistics(input.stats);
+	if (telemetry) {
+		timer.End();
+		telemetry->prune_worker_ns.fetch_add(timer.ElapsedNanos(), std::memory_order_relaxed);
+		telemetry->prune_calls.fetch_add(1, std::memory_order_relaxed);
+	}
+	return result;
 }
 
 ScalarFunction TableFilterPrefixRangeFun::GetFunction() {

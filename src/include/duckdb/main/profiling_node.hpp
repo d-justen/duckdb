@@ -37,6 +37,8 @@ private:
 public:
 	idx_t depth = 0;
 	vector<unique_ptr<ProfilingNode>> children;
+	//! Numeric, operator-specific JSON payloads populated after execution.
+	unordered_map<string, unordered_map<string, double>> json_numeric_metrics;
 
 public:
 	idx_t GetChildCount() {

@@ -156,6 +156,9 @@ public:
 	DUCKDB_API void EndQuery();
 	//! Finalize query metrics for output; safe to call multiple times.
 	DUCKDB_API void FinalizeMetrics();
+	//! Register a late snapshot of numeric JSON metrics for an operator.
+	DUCKDB_API void RegisterOperatorJSONMetrics(const PhysicalOperator &op, string group,
+	                                            std::function<unordered_map<string, double>()> snapshot);
 
 	//! Adds amount to a specific metric type.
 	DUCKDB_API void AddToCounter(MetricType type, const idx_t amount);
@@ -219,6 +222,13 @@ private:
 	string RenderDisabledMessage(ProfilerPrintFormat format) const;
 
 private:
+	struct OperatorJSONMetricProvider {
+		const PhysicalOperator *op;
+		string group;
+		std::function<unordered_map<string, double>()> snapshot;
+	};
+	vector<OperatorJSONMetricProvider> operator_json_metric_providers;
+
 	ClientContext &context;
 
 	//! Whether or not the query profiler is running

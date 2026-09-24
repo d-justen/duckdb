@@ -103,6 +103,7 @@ void QueryProfiler::Start(const string &query) {
 
 void QueryProfiler::Reset() {
 	tree_map.clear();
+	operator_json_metric_providers.clear();
 	root = nullptr;
 	phase_timings.clear();
 	phase_stack.clear();
@@ -237,6 +238,14 @@ void QueryProfiler::EndQuery() {
 void QueryProfiler::FinalizeMetrics() {
 	lock_guard<std::mutex> guard(lock);
 	FinalizeMetricsInternal();
+}
+
+void QueryProfiler::RegisterOperatorJSONMetrics(const PhysicalOperator &op, string group,
+                                                std::function<unordered_map<string, double>()> snapshot) {
+	lock_guard<std::mutex> guard(lock);
+	if (IsEnabled() && running) {
+		operator_json_metric_providers.push_back({&op, std::move(group), std::move(snapshot)});
+	}
 }
 
 void QueryProfiler::AddToCounter(const MetricType type, const idx_t amount) {
@@ -751,6 +760,13 @@ static yyjson_mut_val *ToJSONRecursive(yyjson_mut_doc *doc, ProfilingNode &node)
 	}
 
 	profiling_info.WriteMetricsToJSON(doc, result_obj);
+	for (const auto &group : node.json_numeric_metrics) {
+		auto group_obj = yyjson_mut_obj(doc);
+		for (const auto &metric : group.second) {
+			yyjson_mut_obj_add_real(doc, group_obj, metric.first.c_str(), metric.second);
+		}
+		yyjson_mut_obj_add_val(doc, result_obj, group.first.c_str(), group_obj);
+	}
 
 	auto children_list = yyjson_mut_arr(doc);
 	for (idx_t i = 0; i < node.GetChildCount(); i++) {
@@ -980,6 +996,16 @@ void QueryProfiler::FinalizeMetricsInternal() {
 	for (auto &metric : info.metrics) {
 		if (info.Enabled(settings, metric.first)) {
 			ProfilingUtils::CollectMetrics(metric.first, query_metrics, metric.second, *root, child_info);
+		}
+	}
+	for (auto &provider : operator_json_metric_providers) {
+		auto entry = tree_map.find(*provider.op);
+		if (entry == tree_map.end()) {
+			continue;
+		}
+		auto &metrics = entry->second.get().json_numeric_metrics[provider.group];
+		for (const auto &metric : provider.snapshot()) {
+			metrics[metric.first] += metric.second;
 		}
 	}
 	metrics_finalized = true;

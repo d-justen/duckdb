@@ -12,6 +12,7 @@
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/enums/filter_propagate_result.hpp"
+#include "duckdb/common/chrono.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/scalar/tablefilter_functions.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -144,6 +145,31 @@ struct PerfectHashJoinFunctionData : public FunctionData {
 
 enum class CompressionMode : uint8_t { BITMAP, DIRECT_RANGES };
 
+//! Profiling-only counters shared by a PRF's build and probe pipelines.
+struct PrefixRangeFilterTelemetry {
+	atomic<idx_t> build_worker_ns {0};
+	atomic<idx_t> analysis_elapsed_ns {0};
+	atomic<idx_t> probe_worker_ns {0};
+	atomic<idx_t> prune_worker_ns {0};
+	atomic<idx_t> probe_vectors {0};
+	atomic<idx_t> probe_tuples {0};
+	atomic<idx_t> prune_calls {0};
+	atomic<bool> analysis_performed {false};
+
+	void StartAnalysis() {
+		analysis_start = steady_clock::now();
+	}
+
+	void FinishAnalysis() {
+		const auto elapsed = duration_cast<nanoseconds>(steady_clock::now() - analysis_start).count();
+		analysis_elapsed_ns.fetch_add(UnsafeNumericCast<idx_t>(elapsed), std::memory_order_relaxed);
+		analysis_performed.store(true, std::memory_order_release);
+	}
+
+private:
+	time_point<steady_clock> analysis_start;
+};
+
 //! Runtime prefix-range filter state used by join pushdown and internal tablefilter functions.
 class PrefixRangeFilter {
 public:
@@ -172,6 +198,7 @@ public:
 
 	struct BuildState {
 		virtual ~BuildState() = default;
+		idx_t profiling_build_ns = 0;
 		template <class TARGET>
 
 		TARGET &Cast() {
@@ -236,8 +263,17 @@ public:
 		return allows_tuple_filtering;
 	}
 
+	void SetTelemetry(shared_ptr<PrefixRangeFilterTelemetry> telemetry_p) {
+		telemetry = std::move(telemetry_p);
+	}
+
+	optional_ptr<PrefixRangeFilterTelemetry> GetTelemetry() const {
+		return telemetry.get();
+	}
+
 protected:
 	bool allows_tuple_filtering = true;
+	shared_ptr<PrefixRangeFilterTelemetry> telemetry;
 };
 
 //! FunctionData for prefix range internal function

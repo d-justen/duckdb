@@ -884,6 +884,10 @@ public:
 			// Once the bitmap is small, avoid scheduling an event for every remaining level.
 			state->ExecuteTask(0);
 		}
+		auto filter = sink.hash_table->GetPrefixRangeFilter();
+		if (filter && filter->GetTelemetry()) {
+			filter->GetTelemetry()->FinishAnalysis();
+		}
 		const auto exceeds_threshold = sink.hash_table->CompletePrefixRangeFilterAnalysis(state->GetAnalysis());
 		ContinueAfterRuntimeFilterAnalysis(*pipeline, sink, *this, finalize_hash_table, exceeds_threshold);
 	}
@@ -971,12 +975,20 @@ public:
 		}
 		bool exceeds_threshold = false;
 		if (!build_bloom_filter && sink.hash_table->ShouldAnalyzePrefixRangeFilter()) {
+			auto filter = sink.hash_table->GetPrefixRangeFilter();
+			auto telemetry = filter ? filter->GetTelemetry() : nullptr;
+			if (telemetry) {
+				telemetry->StartAnalysis();
+			}
 			auto compression_state = sink.hash_table->InitializeParallelPrefixRangeCompression(sink.num_threads);
 			if (compression_state) {
 				ScheduleHashJoinCompression(*pipeline, sink, *this, std::move(compression_state), finalize_hash_table);
 				return;
 			}
 			exceeds_threshold = sink.hash_table->AnalyzePrefixRangeFilter();
+			if (telemetry) {
+				telemetry->FinishAnalysis();
+			}
 		}
 		ContinueAfterRuntimeFilterAnalysis(*pipeline, sink, *this, finalize_hash_table, exceeds_threshold);
 	}
@@ -1495,8 +1507,42 @@ void JoinFilterPushdownInfo::RegisterPrefixRangeFilter(const JoinFilterPushdownF
 	D_ASSERT(plan.HasFilter());
 	const auto key_type = ht.conditions[0].GetLHS().GetReturnType();
 	if (!ht.GetPrefixRangeFilter()) {
+		auto &profiler = QueryProfiler::Get(context);
+		shared_ptr<PrefixRangeFilterTelemetry> telemetry;
+		Profiler build_timer;
+		if (profiler.IsEnabled()) {
+			telemetry = make_shared_ptr<PrefixRangeFilterTelemetry>();
+			build_timer.Start();
+		}
 		auto prefix_filter = PrefixRangeFilter::CreatePrefixRangeFilter(key_type);
+		if (telemetry) {
+			prefix_filter->SetTelemetry(telemetry);
+		}
 		prefix_filter->Initialize(context, ht.Count(), min_val, max_val, plan.sizing);
+		if (telemetry) {
+			build_timer.End();
+			telemetry->build_worker_ns.fetch_add(build_timer.ElapsedNanos(), std::memory_order_relaxed);
+			profiler.RegisterOperatorJSONMetrics(op, "prefix_range_filter", [telemetry]() {
+				constexpr double NS_TO_SECONDS = 1e-9;
+				unordered_map<string, double> metrics;
+				metrics["build_worker_seconds"] =
+				    static_cast<double>(telemetry->build_worker_ns.load(std::memory_order_relaxed)) * NS_TO_SECONDS;
+				if (telemetry->analysis_performed.load(std::memory_order_acquire)) {
+					metrics["compression_analysis_elapsed_seconds"] =
+					    static_cast<double>(telemetry->analysis_elapsed_ns.load(std::memory_order_relaxed)) *
+					    NS_TO_SECONDS;
+				}
+				metrics["probe_worker_seconds"] =
+				    static_cast<double>(telemetry->probe_worker_ns.load(std::memory_order_relaxed)) * NS_TO_SECONDS;
+				metrics["prune_worker_seconds"] =
+				    static_cast<double>(telemetry->prune_worker_ns.load(std::memory_order_relaxed)) * NS_TO_SECONDS;
+				metrics["probe_vectors"] =
+				    static_cast<double>(telemetry->probe_vectors.load(std::memory_order_relaxed));
+				metrics["probe_tuples"] = static_cast<double>(telemetry->probe_tuples.load(std::memory_order_relaxed));
+				metrics["prune_calls"] = static_cast<double>(telemetry->prune_calls.load(std::memory_order_relaxed));
+				return metrics;
+			});
+		}
 		ht.SetPrefixRangeFilter(std::move(prefix_filter));
 		ht.SetBuildPrefixRangeFilter();
 		if (enable_compression) {

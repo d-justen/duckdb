@@ -2,6 +2,7 @@
 
 #include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/profiler.hpp"
 #include "duckdb/common/radix_partitioning.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/ht_entry.hpp"
@@ -775,22 +776,51 @@ void JoinHashTable::BuildRuntimeJoinFilters(idx_t chunk_idx_from, idx_t chunk_id
 
 unique_ptr<PrefixRangeFilter::BuildState> JoinHashTable::InitializePrefixRangeBuildState() {
 	D_ASSERT(prefix_range_filter);
-	return prefix_range_filter->InitializeBuildState(context);
+	Profiler timer;
+	auto telemetry = prefix_range_filter->GetTelemetry();
+	if (telemetry) {
+		timer.Start();
+	}
+	auto state = prefix_range_filter->InitializeBuildState(context);
+	if (telemetry) {
+		timer.End();
+		state->profiling_build_ns += timer.ElapsedNanos();
+	}
+	return state;
 }
 
 void JoinHashTable::InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx_t count,
                                            PrefixRangeFilter::BuildState &state) {
 	D_ASSERT(prefix_range_filter);
+	Profiler timer;
+	auto telemetry = prefix_range_filter->GetTelemetry();
+	if (telemetry) {
+		timer.Start();
+	}
 	Vector build_keys(layout_ptr->GetTypes()[0], count);
 	auto &sel = *FlatVector::IncrementalSelectionVector();
 	data_collection->Gather(chunk_state.row_locations, sel, count, 0, build_keys, sel, nullptr);
 	FlatVector::SetSize(build_keys, count_t(count));
 	prefix_range_filter->InsertKeys(build_keys, count, state);
+	if (telemetry) {
+		timer.End();
+		state.profiling_build_ns += timer.ElapsedNanos();
+	}
 }
 
 void JoinHashTable::MergePrefixRangeBuildState(PrefixRangeFilter::BuildState &state) {
 	D_ASSERT(prefix_range_filter);
+	Profiler timer;
+	auto telemetry = prefix_range_filter->GetTelemetry();
+	if (telemetry) {
+		timer.Start();
+	}
 	prefix_range_filter->MergeBuildState(state);
+	if (telemetry) {
+		timer.End();
+		telemetry->build_worker_ns.fetch_add(state.profiling_build_ns + timer.ElapsedNanos(),
+		                                     std::memory_order_relaxed);
+	}
 }
 
 bool JoinHashTable::AnalyzePrefixRangeFilter() {

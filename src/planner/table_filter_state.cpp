@@ -1,5 +1,6 @@
 #include "duckdb/planner/table_filter_state.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
+#include "duckdb/common/profiler.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/common/vector/constant_vector.hpp"
 #include "duckdb/common/vector/flat_vector.hpp"
@@ -11,6 +12,30 @@
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 
 namespace duckdb {
+
+class ScopedPrefixRangeProbeTimer {
+public:
+	ScopedPrefixRangeProbeTimer(optional_ptr<PrefixRangeFilterTelemetry> telemetry_p, idx_t tuple_count_p)
+	    : telemetry(telemetry_p), tuple_count(tuple_count_p) {
+		if (telemetry) {
+			timer.Start();
+		}
+	}
+
+	~ScopedPrefixRangeProbeTimer() {
+		if (telemetry) {
+			timer.End();
+			telemetry->probe_worker_ns.fetch_add(timer.ElapsedNanos(), std::memory_order_relaxed);
+			telemetry->probe_vectors.fetch_add(1, std::memory_order_relaxed);
+			telemetry->probe_tuples.fetch_add(tuple_count, std::memory_order_relaxed);
+		}
+	}
+
+private:
+	optional_ptr<PrefixRangeFilterTelemetry> telemetry;
+	idx_t tuple_count;
+	Profiler timer;
+};
 
 static unique_ptr<ExpressionFilterExecutor> TryCreateFastExecutor(const Expression &expression,
                                                                   bool inside_selectivity_optional);
@@ -350,7 +375,7 @@ private:
 class PrefixRangeFilterExecutor final : public ExpressionFilterExecutor {
 public:
 	PrefixRangeFilterExecutor(const PrefixRangeFunctionData &data, bool inside_selectivity_optional)
-	    : filter(data.filter) {
+	    : filter(data.filter), telemetry(data.filter ? data.filter->GetTelemetry() : nullptr) {
 		if (!inside_selectivity_optional && data.n_vectors_to_check != 0) {
 			stats = make_uniq<SelectivityOptionalFilterState::SelectivityStats>(data.n_vectors_to_check,
 			                                                                    data.selectivity_threshold);
@@ -369,6 +394,7 @@ public:
 			stats->Update(0, 0);
 			return approved_tuple_count;
 		}
+		ScopedPrefixRangeProbeTimer timer(telemetry, approved_tuple_count);
 
 		PrepareCapacity(approved_tuple_count);
 		if (sel.IsSet()) {
@@ -405,6 +431,7 @@ private:
 	}
 
 	optional_ptr<PrefixRangeFilter> filter;
+	optional_ptr<PrefixRangeFilterTelemetry> telemetry;
 	SelectionVector local_sel;
 	idx_t current_capacity = 0;
 	unique_ptr<SelectivityOptionalFilterState::SelectivityStats> stats;
