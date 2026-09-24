@@ -784,7 +784,10 @@ unique_ptr<PrefixRangeFilter::BuildState> JoinHashTable::InitializePrefixRangeBu
 	auto state = prefix_range_filter->InitializeBuildState(context);
 	if (telemetry) {
 		timer.End();
-		state->profiling_build_ns += timer.ElapsedNanos();
+		const auto elapsed = timer.ElapsedNanos();
+		state->profiling_build_ns += elapsed;
+		telemetry->build_initialization_ns.fetch_add(elapsed, std::memory_order_relaxed);
+		state->TrackLocalBitmap(prefix_range_filter->GetTelemetryShared());
 	}
 	return state;
 }
@@ -804,7 +807,9 @@ void JoinHashTable::InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx
 	prefix_range_filter->InsertKeys(build_keys, count, state);
 	if (telemetry) {
 		timer.End();
-		state.profiling_build_ns += timer.ElapsedNanos();
+		const auto elapsed = timer.ElapsedNanos();
+		state.profiling_build_ns += elapsed;
+		telemetry->build_insertion_ns.fetch_add(elapsed, std::memory_order_relaxed);
 	}
 }
 
@@ -818,8 +823,30 @@ void JoinHashTable::MergePrefixRangeBuildState(PrefixRangeFilter::BuildState &st
 	prefix_range_filter->MergeBuildState(state);
 	if (telemetry) {
 		timer.End();
-		telemetry->build_worker_ns.fetch_add(state.profiling_build_ns + timer.ElapsedNanos(),
-		                                     std::memory_order_relaxed);
+		const auto elapsed = timer.ElapsedNanos();
+		telemetry->build_merge_ns.fetch_add(elapsed, std::memory_order_relaxed);
+		telemetry->build_worker_ns.fetch_add(state.profiling_build_ns + elapsed, std::memory_order_relaxed);
+	}
+}
+
+static void RecordPrefixRangeFinalState(PrefixRangeFilter &filter, bool bloom_fallback_selected) {
+	auto telemetry = filter.GetTelemetry();
+	if (!telemetry) {
+		return;
+	}
+	const auto info = filter.GetCompressionInfo();
+	telemetry->final_mode.store(static_cast<idx_t>(info.mode), std::memory_order_relaxed);
+	telemetry->final_bitmap_allocation_bytes.store(info.bitmap_allocation_bytes, std::memory_order_relaxed);
+	telemetry->final_false_positive_rate.store(info.false_positive_rate, std::memory_order_relaxed);
+	telemetry->final_prf_enabled.store(filter.AllowsTupleFiltering(), std::memory_order_relaxed);
+	telemetry->bloom_fallback_selected.store(bloom_fallback_selected, std::memory_order_relaxed);
+	telemetry->final_state_recorded.store(true, std::memory_order_release);
+}
+
+void JoinHashTable::CompletePrefixRangeFilterBuild() {
+	should_build_prefix_range_filter = false;
+	if (prefix_range_filter && !ShouldAnalyzePrefixRangeFilter()) {
+		RecordPrefixRangeFinalState(*prefix_range_filter, false);
 	}
 }
 
@@ -828,8 +855,18 @@ bool JoinHashTable::AnalyzePrefixRangeFilter() {
 		return false;
 	}
 	D_ASSERT(prefix_range_filter);
+	auto telemetry = prefix_range_filter->GetTelemetry();
+	Profiler timer;
+	if (telemetry) {
+		timer.Start();
+	}
 	const auto analysis = prefix_range_filter->Compress(context, prefix_range_filter_false_positive_rate_threshold,
 	                                                    prefix_range_filter_distinct_count_estimate);
+	if (telemetry) {
+		timer.End();
+		telemetry->compression_worker_ns.fetch_add(timer.ElapsedNanos(), std::memory_order_relaxed);
+		telemetry->FinishCompressionPhase();
+	}
 	return CompletePrefixRangeFilterAnalysis(analysis);
 }
 
@@ -848,6 +885,7 @@ bool JoinHashTable::CompletePrefixRangeFilterAnalysis(const PrefixRangeFilter::A
 	const bool exceeds_threshold = analysis.false_positive_rate > prefix_range_filter_false_positive_rate_threshold;
 	prefix_range_filter->SetAllowsTupleFiltering(!exceeds_threshold);
 	should_analyze_prefix_range_filter = false;
+	RecordPrefixRangeFinalState(*prefix_range_filter, exceeds_threshold && HasDeferredBloomFilter());
 	return exceeds_threshold;
 }
 

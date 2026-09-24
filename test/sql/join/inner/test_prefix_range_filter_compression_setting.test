@@ -61,6 +61,18 @@ statement ok
 CREATE TABLE sparse_build AS
 SELECT (i * 2000000000)::BIGINT AS k FROM range(0, 100000) t(i)
 
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k = b.k
+----
+analyzed_plan	<REGEX>:.*"bloom_fallback_selected": 1.*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k = b.k
+----
+analyzed_plan	<REGEX>:.*"final_prf_enabled": 0.*
+
 query I
 SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k = b.k
 ----

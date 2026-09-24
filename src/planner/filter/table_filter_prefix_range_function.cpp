@@ -92,7 +92,9 @@ public:
 		D_ASSERT(bitmap);
 		uint64_t *state_bitmap;
 		auto state_data = AllocateBitmap(context, word_count, state_bitmap);
-		return make_uniq<PrefixRangeBitmapBuildState>(std::move(state_data), state_bitmap);
+		auto state = make_uniq<PrefixRangeBitmapBuildState>(std::move(state_data), state_bitmap);
+		state->bitmap_allocation_bytes = state->data.GetSize();
+		return state;
 	}
 
 	template <typename T, typename CONVERTER>

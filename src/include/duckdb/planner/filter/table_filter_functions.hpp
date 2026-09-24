@@ -148,26 +148,62 @@ enum class CompressionMode : uint8_t { BITMAP, DIRECT_RANGES };
 //! Profiling-only counters shared by a PRF's build and probe pipelines.
 struct PrefixRangeFilterTelemetry {
 	atomic<idx_t> build_worker_ns {0};
-	atomic<idx_t> analysis_elapsed_ns {0};
+	atomic<idx_t> build_initialization_ns {0};
+	atomic<idx_t> build_insertion_ns {0};
+	atomic<idx_t> build_merge_ns {0};
+	atomic<idx_t> build_phase_elapsed_ns {0};
+	atomic<idx_t> build_chunk_count {0};
+	atomic<idx_t> build_task_count {0};
+	atomic<idx_t> local_bitmap_count {0};
+	atomic<idx_t> local_bitmap_bytes_allocated {0};
+	atomic<idx_t> local_bitmap_live_bytes {0};
+	atomic<idx_t> local_bitmap_peak_bytes {0};
+	atomic<idx_t> compression_phase_elapsed_ns {0};
+	atomic<idx_t> compression_worker_ns {0};
 	atomic<idx_t> probe_worker_ns {0};
 	atomic<idx_t> prune_worker_ns {0};
 	atomic<idx_t> probe_vectors {0};
 	atomic<idx_t> probe_tuples {0};
 	atomic<idx_t> prune_calls {0};
-	atomic<bool> analysis_performed {false};
+	atomic<idx_t> final_mode {0};
+	atomic<idx_t> final_bitmap_allocation_bytes {0};
+	atomic<double> final_false_positive_rate {0};
+	atomic<bool> final_prf_enabled {false};
+	atomic<bool> bloom_fallback_selected {false};
+	atomic<bool> final_state_recorded {false};
+	atomic<bool> compression_performed {false};
 
-	void StartAnalysis() {
-		analysis_start = steady_clock::now();
+	void StartBuildPhase() {
+		build_phase_start = steady_clock::now();
 	}
 
-	void FinishAnalysis() {
-		const auto elapsed = duration_cast<nanoseconds>(steady_clock::now() - analysis_start).count();
-		analysis_elapsed_ns.fetch_add(UnsafeNumericCast<idx_t>(elapsed), std::memory_order_relaxed);
-		analysis_performed.store(true, std::memory_order_release);
+	void FinishBuildPhase() {
+		const auto elapsed = duration_cast<nanoseconds>(steady_clock::now() - build_phase_start).count();
+		build_phase_elapsed_ns.fetch_add(UnsafeNumericCast<idx_t>(elapsed), std::memory_order_relaxed);
+	}
+
+	void StartCompressionPhase() {
+		compression_phase_start = steady_clock::now();
+	}
+
+	void FinishCompressionPhase() {
+		const auto elapsed = duration_cast<nanoseconds>(steady_clock::now() - compression_phase_start).count();
+		compression_phase_elapsed_ns.fetch_add(UnsafeNumericCast<idx_t>(elapsed), std::memory_order_relaxed);
+		compression_performed.store(true, std::memory_order_release);
+	}
+
+	void AddLocalBitmap(idx_t bytes) {
+		local_bitmap_count.fetch_add(1, std::memory_order_relaxed);
+		local_bitmap_bytes_allocated.fetch_add(bytes, std::memory_order_relaxed);
+		const auto live = local_bitmap_live_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+		auto peak = local_bitmap_peak_bytes.load(std::memory_order_relaxed);
+		while (live > peak && !local_bitmap_peak_bytes.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
+		}
 	}
 
 private:
-	time_point<steady_clock> analysis_start;
+	time_point<steady_clock> build_phase_start;
+	time_point<steady_clock> compression_phase_start;
 };
 
 //! Runtime prefix-range filter state used by join pushdown and internal tablefilter functions.
@@ -197,8 +233,22 @@ public:
 	};
 
 	struct BuildState {
-		virtual ~BuildState() = default;
+		virtual ~BuildState() {
+			if (profiling_telemetry) {
+				profiling_telemetry->local_bitmap_live_bytes.fetch_sub(bitmap_allocation_bytes,
+				                                                       std::memory_order_relaxed);
+			}
+		}
 		idx_t profiling_build_ns = 0;
+		idx_t bitmap_allocation_bytes = 0;
+
+		void TrackLocalBitmap(shared_ptr<PrefixRangeFilterTelemetry> telemetry) {
+			profiling_telemetry = std::move(telemetry);
+			if (profiling_telemetry) {
+				profiling_telemetry->AddLocalBitmap(bitmap_allocation_bytes);
+			}
+		}
+
 		template <class TARGET>
 
 		TARGET &Cast() {
@@ -210,6 +260,9 @@ public:
 			DynamicCastCheck<TARGET>(this);
 			return reinterpret_cast<const TARGET &>(*this);
 		}
+
+	private:
+		shared_ptr<PrefixRangeFilterTelemetry> profiling_telemetry;
 	};
 
 	//! A compression pass may be executed by several tasks. FinishPass is called only after all tasks complete.
@@ -269,6 +322,10 @@ public:
 
 	optional_ptr<PrefixRangeFilterTelemetry> GetTelemetry() const {
 		return telemetry.get();
+	}
+
+	shared_ptr<PrefixRangeFilterTelemetry> GetTelemetryShared() const {
+		return telemetry;
 	}
 
 protected:

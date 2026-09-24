@@ -539,9 +539,7 @@ public:
 	void SetBuildPrefixRangeFilter() {
 		should_build_prefix_range_filter = true;
 	}
-	void CompletePrefixRangeFilterBuild() {
-		should_build_prefix_range_filter = false;
-	}
+	void CompletePrefixRangeFilterBuild();
 
 	void SetAnalyzePrefixRangeFilter(double false_positive_rate_threshold, idx_t distinct_count_estimate) {
 		should_analyze_prefix_range_filter = true;
