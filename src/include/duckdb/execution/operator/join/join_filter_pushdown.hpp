@@ -118,6 +118,8 @@ struct JoinFilterPushdownInfo {
 	vector<unique_ptr<Expression>> min_max_aggregates;
 	//! Whether the build side has a filter -> we might be able to push down a bloom filter into the probe side
 	bool build_side_has_filter;
+	//! Estimated source rows per distinct numeric join key; defaults to one when statistics are unavailable.
+	double build_key_multiplicity = 1.0;
 
 public:
 	unique_ptr<JoinFilterGlobalState> GetGlobalState(ClientContext &context, const PhysicalOperator &op) const;

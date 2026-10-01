@@ -276,8 +276,8 @@ public:
 	};
 
 	virtual ~PrefixRangeFilter() = default;
-	virtual void Initialize(ClientContext &context, idx_t number_of_rows, Value min, Value max,
-	                        const Sizing &sizing) = 0;
+	virtual void Initialize(ClientContext &context, idx_t number_of_rows, Value min, Value max, const Sizing &sizing,
+	                        double estimated_multiplicity = 1.0) = 0;
 	virtual unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const = 0;
 	virtual void InsertKeys(Vector &keys, idx_t count, BuildState &state) const = 0;
 	virtual void MergeBuildState(BuildState &state) = 0;
@@ -289,13 +289,10 @@ public:
 	virtual FilterPropagateResult LookupStatistics(const BaseStatistics &stats) const = 0;
 	virtual bool IsInitialized() const = 0;
 	virtual Analysis Analyze() const = 0;
-	//! An optional optimizer estimate of distinct represented keys; zero keeps the bitmap-only FPR bound.
-	virtual Analysis Compress(ClientContext &context, double max_false_positive_rate,
-	                          idx_t distinct_count_estimate = 0) = 0;
+	virtual Analysis Compress(ClientContext &context, double max_false_positive_rate) = 0;
 	//! Returns nullptr when the serial compression path is preferable.
 	virtual unique_ptr<ParallelCompressionState> InitializeParallelCompression(ClientContext &context,
 	                                                                           double max_false_positive_rate,
-	                                                                           idx_t distinct_count_estimate,
 	                                                                           idx_t max_tasks) = 0;
 	virtual CompressionInfo GetCompressionInfo() const = 0;
 	static bool SupportedType(const LogicalType &type);

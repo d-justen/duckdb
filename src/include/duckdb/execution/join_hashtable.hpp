@@ -431,7 +431,6 @@ private:
 	bool should_build_prefix_range_filter = false;
 	bool should_analyze_prefix_range_filter = false;
 	double prefix_range_filter_false_positive_rate_threshold = 0.0;
-	idx_t prefix_range_filter_distinct_count_estimate = 0;
 
 	//! Copying not allowed
 	JoinHashTable(const JoinHashTable &) = delete;
@@ -541,10 +540,9 @@ public:
 	}
 	void CompletePrefixRangeFilterBuild();
 
-	void SetAnalyzePrefixRangeFilter(double false_positive_rate_threshold, idx_t distinct_count_estimate) {
+	void SetAnalyzePrefixRangeFilter(double false_positive_rate_threshold) {
 		should_analyze_prefix_range_filter = true;
 		prefix_range_filter_false_positive_rate_threshold = false_positive_rate_threshold;
-		prefix_range_filter_distinct_count_estimate = distinct_count_estimate;
 	}
 
 	optional_ptr<PrefixRangeFilter> GetPrefixRangeFilter() {

@@ -1603,7 +1603,7 @@ void JoinFilterPushdownInfo::RegisterPrefixRangeFilter(const JoinFilterPushdownF
 		if (telemetry) {
 			prefix_filter->SetTelemetry(telemetry);
 		}
-		prefix_filter->Initialize(context, ht.Count(), min_val, max_val, plan.sizing);
+		prefix_filter->Initialize(context, ht.Count(), min_val, max_val, plan.sizing, build_key_multiplicity);
 		if (telemetry) {
 			build_timer.End();
 			const auto elapsed = build_timer.ElapsedNanos();
@@ -1670,16 +1670,7 @@ void JoinFilterPushdownInfo::RegisterPrefixRangeFilter(const JoinFilterPushdownF
 		ht.SetBuildPrefixRangeFilter();
 		if (enable_compression) {
 			static constexpr double PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD = 0.001;
-			idx_t distinct_count_estimate = 0;
-			// Join-condition statistics may describe more rows than the build retained, so cap the estimate.
-			// String statistics count full values rather than the prefixes represented by the PRF.
-			if (key_type.InternalType() != PhysicalType::VARCHAR) {
-				const auto &build_key_stats = ht.conditions[0].GetRightStats();
-				if (build_key_stats) {
-					distinct_count_estimate = MinValue(build_key_stats->GetDistinctCount(), ht.Count());
-				}
-			}
-			ht.SetAnalyzePrefixRangeFilter(PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD, distinct_count_estimate);
+			ht.SetAnalyzePrefixRangeFilter(PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD);
 		}
 	}
 

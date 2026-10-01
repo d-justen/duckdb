@@ -1,5 +1,6 @@
 #include "duckdb/optimizer/join_filter_pushdown_optimizer.hpp"
 
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/execution/operator/join/physical_comparison_join.hpp"
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
@@ -14,6 +15,7 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
+#include "duckdb/storage/statistics/node_statistics.hpp"
 
 namespace duckdb {
 
@@ -221,6 +223,65 @@ bool JoinFilterPushdownOptimizer::IsFiltering(const unique_ptr<LogicalOperator> 
 	}
 }
 
+static double GetBuildKeyMultiplicity(LogicalOperator &op, const Expression &key, ClientContext &context) {
+	if (key.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+	    !PrefixRangeFilter::SupportedType(key.GetReturnType()) ||
+	    key.GetReturnType().InternalType() == PhysicalType::VARCHAR) {
+		return 1.0;
+	}
+	auto binding = key.Cast<BoundColumnRefExpression>().binding;
+	auto current = &op;
+	while (current->type == LogicalOperatorType::LOGICAL_FILTER ||
+	       current->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+		if (current->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &projection = current->Cast<LogicalProjection>();
+			if (binding.table_index != projection.table_index ||
+			    binding.column_index >= projection.expressions.size()) {
+				return 1.0;
+			}
+			const auto &expression = projection.GetExpression(binding);
+			if (expression.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+				return 1.0;
+			}
+			binding = expression.Cast<BoundColumnRefExpression>().binding;
+		}
+		current = current->children[0].get();
+	}
+	if (current->type != LogicalOperatorType::LOGICAL_GET) {
+		return 1.0;
+	}
+	auto &get = current->Cast<LogicalGet>();
+	const auto table = get.GetTable();
+	if (!table || !table->IsDuckTable() || binding.table_index != get.table_index ||
+	    binding.column_index >= get.GetColumnIds().size() || !get.function.cardinality) {
+		return 1.0;
+	}
+	const auto &column_index = get.GetColumnIndex(binding);
+	if (column_index.IsVirtualColumn() || column_index.IsPushdownExtract()) {
+		return 1.0;
+	}
+
+	unique_ptr<BaseStatistics> column_statistics;
+	if (get.function.statistics_extended) {
+		TableFunctionGetStatisticsInput input(get.bind_data.get(), column_index);
+		column_statistics = get.function.statistics_extended(context, input);
+	} else if (get.function.statistics) {
+		column_statistics = get.function.statistics(context, get.bind_data.get(), column_index.GetPrimaryIndex());
+	}
+	if (!column_statistics) {
+		return 1.0;
+	}
+	const auto distinct_count = column_statistics->GetDistinctCount();
+	const auto cardinality = get.function.cardinality(context, get.bind_data.get());
+	if (!cardinality || !cardinality->has_estimated_cardinality || cardinality->estimated_cardinality == 0 ||
+	    distinct_count == 0) {
+		return 1.0;
+	}
+	// Both values describe the source scan. The actual retained build count is applied after the hash table is built.
+	return MaxValue(1.0, static_cast<double>(cardinality->estimated_cardinality) /
+	                         static_cast<double>(distinct_count));
+}
+
 void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &join) {
 	if (!JoinFilterPushdownUtil::JoinTypeIsSupported(join.join_type)) {
 		return;
@@ -310,6 +371,11 @@ void JoinFilterPushdownOptimizer::GenerateJoinFilters(LogicalComparisonJoin &joi
 	if (!pushdown_info->probe_info.empty()) {
 		const idx_t child_idx = join.children[1]->type == LogicalOperatorType::LOGICAL_DELIM_GET ? 0 : 1;
 		pushdown_info->build_side_has_filter = IsFiltering(join.children[child_idx]);
+		if (join.conditions[0].IsComparison() &&
+		    join.conditions[0].GetComparisonType() == ExpressionType::COMPARE_EQUAL) {
+			pushdown_info->build_key_multiplicity =
+			    GetBuildKeyMultiplicity(*join.children[1], join.conditions[0].GetRHS(), optimizer.GetContext());
+		}
 	}
 
 	// set up the filter pushdown in the join itself

@@ -860,8 +860,7 @@ bool JoinHashTable::AnalyzePrefixRangeFilter() {
 	if (telemetry) {
 		timer.Start();
 	}
-	const auto analysis = prefix_range_filter->Compress(context, prefix_range_filter_false_positive_rate_threshold,
-	                                                    prefix_range_filter_distinct_count_estimate);
+	const auto analysis = prefix_range_filter->Compress(context, prefix_range_filter_false_positive_rate_threshold);
 	if (telemetry) {
 		timer.End();
 		telemetry->compression_worker_ns.fetch_add(timer.ElapsedNanos(), std::memory_order_relaxed);
@@ -876,8 +875,7 @@ JoinHashTable::InitializeParallelPrefixRangeCompression(idx_t max_tasks) {
 		return nullptr;
 	}
 	return prefix_range_filter->InitializeParallelCompression(context,
-	                                                          prefix_range_filter_false_positive_rate_threshold,
-	                                                          prefix_range_filter_distinct_count_estimate, max_tasks);
+	                                                          prefix_range_filter_false_positive_rate_threshold, max_tasks);
 }
 
 bool JoinHashTable::CompletePrefixRangeFilterAnalysis(const PrefixRangeFilter::Analysis &analysis) {
@@ -2031,7 +2029,6 @@ void JoinHashTable::ResetForNewIterationSinglePartition() {
 	deferred_bloom_filter_registered = false;
 	prefix_range_filter.reset();
 	should_build_prefix_range_filter = false;
-	prefix_range_filter_distinct_count_estimate = 0;
 	ResetCorrelatedMarkJoinInfo(*this);
 }
 

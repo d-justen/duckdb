@@ -1,0 +1,68 @@
+# name: test/sql/join/inner/test_prefix_range_filter_multiplicity.test
+# description: Source multiplicity affects PRF rejection while missing statistics assume distinct build keys
+# group: [inner]
+
+statement ok
+SET disabled_optimizers='join_order,build_side_probe_side'
+
+statement ok
+SET enable_perfect_hash_join_filter_pushdown=false
+
+statement ok
+SET enable_join_bloom_filter_pushdown=false
+
+statement ok
+SET enable_join_min_max_filter_pushdown=false
+
+statement ok
+CREATE TABLE prf_multiplicity_build AS
+SELECT (i * 700)::BIGINT k FROM range(100000) t(i)
+UNION ALL
+SELECT (i * 700)::BIGINT k FROM range(50000) t(i)
+
+statement ok
+CREATE TABLE prf_multiplicity_probe AS
+SELECT (i * 700)::BIGINT k FROM range(200000) t(i)
+
+# The DuckDB table has roughly three rows per two distinct keys. At initial shift 1,
+# its FPR exceeds 0.001 and tuple filtering is disabled.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_multiplicity_probe p JOIN prf_multiplicity_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"final_prf_enabled": 0.*
+
+query I
+SELECT count(*) FROM prf_multiplicity_probe p JOIN prf_multiplicity_build b ON p.k=b.k
+----
+150000
+
+# A filtered build keeps the table's source multiplicity and uses the retained
+# hash-table row count. Half the keys remain, lowering the estimated FPR.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_multiplicity_probe p
+JOIN (SELECT k FROM prf_multiplicity_build WHERE k % 1400 = 0) b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"final_prf_enabled": 1.*
+
+query I
+SELECT count(*) FROM prf_multiplicity_probe p
+JOIN (SELECT k FROM prf_multiplicity_build WHERE k % 1400 = 0) b ON p.k=b.k
+----
+75000
+
+# This derived build has the same keys but no matched source distinct estimate.
+# Assuming distinct rows gives an initial FPR below the rejection threshold.
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_multiplicity_probe p
+JOIN (SELECT ((i % 100000) * 700)::BIGINT k FROM range(150000) t(i)) b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"final_prf_enabled": 1.*
+
+query I
+SELECT count(*) FROM prf_multiplicity_probe p
+JOIN (SELECT ((i % 100000) * 700)::BIGINT k FROM range(150000) t(i)) b ON p.k=b.k
+----
+150000

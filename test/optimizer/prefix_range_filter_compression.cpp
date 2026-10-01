@@ -10,14 +10,15 @@ using namespace duckdb;
 namespace {
 
 unique_ptr<PrefixRangeFilter> BuildInt32PrefixRangeFilter(ClientContext &context, const vector<int32_t> &keys,
-                                                          int32_t min, int32_t max, idx_t shift,
-                                                          double max_false_positive_rate, bool compress = true,
-                                                          idx_t distinct_count_estimate = 0, idx_t parallel_tasks = 0) {
+	                                                      int32_t min, int32_t max, idx_t shift,
+	                                                      double max_false_positive_rate, bool compress = true,
+	                                                      double estimated_multiplicity = 1.0, idx_t parallel_tasks = 0) {
 	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::INTEGER);
 	PrefixRangeFilter::Sizing sizing;
 	REQUIRE(PrefixRangeFilter::TryComputeSpan(Value::INTEGER(min), Value::INTEGER(max), sizing.span));
 	sizing.shift = shift;
-	filter->Initialize(context, keys.size(), Value::INTEGER(min), Value::INTEGER(max), sizing);
+	filter->Initialize(context, keys.size(), Value::INTEGER(min), Value::INTEGER(max), sizing,
+	                   estimated_multiplicity);
 
 	auto state = filter->InitializeBuildState(context);
 	Vector key_vector(LogicalType::INTEGER, keys.size());
@@ -30,8 +31,7 @@ unique_ptr<PrefixRangeFilter> BuildInt32PrefixRangeFilter(ClientContext &context
 	filter->MergeBuildState(*state);
 	if (compress) {
 		if (parallel_tasks) {
-			auto compression = filter->InitializeParallelCompression(context, max_false_positive_rate,
-			                                                         distinct_count_estimate, parallel_tasks);
+			auto compression = filter->InitializeParallelCompression(context, max_false_positive_rate, parallel_tasks);
 			REQUIRE(compression);
 			do {
 				for (idx_t task_idx = 0; task_idx < compression->TaskCount(); task_idx++) {
@@ -39,7 +39,7 @@ unique_ptr<PrefixRangeFilter> BuildInt32PrefixRangeFilter(ClientContext &context
 				}
 			} while (compression->FinishPass());
 		} else {
-			filter->Compress(context, max_false_positive_rate, distinct_count_estimate);
+			filter->Compress(context, max_false_positive_rate);
 		}
 	}
 	return filter;
@@ -99,7 +99,7 @@ TEST_CASE("Parallel prefix range compression matches serial across task boundari
 	for (const auto &keys : key_sets) {
 		for (const auto threshold : {1.0, 0.001, 0.000001}) {
 			auto serial = BuildInt32PrefixRangeFilter(*con.context, keys, 0, maximum, 0, threshold);
-			auto parallel = BuildInt32PrefixRangeFilter(*con.context, keys, 0, maximum, 0, threshold, true, 0, 4);
+			auto parallel = BuildInt32PrefixRangeFilter(*con.context, keys, 0, maximum, 0, threshold, true, 1.0, 4);
 			const auto serial_info = serial->GetCompressionInfo();
 			const auto parallel_info = parallel->GetCompressionInfo();
 			REQUIRE(parallel_info.mode == serial_info.mode);
@@ -121,6 +121,15 @@ TEST_CASE("Parallel prefix range compression matches serial across task boundari
 				REQUIRE(parallel->LookupStatistics(range) == serial->LookupStatistics(range));
 			}
 		}
+	}
+	const vector<int32_t> duplicate_keys = {0, 0, 16, 16, 33554432, 33554432, maximum, maximum};
+	auto serial = BuildInt32PrefixRangeFilter(*con.context, duplicate_keys, 0, maximum, 1, 0.000001, true, 2.0);
+	auto parallel = BuildInt32PrefixRangeFilter(*con.context, duplicate_keys, 0, maximum, 1, 0.000001, true, 2.0, 4);
+	REQUIRE(parallel->GetCompressionInfo().shift == serial->GetCompressionInfo().shift);
+	REQUIRE(parallel->GetCompressionInfo().false_positive_rate ==
+	        Approx(serial->GetCompressionInfo().false_positive_rate));
+	for (const auto key : duplicate_keys) {
+		REQUIRE(ContainsKey(*parallel, key));
 	}
 }
 
@@ -274,14 +283,14 @@ TEST_CASE("Prefix range filter rejects an initially oversized FPR before compres
 	REQUIRE(analysis.false_positive_rate == Approx(info.false_positive_rate));
 }
 
-TEST_CASE("Prefix range filter uses a distinct-count estimate for its FPR decision", "[optimizer]") {
+TEST_CASE("Prefix range filter uses estimated multiplicity for its FPR decision", "[optimizer]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 
 	const vector<int32_t> keys = {0, 1, 2, 3, 512, 513, 514, 515};
 	static constexpr double MAX_FALSE_POSITIVE_RATE = 0.001;
-	auto conservative = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 1023, 2, MAX_FALSE_POSITIVE_RATE);
-	auto estimated = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 1023, 2, MAX_FALSE_POSITIVE_RATE, true, 8);
+	auto conservative = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 1023, 2, MAX_FALSE_POSITIVE_RATE, true, 4.0);
+	auto estimated = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 1023, 2, MAX_FALSE_POSITIVE_RATE);
 
 	REQUIRE(conservative->Analyze().active_buckets == 2);
 	REQUIRE(conservative->Analyze().false_positive_rate > MAX_FALSE_POSITIVE_RATE);
@@ -294,14 +303,33 @@ TEST_CASE("Prefix range filter uses a distinct-count estimate for its FPR decisi
 	REQUIRE(!ContainsKey(*estimated, 4));
 
 	const vector<int32_t> dyadic_keys = {0, 1, 4, 5, 8, 9, 12, 13, 16, 17};
-	auto conservative_dyadic = BuildInt32PrefixRangeFilter(*con.context, dyadic_keys, 0, 127, 1, 0.09);
-	auto estimated_dyadic = BuildInt32PrefixRangeFilter(*con.context, dyadic_keys, 0, 127, 1, 0.09, true, 10);
+	auto conservative_dyadic = BuildInt32PrefixRangeFilter(*con.context, dyadic_keys, 0, 127, 1, 0.09, true, 2.0);
+	auto estimated_dyadic = BuildInt32PrefixRangeFilter(*con.context, dyadic_keys, 0, 127, 1, 0.09);
 	REQUIRE(conservative_dyadic->GetCompressionInfo().mode == CompressionMode::BITMAP);
 	REQUIRE(estimated_dyadic->GetCompressionInfo().mode == CompressionMode::DIRECT_RANGES);
 	REQUIRE(estimated_dyadic->GetCompressionInfo().false_positive_rate <= 0.09);
 	for (const auto key : dyadic_keys) {
 		REQUIRE(ContainsKey(*estimated_dyadic, key));
 	}
+}
+
+TEST_CASE("Prefix range filter applies fractional multiplicity to initial FPR", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	const vector<int32_t> keys = {0, 0, 16};
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 64, 4, 0.47, false, 1.5);
+	const auto analysis = filter->Analyze();
+	REQUIRE(analysis.active_buckets == 2);
+	REQUIRE(analysis.false_positive_rate == Approx(30.0 / 63.0));
+	REQUIRE(filter->GetCompressionInfo().false_positive_rate == Approx(analysis.false_positive_rate));
+	filter->Compress(*con.context, 0.47);
+	REQUIRE(filter->GetCompressionInfo().mode == CompressionMode::BITMAP);
+	REQUIRE(filter->Analyze().false_positive_rate == Approx(analysis.false_positive_rate));
+
+	auto no_stats = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 64, 4, 0.47, false);
+	REQUIRE(no_stats->Analyze().false_positive_rate == Approx(29.0 / 62.0));
+	no_stats->Compress(*con.context, 0.47);
+	REQUIRE(no_stats->GetCompressionInfo().mode == CompressionMode::DIRECT_RANGES);
 }
 
 TEST_CASE("Prefix range filter dyadic analysis preserves original positive lower bound", "[optimizer]") {
@@ -381,7 +409,7 @@ TEST_CASE("Prefix range filter right-sizes an accepted cache-sized bitmap", "[op
 	REQUIRE(ContainsKey(*filter, keys.back()));
 }
 
-TEST_CASE("Prefix range filter FPR analysis is conservative for duplicate build keys", "[optimizer]") {
+TEST_CASE("Prefix range filter uses source multiplicity for duplicate build keys", "[optimizer]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 
@@ -392,10 +420,12 @@ TEST_CASE("Prefix range filter FPR analysis is conservative for duplicate build 
 		}
 	}
 
-	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 64, 4, 1.0);
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 64, 4, 1.0, true, 100.0);
 	auto analysis = filter->Analyze();
 	REQUIRE(analysis.active_buckets == 4);
 	REQUIRE(analysis.false_positive_rate > 0.9);
+	auto no_stats = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 64, 4, 1.0, false);
+	REQUIRE(no_stats->Analyze().false_positive_rate == Approx(0.0));
 }
 
 TEST_CASE("Prefix range filter direct range analysis stays consistent after compression", "[optimizer]") {

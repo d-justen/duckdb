@@ -63,10 +63,19 @@ struct PrefixRangeBitmapBuildState : public PrefixRangeFilter::BuildState {
 template <typename U>
 class PrefixRangeBitmap {
 public:
-	void Initialize(ClientContext &context, U min_p, U span_p, idx_t shift_p) {
+	void Initialize(ClientContext &context, U min_p, U span_p, idx_t shift_p, idx_t number_of_rows,
+	                double estimated_multiplicity) {
 		min = min_p;
 		span = span_p;
 		shift = shift_p;
+		// String PRFs pass zero here because full-string counts do not estimate distinct prefixes.
+		estimated_distinct_keys = number_of_rows;
+		if (estimated_multiplicity > 1.0) {
+			const auto estimated = static_cast<double>(number_of_rows) / estimated_multiplicity;
+			if (estimated < static_cast<double>(number_of_rows)) {
+				estimated_distinct_keys = LossyNumericCast<idx_t>(estimated);
+			}
+		}
 
 		const idx_t buckets = UnsafeNumericCast<idx_t>((span >> shift) + 1);
 		logical_bucket_count = buckets;
@@ -231,29 +240,27 @@ public:
 		}
 
 		const auto current_active_buckets = CountActiveBuckets();
-		return {current_active_buckets, FalsePositiveRate(current_active_buckets, shift, current_active_buckets)};
+		return {current_active_buckets,
+		        FalsePositiveRate(current_active_buckets, shift, PositiveCountEstimate(current_active_buckets, shift))};
 	}
 
-	PrefixRangeFilter::Analysis Compress(ClientContext &context, double max_false_positive_rate,
-	                                     idx_t distinct_count_estimate) {
+	PrefixRangeFilter::Analysis Compress(ClientContext &context, double max_false_positive_rate) {
 		if (!initialized || compression_finalized || mode != Mode::BITMAP || max_false_positive_rate < 0) {
 			return Analyze();
 		}
-		CompressBitmap(context, max_false_positive_rate, distinct_count_estimate);
+		CompressBitmap(context, max_false_positive_rate);
 		return Analyze();
 	}
 
 	unique_ptr<PrefixRangeFilter::ParallelCompressionState>
-	InitializeParallelCompression(ClientContext &context, double max_false_positive_rate, idx_t distinct_count_estimate,
-	                              idx_t max_tasks) {
+	InitializeParallelCompression(ClientContext &context, double max_false_positive_rate, idx_t max_tasks) {
 		// The first pass reads the original bitmap and writes one half its size. Below this size,
 		// scheduling tasks costs more than the reduction is likely to save.
 		if (!initialized || compression_finalized || mode != Mode::BITMAP || max_false_positive_rate < 0 ||
 		    logical_bucket_count <= 1 || max_tasks <= 1 || word_count * sizeof(uint64_t) < PARALLEL_MIN_BYTES) {
 			return nullptr;
 		}
-		return make_uniq<ParallelBitmapCompressionState>(*this, context, max_false_positive_rate,
-		                                                 distinct_count_estimate, max_tasks);
+		return make_uniq<ParallelBitmapCompressionState>(*this, context, max_false_positive_rate, max_tasks);
 	}
 
 	PrefixRangeFilter::CompressionInfo GetCompressionInfo() const {
@@ -267,8 +274,10 @@ public:
 		info.bitmap_allocation_bytes = mode == Mode::BITMAP ? buf_.GetSize() : 0;
 		info.range_index_count = homogeneous_word_runs.size();
 		info.range_index_bytes = homogeneous_word_runs.capacity() * sizeof(HomogeneousWordRun);
-		info.false_positive_rate = analysis_cached ? cached_false_positive_rate
-		                                           : FalsePositiveRate(info.active_buckets, shift, info.active_buckets);
+		info.false_positive_rate = analysis_cached
+		                               ? cached_false_positive_rate
+		                               : FalsePositiveRate(info.active_buckets, shift,
+		                                                   PositiveCountEstimate(info.active_buckets, shift));
 		return info;
 	}
 
@@ -632,7 +641,8 @@ private:
 		return covered_values;
 	}
 
-	idx_t PositiveCountEstimate(idx_t active_buckets, idx_t shift_p, idx_t distinct_count_estimate) const {
+	idx_t PositiveCountEstimate(idx_t active_buckets, idx_t shift_p) const {
+		auto distinct_count_estimate = estimated_distinct_keys;
 		idx_t covered_values;
 		if (Uhugeint::TryCast(CoveredValues(active_buckets, shift_p), covered_values)) {
 			distinct_count_estimate = MinValue(distinct_count_estimate, covered_values);
@@ -937,7 +947,7 @@ private:
 		}
 	}
 
-	void CompressBitmap(ClientContext &context, double max_false_positive_rate, idx_t distinct_count_estimate) {
+	void CompressBitmap(ClientContext &context, double max_false_positive_rate) {
 		BitmapStorage current;
 		current.data = std::move(buf_);
 		current.bitmap = bitmap;
@@ -959,8 +969,7 @@ private:
 			                                                     scratch.bitmap, next_words);
 			current_metrics = first_pass.source;
 
-			positive_count_estimate =
-			    PositiveCountEstimate(current_metrics.active_buckets, current_shift, distinct_count_estimate);
+			positive_count_estimate = PositiveCountEstimate(current_metrics.active_buckets, current_shift);
 			const auto initial_false_positive_rate =
 			    FalsePositiveRate(current_metrics.active_buckets, current_shift, positive_count_estimate);
 			SetCachedAnalysis(current_metrics, initial_false_positive_rate);
@@ -1022,8 +1031,7 @@ private:
 			}
 		} else {
 			current_metrics = AnalyzeBitmap(current.bitmap, current_words, current_logical_buckets);
-			positive_count_estimate =
-			    PositiveCountEstimate(current_metrics.active_buckets, current_shift, distinct_count_estimate);
+			positive_count_estimate = PositiveCountEstimate(current_metrics.active_buckets, current_shift);
 			const auto initial_false_positive_rate =
 			    FalsePositiveRate(current_metrics.active_buckets, current_shift, positive_count_estimate);
 			SetCachedAnalysis(current_metrics, initial_false_positive_rate);
@@ -1047,10 +1055,8 @@ private:
 	class ParallelBitmapCompressionState final : public PrefixRangeFilter::ParallelCompressionState {
 	public:
 		ParallelBitmapCompressionState(PrefixRangeBitmap &owner_p, ClientContext &context_p,
-		                               double max_false_positive_rate_p, idx_t distinct_count_estimate_p,
-		                               idx_t max_tasks_p)
-		    : owner(owner_p), context(context_p), max_false_positive_rate(max_false_positive_rate_p),
-		      distinct_count_estimate(distinct_count_estimate_p), max_tasks(max_tasks_p),
+		                               double max_false_positive_rate_p, idx_t max_tasks_p)
+		    : owner(owner_p), context(context_p), max_false_positive_rate(max_false_positive_rate_p), max_tasks(max_tasks_p),
 		      current_words(owner.word_count), current_logical_buckets(owner.logical_bucket_count),
 		      current_shift(owner.shift) {
 			current.data = std::move(owner.buf_);
@@ -1080,8 +1086,7 @@ private:
 		bool FinishPass() override {
 			if (first_pass) {
 				current_metrics = MergeMetrics(true);
-				positive_count_estimate =
-				    owner.PositiveCountEstimate(current_metrics.active_buckets, current_shift, distinct_count_estimate);
+				positive_count_estimate = owner.PositiveCountEstimate(current_metrics.active_buckets, current_shift);
 				const auto initial_fpr =
 				    owner.FalsePositiveRate(current_metrics.active_buckets, current_shift, positive_count_estimate);
 				owner.SetCachedAnalysis(current_metrics, initial_fpr);
@@ -1194,7 +1199,6 @@ private:
 		PrefixRangeBitmap &owner;
 		ClientContext &context;
 		double max_false_positive_rate;
-		idx_t distinct_count_estimate;
 		idx_t max_tasks;
 		BitmapStorage current;
 		BitmapStorage scratch;
@@ -1217,6 +1221,7 @@ private:
 	idx_t shift;
 	idx_t logical_bucket_count;
 	idx_t word_count;
+	idx_t estimated_distinct_keys = 0;
 	idx_t current_active_buckets = 0;
 	idx_t current_run_count = 0;
 	bool current_run_count_is_exact = false;
@@ -1275,12 +1280,12 @@ private:
 
 public:
 	void Initialize(ClientContext &context, idx_t number_of_rows, Value min_val, Value max_val,
-	                const PrefixRangeFilter::Sizing &sizing) override {
+	                const PrefixRangeFilter::Sizing &sizing, double estimated_multiplicity) override {
 		D_ASSERT(min_val <= max_val);
 		D_ASSERT(number_of_rows > 0);
 		const auto min = NumericConverter<T>::Convert(min_val.GetValueUnsafe<T>());
 		const auto max = NumericConverter<T>::Convert(max_val.GetValueUnsafe<T>());
-		bitmap.Initialize(context, min, max - min, sizing.shift);
+		bitmap.Initialize(context, min, max - min, sizing.shift, number_of_rows, estimated_multiplicity);
 	}
 
 	unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const override {
@@ -1350,16 +1355,14 @@ public:
 		return bitmap.Analyze();
 	}
 
-	Analysis Compress(ClientContext &context, double max_false_positive_rate, idx_t distinct_count_estimate) override {
-		return bitmap.Compress(context, max_false_positive_rate, distinct_count_estimate);
+	Analysis Compress(ClientContext &context, double max_false_positive_rate) override {
+		return bitmap.Compress(context, max_false_positive_rate);
 	}
 
 	unique_ptr<ParallelCompressionState> InitializeParallelCompression(ClientContext &context,
 	                                                                   double max_false_positive_rate,
-	                                                                   idx_t distinct_count_estimate,
 	                                                                   idx_t max_tasks) override {
-		return bitmap.InitializeParallelCompression(context, max_false_positive_rate, distinct_count_estimate,
-		                                            max_tasks);
+		return bitmap.InitializeParallelCompression(context, max_false_positive_rate, max_tasks);
 	}
 
 	CompressionInfo GetCompressionInfo() const override {
@@ -1373,13 +1376,14 @@ private:
 class StringPrefixRangeFilter : public PrefixRangeFilter {
 public:
 	void Initialize(ClientContext &context, idx_t number_of_rows, Value min_val, Value max_val,
-	                const PrefixRangeFilter::Sizing &sizing) override {
+	                const PrefixRangeFilter::Sizing &sizing, double) override {
 		D_ASSERT(min_val <= max_val);
 		D_ASSERT(number_of_rows > 0);
 		const auto min = StringPrefixConverter::Convert(min_val.GetValueUnsafe<string_t>());
 		const auto max = StringPrefixConverter::Convert(max_val.GetValueUnsafe<string_t>());
 		D_ASSERT(min <= max);
-		bitmap.Initialize(context, min, max - min, sizing.shift);
+		// The bitmap represents string prefixes, for which full-string multiplicity is not meaningful.
+		bitmap.Initialize(context, min, max - min, sizing.shift, 0, 1.0);
 	}
 
 	unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const override {
@@ -1465,16 +1469,14 @@ public:
 		return bitmap.Analyze();
 	}
 
-	Analysis Compress(ClientContext &context, double max_false_positive_rate, idx_t) override {
-		// Distinct full strings can still have the same PRF prefix.
-		return bitmap.Compress(context, max_false_positive_rate, 0);
+	Analysis Compress(ClientContext &context, double max_false_positive_rate) override {
+		return bitmap.Compress(context, max_false_positive_rate);
 	}
 
 	unique_ptr<ParallelCompressionState> InitializeParallelCompression(ClientContext &context,
-	                                                                   double max_false_positive_rate, idx_t,
+	                                                                   double max_false_positive_rate,
 	                                                                   idx_t max_tasks) override {
-		// Distinct full strings can still have the same PRF prefix.
-		return bitmap.InitializeParallelCompression(context, max_false_positive_rate, 0, max_tasks);
+		return bitmap.InitializeParallelCompression(context, max_false_positive_rate, max_tasks);
 	}
 
 	CompressionInfo GetCompressionInfo() const override {
