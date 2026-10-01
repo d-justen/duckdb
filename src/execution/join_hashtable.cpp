@@ -851,7 +851,7 @@ void JoinHashTable::CompletePrefixRangeFilterBuild() {
 }
 
 bool JoinHashTable::AnalyzePrefixRangeFilter() {
-	if (!ShouldAnalyzePrefixRangeFilter()) {
+	if (!ShouldCompressPrefixRangeFilter()) {
 		return false;
 	}
 	D_ASSERT(prefix_range_filter);
@@ -869,9 +869,16 @@ bool JoinHashTable::AnalyzePrefixRangeFilter() {
 	return CompletePrefixRangeFilterAnalysis(analysis);
 }
 
+bool JoinHashTable::AnalyzeUncompressedPrefixRangeFilter() {
+	if (!ShouldAnalyzePrefixRangeFilter() || ShouldCompressPrefixRangeFilter()) {
+		return false;
+	}
+	return CompletePrefixRangeFilterAnalysis(prefix_range_filter->Analyze());
+}
+
 unique_ptr<PrefixRangeFilter::ParallelCompressionState>
 JoinHashTable::InitializeParallelPrefixRangeCompression(idx_t max_tasks) {
-	if (!ShouldAnalyzePrefixRangeFilter()) {
+	if (!ShouldCompressPrefixRangeFilter()) {
 		return nullptr;
 	}
 	return prefix_range_filter->InitializeParallelCompression(context,
@@ -882,7 +889,7 @@ bool JoinHashTable::CompletePrefixRangeFilterAnalysis(const PrefixRangeFilter::A
 	D_ASSERT(ShouldAnalyzePrefixRangeFilter());
 	const bool exceeds_threshold = analysis.false_positive_rate > prefix_range_filter_false_positive_rate_threshold;
 	prefix_range_filter->SetAllowsTupleFiltering(!exceeds_threshold);
-	should_analyze_prefix_range_filter = false;
+	prefix_range_filter_post_build_mode = PrefixRangeFilterPostBuildMode::NONE;
 	RecordPrefixRangeFinalState(*prefix_range_filter, exceeds_threshold && HasDeferredBloomFilter());
 	return exceeds_threshold;
 }
@@ -2029,6 +2036,7 @@ void JoinHashTable::ResetForNewIterationSinglePartition() {
 	deferred_bloom_filter_registered = false;
 	prefix_range_filter.reset();
 	should_build_prefix_range_filter = false;
+	prefix_range_filter_post_build_mode = PrefixRangeFilterPostBuildMode::NONE;
 	ResetCorrelatedMarkJoinInfo(*this);
 }
 

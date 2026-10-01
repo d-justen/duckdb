@@ -429,7 +429,8 @@ private:
 
 	unique_ptr<PrefixRangeFilter> prefix_range_filter;
 	bool should_build_prefix_range_filter = false;
-	bool should_analyze_prefix_range_filter = false;
+	enum class PrefixRangeFilterPostBuildMode : uint8_t { NONE, COMPRESS, ANALYZE_ONLY };
+	PrefixRangeFilterPostBuildMode prefix_range_filter_post_build_mode = PrefixRangeFilterPostBuildMode::NONE;
 	double prefix_range_filter_false_positive_rate_threshold = 0.0;
 
 	//! Copying not allowed
@@ -540,8 +541,9 @@ public:
 	}
 	void CompletePrefixRangeFilterBuild();
 
-	void SetAnalyzePrefixRangeFilter(double false_positive_rate_threshold) {
-		should_analyze_prefix_range_filter = true;
+	void SetAnalyzePrefixRangeFilter(double false_positive_rate_threshold, bool enable_compression) {
+		prefix_range_filter_post_build_mode = enable_compression ? PrefixRangeFilterPostBuildMode::COMPRESS
+		                                                         : PrefixRangeFilterPostBuildMode::ANALYZE_ONLY;
 		prefix_range_filter_false_positive_rate_threshold = false_positive_rate_threshold;
 	}
 
@@ -554,10 +556,15 @@ public:
 	}
 
 	bool ShouldAnalyzePrefixRangeFilter() const {
-		return should_analyze_prefix_range_filter && prefix_range_filter;
+		return prefix_range_filter_post_build_mode != PrefixRangeFilterPostBuildMode::NONE && prefix_range_filter;
+	}
+
+	bool ShouldCompressPrefixRangeFilter() const {
+		return prefix_range_filter_post_build_mode == PrefixRangeFilterPostBuildMode::COMPRESS && prefix_range_filter;
 	}
 
 	bool AnalyzePrefixRangeFilter();
+	bool AnalyzeUncompressedPrefixRangeFilter();
 	unique_ptr<PrefixRangeFilter::ParallelCompressionState> InitializeParallelPrefixRangeCompression(idx_t max_tasks);
 	bool CompletePrefixRangeFilterAnalysis(const PrefixRangeFilter::Analysis &analysis);
 

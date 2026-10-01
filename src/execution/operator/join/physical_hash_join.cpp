@@ -1055,17 +1055,21 @@ public:
 		}
 		bool exceeds_threshold = false;
 		if (!build_bloom_filter && sink.hash_table->ShouldAnalyzePrefixRangeFilter()) {
-			auto filter = sink.hash_table->GetPrefixRangeFilter();
-			auto telemetry = filter ? filter->GetTelemetry() : nullptr;
-			if (telemetry) {
-				telemetry->StartCompressionPhase();
+			if (sink.hash_table->ShouldCompressPrefixRangeFilter()) {
+				auto filter = sink.hash_table->GetPrefixRangeFilter();
+				auto telemetry = filter ? filter->GetTelemetry() : nullptr;
+				if (telemetry) {
+					telemetry->StartCompressionPhase();
+				}
+				auto compression_state = sink.hash_table->InitializeParallelPrefixRangeCompression(sink.num_threads);
+				if (compression_state) {
+					ScheduleHashJoinCompression(*pipeline, sink, *this, std::move(compression_state), finalize_hash_table);
+					return;
+				}
+				exceeds_threshold = sink.hash_table->AnalyzePrefixRangeFilter();
+			} else {
+				exceeds_threshold = sink.hash_table->AnalyzeUncompressedPrefixRangeFilter();
 			}
-			auto compression_state = sink.hash_table->InitializeParallelPrefixRangeCompression(sink.num_threads);
-			if (compression_state) {
-				ScheduleHashJoinCompression(*pipeline, sink, *this, std::move(compression_state), finalize_hash_table);
-				return;
-			}
-			exceeds_threshold = sink.hash_table->AnalyzePrefixRangeFilter();
 		}
 		ContinueAfterRuntimeFilterAnalysis(*pipeline, sink, *this, finalize_hash_table, exceeds_threshold);
 	}
@@ -1517,8 +1521,10 @@ JoinFilterPushdownInfo::PlanSummaryFilters(const JoinFilterPushdownSettings &set
 	if (settings.enable_prefix_range_filter_pushdown) {
 		result.prefix_range_plan = PlanPrefixRangeFilter(context, ht, op, cmp, min, max);
 		if (result.prefix_range_plan.HasFilter()) {
+			// Keep compressed fallback planning unchanged; an uncompressed exact bitmap has no false positives.
 			const auto use_fallbacks =
-			    settings.enable_prefix_range_filter_compression && result.prefix_range_plan.NeedsPostBuildAnalysis() &&
+			    (settings.enable_prefix_range_filter_compression ? result.prefix_range_plan.NeedsPostBuildAnalysis()
+			                                                     : result.prefix_range_plan.sizing.shift > 0) &&
 			    (settings.enable_bloom_filter_pushdown || settings.enable_min_max_filter_pushdown);
 			result.type = use_fallbacks ? JoinFilterSummaryPlanType::PREFIX_RANGE_WITH_FALLBACKS
 			                            : JoinFilterSummaryPlanType::PREFIX_RANGE;
@@ -1668,9 +1674,9 @@ void JoinFilterPushdownInfo::RegisterPrefixRangeFilter(const JoinFilterPushdownF
 		}
 		ht.SetPrefixRangeFilter(std::move(prefix_filter));
 		ht.SetBuildPrefixRangeFilter();
-		if (enable_compression) {
+		if (enable_compression || plan.sizing.shift > 0) {
 			static constexpr double PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD = 0.001;
-			ht.SetAnalyzePrefixRangeFilter(PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD);
+			ht.SetAnalyzePrefixRangeFilter(PREFIX_RANGE_FALSE_POSITIVE_RATE_THRESHOLD, enable_compression);
 		}
 	}
 
