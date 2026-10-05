@@ -742,6 +742,26 @@ void JoinHashTable::InsertHashes(Vector &hashes_v, const idx_t count, TupleDataC
 	}
 }
 
+void JoinHashTable::BuildPrefixRangeFilter(idx_t chunk_idx_from, idx_t chunk_idx_to,
+                                           PrefixRangeFilter::BuildState &state) {
+	// Read keys directly from pinned rows, avoiding temporary hash/key vectors and row-pointer copies.
+	auto telemetry = prefix_range_filter->GetDetailedTelemetry();
+	TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::KEEP_EVERYTHING_PINNED, chunk_idx_from,
+	                                chunk_idx_to, false);
+	do {
+		Profiler timer;
+		if (telemetry) {
+			timer.Start();
+		}
+		prefix_range_filter->InsertRows(iterator.GetRowLocations(), iterator.GetCurrentChunkCount(), *layout_ptr,
+		                                state);
+		if (telemetry) {
+			timer.End();
+			state.profiling_insertion_ns += timer.ElapsedNanos();
+		}
+	} while (iterator.Next());
+}
+
 void JoinHashTable::BuildRuntimeJoinFilters(idx_t chunk_idx_from, idx_t chunk_idx_to,
                                             optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state,
                                             bool build_bloom_filter) {
@@ -774,14 +794,14 @@ void JoinHashTable::BuildRuntimeJoinFilters(idx_t chunk_idx_from, idx_t chunk_id
 	} while (iterator.Next());
 }
 
-unique_ptr<PrefixRangeFilter::BuildState> JoinHashTable::InitializePrefixRangeBuildState() {
+unique_ptr<PrefixRangeFilter::BuildState> JoinHashTable::InitializePrefixRangeBuildState(bool in_place) {
 	D_ASSERT(prefix_range_filter);
 	Profiler timer;
 	auto telemetry = prefix_range_filter->GetDetailedTelemetry();
 	if (telemetry) {
 		timer.Start();
 	}
-	auto state = prefix_range_filter->InitializeBuildState(context);
+	auto state = prefix_range_filter->InitializeBuildState(context, in_place);
 	if (telemetry) {
 		timer.End();
 		const auto elapsed = timer.ElapsedNanos();
@@ -933,10 +953,10 @@ void JoinHashTable::InitializePointerTable(idx_t entry_idx_from, idx_t entry_idx
 	std::fill_n(entries.get() + entry_idx_from, entry_idx_to - entry_idx_from, ht_entry_t());
 }
 
-void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel,
-                             optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state) {
+void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel) {
 	// Pointer table should be allocated
 	D_ASSERT(hash_map.get());
+	D_ASSERT(!ShouldBuildPrefixRangeFilter());
 
 	Vector hashes(LogicalType::HASH);
 
@@ -954,9 +974,6 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
 		TupleDataChunkState &chunk_state = iterator.GetChunkState();
 
 		InsertHashes(hashes, count, chunk_state, insert_state, parallel);
-		if (prefix_range_state) {
-			InsertPrefixRangeChunk(chunk_state, count, *prefix_range_state);
-		}
 	} while (iterator.Next());
 }
 

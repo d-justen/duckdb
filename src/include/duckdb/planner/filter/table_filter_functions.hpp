@@ -13,6 +13,7 @@
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/enums/filter_propagate_result.hpp"
 #include "duckdb/common/chrono.hpp"
+#include "duckdb/common/profiler.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/scalar/tablefilter_functions.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -24,6 +25,7 @@ class BaseStatistics;
 class Expression;
 class PerfectHashJoinExecutor;
 class PrefixRangeFilter;
+class TupleDataLayout;
 struct DynamicFilterData;
 
 struct SelectivityOptionalFilterState final : public TableFilterState {
@@ -147,6 +149,9 @@ enum class CompressionMode : uint8_t { BITMAP, DIRECT_RANGES };
 
 //! Profiling-only counters shared by a PRF's build and probe pipelines.
 struct PrefixRangeFilterTelemetry {
+	//! Coordinator-owned interval from initial allocation through the completed merge.
+	//! Event dependencies synchronize the timer's handoff between threads.
+	Profiler build_timer;
 	//! Worker/probe instrumentation is only enabled by profiling_mode='detailed'.
 	bool detailed = false;
 	atomic<idx_t> build_worker_ns {0};
@@ -230,8 +235,12 @@ public:
 	virtual ~PrefixRangeFilter() = default;
 	virtual void Initialize(ClientContext &context, idx_t number_of_rows, Value min, Value max, const Sizing &sizing,
 	                        double estimated_multiplicity = 1.0) = 0;
-	virtual unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const = 0;
+	//! A single builder can populate the initial bitmap in place. The caller must guarantee exclusive access.
+	//! MergeBuildState must still complete the build before postprocessing or probing.
+	virtual unique_ptr<BuildState> InitializeBuildState(ClientContext &context, bool in_place = false) const = 0;
 	virtual void InsertKeys(Vector &keys, idx_t count, BuildState &state) const = 0;
+	//! Insert the first key column of pinned, ordinary tuple-data rows without gathering a temporary vector.
+	virtual void InsertRows(data_ptr_t *rows, idx_t count, const TupleDataLayout &layout, BuildState &state) const = 0;
 	virtual void MergeBuildState(BuildState &state) = 0;
 	virtual idx_t LookupKeys(Vector &keys, SelectionVector &result_sel, idx_t count) const = 0;
 	//! result_sel contains source row ids from sel.

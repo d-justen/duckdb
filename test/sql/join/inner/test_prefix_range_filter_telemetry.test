@@ -1,5 +1,5 @@
 # name: test/sql/join/inner/test_prefix_range_filter_telemetry.test
-# description: Join finalization and PRF postprocessing are elapsed timings; worker metrics are opt-in
+# description: PRF construction and postprocessing have separate elapsed timings; worker metrics are opt-in
 # group: [inner]
 
 statement ok
@@ -40,6 +40,12 @@ EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
 ----
 analyzed_plan	<REGEX>:.*"join_finalize_build_elapsed_seconds": [0-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"prf_build_elapsed_seconds": [0-9].*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)

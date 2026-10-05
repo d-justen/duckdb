@@ -217,8 +217,8 @@ public:
 	//! Finalize the build of the HT, constructing the actual hash table and making the HT ready for probing.
 	//! Finalize must be called before any call to Probe, and after Finalize is called Build should no longer be
 	//! ever called.
-	void Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel,
-	              optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state = nullptr);
+	void Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool parallel);
+	void BuildPrefixRangeFilter(idx_t chunk_idx_from, idx_t chunk_idx_to, PrefixRangeFilter::BuildState &state);
 	void BuildRuntimeJoinFilters(idx_t chunk_idx_from, idx_t chunk_idx_to,
 	                             optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state = nullptr,
 	                             bool build_bloom_filter = false);
@@ -568,7 +568,7 @@ public:
 	unique_ptr<PrefixRangeFilter::ParallelCompressionState> InitializeParallelPrefixRangeCompression(idx_t max_tasks);
 	bool CompletePrefixRangeFilterAnalysis(const PrefixRangeFilter::Analysis &analysis);
 
-	unique_ptr<PrefixRangeFilter::BuildState> InitializePrefixRangeBuildState();
+	unique_ptr<PrefixRangeFilter::BuildState> InitializePrefixRangeBuildState(bool in_place = false);
 	void InsertPrefixRangeChunk(TupleDataChunkState &chunk_state, idx_t count, PrefixRangeFilter::BuildState &state);
 	void MergePrefixRangeBuildState(PrefixRangeFilter::BuildState &state);
 

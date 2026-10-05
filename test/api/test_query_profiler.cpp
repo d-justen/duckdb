@@ -24,7 +24,7 @@ optional_ptr<ProfilingNode> FindJoinFilterProfile(ProfilingNode &node) {
 
 } // namespace
 
-TEST_CASE("Runtime join filter elapsed profiling preserves build paths", "[api][profiling]") {
+TEST_CASE("Runtime join filter elapsed profiling uses a common PRF build", "[api][profiling]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='join_order,build_side_probe_side'"));
@@ -46,6 +46,7 @@ TEST_CASE("Runtime join filter elapsed profiling preserves build paths", "[api][
 	for (auto threads : {1, 4}) {
 		REQUIRE_NO_FAIL(con.Query("SET threads=" + to_string(threads)));
 		for (auto perfect : {false, true}) {
+			unordered_map<string, unordered_map<string, double>> compressed_build_metrics;
 			for (auto mode : {"none", "bloom", "compressed", "uncompressed"}) {
 				const string filter_mode(mode);
 				const bool prf = filter_mode == "compressed" || filter_mode == "uncompressed";
@@ -74,9 +75,12 @@ TEST_CASE("Runtime join filter elapsed profiling preserves build paths", "[api][
 					auto &metrics = node->json_numeric_metrics.at("join_filter");
 					const auto total = metrics.at("join_finalize_elapsed_seconds");
 					const auto build = metrics.at("join_finalize_build_elapsed_seconds");
+					const auto prf_build = metrics.at("prf_build_elapsed_seconds");
 					const auto compression = metrics.at("prf_compression_elapsed_seconds");
 					const auto analysis = metrics.at("prf_analysis_elapsed_seconds");
 					REQUIRE(build > 0);
+					REQUIRE((prf_build > 0) == prf);
+					REQUIRE(prf_build <= build);
 					REQUIRE(total == Approx(build + compression + analysis));
 					REQUIRE((compression > 0) == compressed);
 					REQUIRE((analysis > 0) ==
@@ -92,10 +96,19 @@ TEST_CASE("Runtime join filter elapsed profiling preserves build paths", "[api][
 						REQUIRE(prf_metrics.count("build_worker_seconds") == 0);
 						REQUIRE(prf_metrics.count("probe_worker_seconds") == 0);
 						REQUIRE(prf_metrics.count("build_phase_elapsed_seconds") == 0);
-						const auto tasks = name == "exact" && threads == 4 ? (compressed ? 4 : 16) : 1;
+						const auto tasks = name == "exact" && threads == 4 ? 4 : 1;
 						REQUIRE(prf_metrics.at("build_task_count") == tasks);
-						REQUIRE(prf_metrics.at("local_bitmap_count") == tasks);
+						REQUIRE(prf_metrics.at("local_bitmap_count") == (tasks == 1 ? 0 : tasks));
 						REQUIRE(prf_metrics.at("bloom_fallback_selected") == (name == "sparse" ? 1 : 0));
+						if (compressed) {
+							compressed_build_metrics[name] = prf_metrics;
+						} else {
+							// Parallel sinking can produce different chunk counts for the same build rows.
+							for (auto metric : {"build_task_count", "local_bitmap_count",
+							                    "local_bitmap_bytes_allocated", "local_bitmap_peak_bytes"}) {
+								REQUIRE(prf_metrics.at(metric) == compressed_build_metrics.at(name).at(metric));
+							}
+						}
 					}
 				}
 			}
@@ -113,6 +126,8 @@ TEST_CASE("Runtime join filter elapsed profiling preserves build paths", "[api][
 		auto &prf = node->json_numeric_metrics.at("prefix_range_filter");
 		REQUIRE(metrics.at("finalize_count") == 1);
 		REQUIRE(metrics.at("bloom_build_count") == 0);
+		REQUIRE(metrics.at("prf_build_elapsed_seconds") > 0);
+		REQUIRE(metrics.at("prf_build_elapsed_seconds") <= metrics.at("join_finalize_build_elapsed_seconds"));
 		REQUIRE(prf.at("final_prf_enabled") == 0);
 		REQUIRE(prf.at("bloom_fallback_selected") == 0);
 		REQUIRE(prf.at("build_worker_seconds") > 0);
@@ -142,10 +157,77 @@ TEST_CASE("Runtime join filter elapsed profiling counts repeated and reused buil
 		REQUIRE(metrics.at("finalize_count") == (reuse ? 1 : 4));
 		REQUIRE(metrics.at("join_finalize_elapsed_seconds") > 0);
 		REQUIRE(metrics.at("join_finalize_elapsed_seconds") == metrics.at("join_finalize_build_elapsed_seconds"));
+		REQUIRE(metrics.at("prf_build_elapsed_seconds") == 0);
 		// Repeated snapshots must not add the same completed builds again.
 		con.GetProfilingInformation(ProfilerPrintFormat::JSON);
 		con.GetProfilingInformation(ProfilerPrintFormat::JSON);
 		REQUIRE(metrics.at("finalize_count") == (reuse ? 1 : 4));
+	}
+}
+
+TEST_CASE("Runtime join filter PRF timing survives recursive rebuilds and reuse", "[api][profiling]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='join_order,build_side_probe_side'"));
+	REQUIRE_NO_FAIL(con.Query("SET enable_perfect_hash_join_filter_pushdown=false"));
+	REQUIRE_NO_FAIL(con.Query("SET enable_join_min_max_filter_pushdown=false"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE recursive_probe AS SELECT i k FROM range(5000) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE recursive_build AS SELECT * FROM recursive_probe"));
+	con.EnableProfiling();
+	con.context->config.emit_profiler_output = false;
+	for (auto compress : {false, true}) {
+		REQUIRE_NO_FAIL(
+		    con.Query(string("SET enable_prefix_range_filter_compression=") + (compress ? "true" : "false")));
+		for (auto reuse : {false, true}) {
+			CAPTURE(compress, reuse);
+			const string query =
+			    reuse ? "WITH RECURSIVE t(depth,n) AS (SELECT 0,0::BIGINT UNION ALL SELECT t.depth+1, counts.n "
+			            "FROM t CROSS JOIN (SELECT count(*) n FROM recursive_probe p JOIN recursive_build b "
+			            "ON p.k=b.k AND p.k%7>=b.k%7) counts WHERE t.depth<2) SELECT sum(n) FROM t"
+			          : "WITH RECURSIVE t(k,depth) AS (SELECT k,0 FROM recursive_build UNION ALL "
+			            "SELECT p.k,t.depth+1 FROM recursive_probe p JOIN t ON p.k=t.k AND p.k%7>=t.k%7 "
+			            "WHERE t.depth<2) SELECT count(*) FROM t";
+			auto result = con.Query(query);
+			REQUIRE_NO_FAIL(*result);
+			REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == (reuse ? 10000 : 15000));
+			auto node = FindJoinFilterProfile(*con.GetProfilingTree());
+			REQUIRE(node);
+			auto &metrics = node->json_numeric_metrics.at("join_filter");
+			REQUIRE(metrics.at("finalize_count") == (reuse ? 1 : 3));
+			REQUIRE(metrics.at("prf_build_count") == (reuse ? 1 : 2));
+			REQUIRE(metrics.at("prf_build_elapsed_seconds") > 0);
+			REQUIRE(metrics.at("prf_build_elapsed_seconds") <= metrics.at("join_finalize_build_elapsed_seconds"));
+			REQUIRE((metrics.at("prf_compression_elapsed_seconds") > 0) == compress);
+			REQUIRE(metrics.at("prf_analysis_elapsed_seconds") == 0);
+			const auto build_time = metrics.at("prf_build_elapsed_seconds");
+			con.GetProfilingInformation(ProfilerPrintFormat::JSON);
+			con.GetProfilingInformation(ProfilerPrintFormat::JSON);
+			REQUIRE(metrics.at("prf_build_elapsed_seconds") == build_time);
+		}
+	}
+}
+
+TEST_CASE("Runtime join filter common PRF scan handles nullable build input", "[api][profiling]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET threads=1; SET disabled_optimizers='join_order,build_side_probe_side'"));
+	REQUIRE_NO_FAIL(con.Query("SET enable_perfect_hash_join_filter_pushdown=false"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE nullable_build AS SELECT NULL::BIGINT k FROM range(10000) "
+	                          "UNION ALL SELECT i FROM range(5000) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE nullable_probe AS SELECT i k FROM range(10000) t(i)"));
+	con.EnableProfiling();
+	con.context->config.emit_profiler_output = false;
+	for (auto compress : {false, true}) {
+		REQUIRE_NO_FAIL(
+		    con.Query(string("SET enable_prefix_range_filter_compression=") + (compress ? "true" : "false")));
+		auto result = con.Query("SELECT count(*), count(p.k) FROM nullable_probe p JOIN nullable_build b "
+		                        "ON p.k=b.k AND p.k%7>=b.k%7");
+		REQUIRE_NO_FAIL(*result);
+		REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 5000);
+		REQUIRE(result->GetValue(1, 0).GetValue<int64_t>() == 5000);
+		auto node = FindJoinFilterProfile(*con.GetProfilingTree());
+		REQUIRE(node);
+		REQUIRE(node->json_numeric_metrics.at("join_filter").at("prf_build_count") == 1);
 	}
 }
 

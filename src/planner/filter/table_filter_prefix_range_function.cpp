@@ -31,6 +31,7 @@
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/uhugeint.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/types/row/tuple_data_layout.hpp"
 #include "duckdb/common/uhugeint.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -97,8 +98,12 @@ public:
 		initialized = false;
 	}
 
-	unique_ptr<PrefixRangeBitmapBuildState> InitializeBuildState(ClientContext &context) const {
+	unique_ptr<PrefixRangeBitmapBuildState> InitializeBuildState(ClientContext &context, bool in_place) const {
 		D_ASSERT(bitmap);
+		if (in_place) {
+			D_ASSERT(!initialized);
+			return make_uniq<PrefixRangeBitmapBuildState>(AllocatedData(), bitmap);
+		}
 		uint64_t *state_bitmap;
 		auto state_data = AllocateBitmap(context, word_count, state_bitmap);
 		auto state = make_uniq<PrefixRangeBitmapBuildState>(std::move(state_data), state_bitmap);
@@ -117,12 +122,28 @@ public:
 	}
 
 	void MergeBuildState(PrefixRangeBitmapBuildState &state) {
-		for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
-			bitmap[word_idx] |= state.bitmap[word_idx];
+		if (bitmap != state.bitmap) {
+			for (idx_t word_idx = 0; word_idx < word_count; word_idx++) {
+				bitmap[word_idx] |= state.bitmap[word_idx];
+			}
 		}
 		initialized = true;
 		analysis_cached = false;
 		compression_finalized = false;
+	}
+
+	template <typename T, typename CONVERTER>
+	void InsertRows(data_ptr_t *rows, idx_t count, const TupleDataLayout &layout, uint64_t *state_bitmap) const {
+		D_ASSERT(!layout.IsSortKeyLayout());
+		const auto offset = layout.GetOffsets()[0];
+		for (idx_t i = 0; i < count; i++) {
+			if (layout.CanHaveNull() && !TupleDataLayout::ValidityBytes(rows[i], layout.ColumnCount()).RowIsValid(0)) {
+				continue;
+			}
+			const U y = CONVERTER::Convert(Load<T>(rows[i] + offset)) - min;
+			const U idx = y >> shift;
+			state_bitmap[idx >> WORD_SHIFT] |= 1ULL << (idx & WORD_MASK);
+		}
 	}
 
 	template <typename T, typename CONVERTER>
@@ -1291,13 +1312,18 @@ public:
 		bitmap.Initialize(context, min, max - min, sizing.shift, number_of_rows, estimated_multiplicity);
 	}
 
-	unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const override {
-		return bitmap.InitializeBuildState(context);
+	unique_ptr<BuildState> InitializeBuildState(ClientContext &context, bool in_place) const override {
+		return bitmap.InitializeBuildState(context, in_place);
 	}
 
 	void InsertKeys(Vector &keys, idx_t count, BuildState &state) const override {
 		auto &bitmap_state = state.Cast<PrefixRangeBitmapBuildState>();
 		bitmap.template InsertKeys<T, NumericConverter<T>>(keys, count, bitmap_state.bitmap);
+	}
+
+	void InsertRows(data_ptr_t *rows, idx_t count, const TupleDataLayout &layout, BuildState &state) const override {
+		bitmap.template InsertRows<T, NumericConverter<T>>(rows, count, layout,
+		                                                   state.Cast<PrefixRangeBitmapBuildState>().bitmap);
 	}
 
 	void MergeBuildState(BuildState &state) override {
@@ -1389,13 +1415,18 @@ public:
 		bitmap.Initialize(context, min, max - min, sizing.shift, 0, 1.0);
 	}
 
-	unique_ptr<BuildState> InitializeBuildState(ClientContext &context) const override {
-		return bitmap.InitializeBuildState(context);
+	unique_ptr<BuildState> InitializeBuildState(ClientContext &context, bool in_place) const override {
+		return bitmap.InitializeBuildState(context, in_place);
 	}
 
 	void InsertKeys(Vector &keys, idx_t count, BuildState &state) const override {
 		auto &bitmap_state = state.Cast<PrefixRangeBitmapBuildState>();
 		bitmap.template InsertKeys<string_t, StringPrefixConverter>(keys, count, bitmap_state.bitmap);
+	}
+
+	void InsertRows(data_ptr_t *rows, idx_t count, const TupleDataLayout &layout, BuildState &state) const override {
+		bitmap.template InsertRows<string_t, StringPrefixConverter>(rows, count, layout,
+		                                                            state.Cast<PrefixRangeBitmapBuildState>().bitmap);
 	}
 
 	void MergeBuildState(BuildState &state) override {

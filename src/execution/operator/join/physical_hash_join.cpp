@@ -296,11 +296,12 @@ unique_ptr<JoinFilterGlobalState> JoinFilterPushdownInfo::GetGlobalState(ClientC
 }
 
 //! Coordinator-owned elapsed timings. Event dependencies synchronize handoffs between threads.
-//! This measures the existing finalization path, including fused hash-table/filter construction.
+//! Finalization includes the separate PRF build and fused hash-table/Bloom construction.
 //! External joins report initial finalization only; later source-side build/probe rounds are excluded.
 struct JoinFilterProfile {
 	Profiler finalize_timer;
 	Profiler postprocess_timer;
+	idx_t prf_build_ns = 0;
 	idx_t compression_ns = 0;
 	idx_t analysis_ns = 0;
 	bool compressing = false;
@@ -340,10 +341,11 @@ struct JoinFilterProfile {
 		}
 		constexpr double NS_TO_SECONDS = 1e-9;
 		const auto total = finalize_timer.ElapsedNanos();
-		D_ASSERT(total >= compression_ns + analysis_ns);
+		D_ASSERT(total >= prf_build_ns + compression_ns + analysis_ns);
 		return {{"join_finalize_elapsed_seconds", static_cast<double>(total) * NS_TO_SECONDS},
 		        {"join_finalize_build_elapsed_seconds",
 		         static_cast<double>(total - compression_ns - analysis_ns) * NS_TO_SECONDS},
+		        {"prf_build_elapsed_seconds", static_cast<double>(prf_build_ns) * NS_TO_SECONDS},
 		        {"prf_compression_elapsed_seconds", static_cast<double>(compression_ns) * NS_TO_SECONDS},
 		        {"prf_analysis_elapsed_seconds", static_cast<double>(analysis_ns) * NS_TO_SECONDS},
 		        {"finalize_count", 1},
@@ -800,18 +802,17 @@ static void ExecuteHashJoinTableInitTask(HashJoinGlobalSinkState &sink, idx_t en
 	sink.hash_table->InitializePointerTable(entry_idx_from, entry_idx_to);
 }
 
-static void ExecuteHashJoinFinalizeTask(HashJoinGlobalSinkState &sink, optional_idx partition_idx,
-                                        optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state) {
+static void ExecuteHashJoinFinalizeTask(HashJoinGlobalSinkState &sink, optional_idx partition_idx) {
 	const auto &data_collection = sink.hash_table->GetDataCollection();
 	if (!partition_idx.IsValid() || sink.hash_table->GetRadixBits() == 0) {
 		// Unpartitioned builds still finalize over the full chunk range even if the scheduler created a
 		// single "partition 0" task, because tuple-data segments are not tagged with partition ids there.
-		sink.hash_table->Finalize(0U, data_collection.ChunkCount(), false, prefix_range_state);
+		sink.hash_table->Finalize(0U, data_collection.ChunkCount(), false);
 	} else {
 		// Parallel finalize - each thread processes one partition
 		const auto chunk_ranges = data_collection.GetChunkRangesForPartition(partition_idx.GetIndex());
 		for (auto &chunk_range : chunk_ranges) {
-			sink.hash_table->Finalize(chunk_range.first, chunk_range.second, true, prefix_range_state);
+			sink.hash_table->Finalize(chunk_range.first, chunk_range.second, true);
 		}
 	}
 }
@@ -884,14 +885,12 @@ public:
 
 class HashJoinFinalizeTask : public ExecutorTask {
 public:
-	HashJoinFinalizeTask(HashJoinGlobalSinkState &sink_p, shared_ptr<Event> event, optional_idx partition_idx_p,
-	                     optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state_p = nullptr)
-	    : ExecutorTask(sink_p.context, std::move(event), sink_p.op), sink(sink_p), partition_idx(partition_idx_p),
-	      prefix_range_state(prefix_range_state_p) {
+	HashJoinFinalizeTask(HashJoinGlobalSinkState &sink_p, shared_ptr<Event> event, optional_idx partition_idx_p)
+	    : ExecutorTask(sink_p.context, std::move(event), sink_p.op), sink(sink_p), partition_idx(partition_idx_p) {
 	}
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
-		ExecuteHashJoinFinalizeTask(sink, partition_idx, prefix_range_state);
+		ExecuteHashJoinFinalizeTask(sink, partition_idx);
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
@@ -902,12 +901,7 @@ public:
 private:
 	HashJoinGlobalSinkState &sink;
 	optional_idx partition_idx;
-	optional_ptr<PrefixRangeFilter::BuildState> prefix_range_state;
 };
-
-static bool NeedsRuntimeJoinFilterBuild(const JoinHashTable &ht) {
-	return ht.ShouldBuildPrefixRangeFilter() || ht.ShouldBuildBloomFilter();
-}
 
 static void ScheduleHashJoinTableFinalize(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event);
 static void ContinueAfterRuntimeFilterAnalysis(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event,
@@ -1030,6 +1024,24 @@ private:
 	bool build_bloom_filter;
 };
 
+static void ExecutePrefixRangeBuild(JoinHashTable &ht, idx_t first_chunk, idx_t chunk_count,
+                                    optional_ptr<atomic<idx_t>> next_chunk,
+                                    unique_ptr<PrefixRangeFilter::BuildState> &state_slot) {
+	// Direct execution has one exclusive builder, so it can use the initial bitmap without a local copy.
+	state_slot = ht.InitializePrefixRangeBuildState(!next_chunk);
+	if (!next_chunk) {
+		// One iterator and no work-distribution atomics for a single builder.
+		ht.BuildPrefixRangeFilter(0, chunk_count, *state_slot);
+		return;
+	}
+	auto chunk_idx = first_chunk;
+	do {
+		const auto chunk_idx_to = MinValue<idx_t>(chunk_idx + HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK, chunk_count);
+		ht.BuildPrefixRangeFilter(chunk_idx, chunk_idx_to, *state_slot);
+		chunk_idx = next_chunk->fetch_add(HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK, std::memory_order_relaxed);
+	} while (chunk_idx < chunk_count);
+}
+
 class HashJoinPrefixRangeBuildTask : public ExecutorTask {
 public:
 	HashJoinPrefixRangeBuildTask(HashJoinGlobalSinkState &sink_p, shared_ptr<Event> event_p, idx_t first_chunk_p,
@@ -1040,16 +1052,7 @@ public:
 	}
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
-		state_slot = sink.hash_table->InitializePrefixRangeBuildState();
-		BuildBlock(first_chunk);
-		while (true) {
-			const auto chunk_idx =
-			    next_chunk.fetch_add(HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK, std::memory_order_relaxed);
-			if (chunk_idx >= chunk_count) {
-				break;
-			}
-			BuildBlock(chunk_idx);
-		}
+		ExecutePrefixRangeBuild(*sink.hash_table, first_chunk, chunk_count, &next_chunk, state_slot);
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
@@ -1059,11 +1062,6 @@ public:
 	}
 
 private:
-	void BuildBlock(idx_t chunk_idx) {
-		const auto chunk_idx_to = MinValue<idx_t>(chunk_idx + HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK, chunk_count);
-		sink.hash_table->BuildRuntimeJoinFilters(chunk_idx, chunk_idx_to, state_slot.get(), false);
-	}
-
 	HashJoinGlobalSinkState &sink;
 	idx_t first_chunk;
 	idx_t chunk_count;
@@ -1079,11 +1077,13 @@ static void MergePrefixRangeStates(HashJoinGlobalSinkState &sink,
 	auto telemetry = sink.hash_table->GetPrefixRangeFilter()->GetTelemetry();
 	if (telemetry) {
 		idx_t bytes = 0;
+		idx_t bitmap_count = 0;
 		for (auto &state : states) {
 			bytes += state->bitmap_allocation_bytes;
+			bitmap_count += state->bitmap_allocation_bytes > 0 ? 1 : 0;
 		}
 		// All task-local bitmaps remain alive until this barrier; no per-allocation atomics are needed.
-		telemetry->local_bitmap_count.fetch_add(states.size(), std::memory_order_relaxed);
+		telemetry->local_bitmap_count.fetch_add(bitmap_count, std::memory_order_relaxed);
 		telemetry->local_bitmap_bytes_allocated.fetch_add(bytes, std::memory_order_relaxed);
 		telemetry->local_bitmap_peak_bytes.store(
 		    MaxValue(bytes, telemetry->local_bitmap_peak_bytes.load(std::memory_order_relaxed)),
@@ -1120,13 +1120,8 @@ public:
 			D_ASSERT(chunk_count > 0);
 			const auto block_count = (chunk_count - 1) / HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK + 1;
 			const auto task_count = FinalizeSingleThreaded(sink, false) ? 1 : MinValue(sink.num_threads, block_count);
-			prefix_range_states.resize(task_count);
+			InitializePrefixRangeStates(task_count);
 			next_chunk_idx.store(task_count * HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK, std::memory_order_relaxed);
-			auto telemetry = ht.GetPrefixRangeFilter()->GetTelemetry();
-			if (telemetry) {
-				telemetry->build_chunk_count.fetch_add(chunk_count, std::memory_order_relaxed);
-				telemetry->build_task_count.fetch_add(task_count, std::memory_order_relaxed);
-			}
 			for (idx_t task_idx = 0; task_idx < task_count; task_idx++) {
 				filter_tasks.push_back(make_uniq<HashJoinPrefixRangeBuildTask>(
 				    sink, shared_from_this(), task_idx * HASH_JOIN_FILTER_BUILD_CHUNKS_PER_TASK, chunk_count,
@@ -1146,9 +1141,39 @@ public:
 	}
 
 	void FinishEvent() override {
+		FinishBuild(*this);
+	}
+
+	void ExecutePrefixRangeDirectly(Event &parent) {
+		D_ASSERT(!build_bloom_filter);
+		InitializePrefixRangeStates(1);
+		ExecutePrefixRangeBuild(*sink.hash_table, 0, sink.hash_table->GetDataCollection().ChunkCount(), nullptr,
+		                        prefix_range_states[0]);
+		// Continuations must attach to the scheduled parent, not this unscheduled event.
+		FinishBuild(parent);
+	}
+
+private:
+	void InitializePrefixRangeStates(idx_t task_count) {
+		prefix_range_states.resize(task_count);
+		auto telemetry = sink.hash_table->GetPrefixRangeFilter()->GetTelemetry();
+		if (telemetry) {
+			telemetry->build_chunk_count.fetch_add(sink.hash_table->GetDataCollection().ChunkCount(),
+			                                       std::memory_order_relaxed);
+			telemetry->build_task_count.fetch_add(task_count, std::memory_order_relaxed);
+		}
+	}
+
+	void FinishBuild(Event &parent) {
 		MergePrefixRangeStates(sink, prefix_range_states);
 		if (!build_bloom_filter) {
 			sink.hash_table->CompletePrefixRangeFilterBuild();
+			if (sink.finalize_profile) {
+				auto telemetry = sink.hash_table->GetPrefixRangeFilter()->GetTelemetry();
+				D_ASSERT(telemetry);
+				telemetry->build_timer.End();
+				sink.finalize_profile->prf_build_ns = telemetry->build_timer.ElapsedNanos();
+			}
 		}
 		bool exceeds_threshold = false;
 		if (!build_bloom_filter && sink.hash_table->ShouldAnalyzePrefixRangeFilter()) {
@@ -1158,7 +1183,8 @@ public:
 			if (sink.hash_table->ShouldCompressPrefixRangeFilter()) {
 				auto compression_state = sink.hash_table->InitializeParallelPrefixRangeCompression(sink.num_threads);
 				if (compression_state) {
-					ScheduleHashJoinCompression(*pipeline, sink, *this, std::move(compression_state), finalize_hash_table);
+					ScheduleHashJoinCompression(*pipeline, sink, parent, std::move(compression_state),
+					                            finalize_hash_table);
 					return;
 				}
 				exceeds_threshold = sink.hash_table->AnalyzePrefixRangeFilter();
@@ -1169,7 +1195,7 @@ public:
 				sink.finalize_profile->FinishPostprocess();
 			}
 		}
-		ContinueAfterRuntimeFilterAnalysis(*pipeline, sink, *this, finalize_hash_table, exceeds_threshold);
+		ContinueAfterRuntimeFilterAnalysis(*pipeline, sink, parent, finalize_hash_table, exceeds_threshold);
 	}
 
 private:
@@ -1179,6 +1205,17 @@ private:
 	atomic<idx_t> next_chunk_idx {0};
 	vector<unique_ptr<PrefixRangeFilter::BuildState>> prefix_range_states;
 };
+
+static void SchedulePrefixRangeBuild(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event,
+                                     bool finalize_hash_table) {
+	if (FinalizeSingleThreaded(sink, false)) {
+		HashJoinRuntimeFilterEvent filter_event(pipeline, sink, false, finalize_hash_table);
+		filter_event.ExecutePrefixRangeDirectly(event);
+	} else {
+		auto filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(pipeline, sink, false, finalize_hash_table);
+		event.InsertEvent(std::move(filter_event));
+	}
+}
 
 static void ContinueAfterRuntimeFilterAnalysis(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event,
                                                bool finalize_hash_table, bool exceeds_threshold) {
@@ -1212,7 +1249,6 @@ public:
 public:
 	vector<shared_ptr<Task>> GetTasks() {
 		auto &ht = *sink.hash_table;
-		const auto build_prefix_range_filter = ht.ShouldBuildPrefixRangeFilter();
 		if (ht.ShouldBuildBloomFilter()) {
 			if (sink.finalize_profile) {
 				sink.finalize_profile->bloom_built = true;
@@ -1221,9 +1257,7 @@ public:
 		}
 		vector<shared_ptr<Task>> finalize_tasks;
 		if (FinalizeSingleThreaded(sink, false)) {
-			auto prefix_range_state = build_prefix_range_filter ? RegisterPrefixRangeState(ht) : nullptr;
-			finalize_tasks.push_back(
-			    make_uniq<HashJoinFinalizeTask>(sink, shared_from_this(), optional_idx(), prefix_range_state));
+			finalize_tasks.push_back(make_uniq<HashJoinFinalizeTask>(sink, shared_from_this(), optional_idx()));
 			return finalize_tasks;
 		}
 
@@ -1234,9 +1268,7 @@ public:
 			if (sink.external && !current_partitions.RowIsValidUnsafe(partition_idx)) {
 				continue; // Partition is not being built on
 			}
-			auto prefix_range_state = build_prefix_range_filter ? RegisterPrefixRangeState(ht) : nullptr;
-			finalize_tasks.push_back(
-			    make_uniq<HashJoinFinalizeTask>(sink, shared_from_this(), partition_idx, prefix_range_state));
+			finalize_tasks.push_back(make_uniq<HashJoinFinalizeTask>(sink, shared_from_this(), partition_idx));
 		}
 		return finalize_tasks;
 	}
@@ -1249,8 +1281,7 @@ public:
 			}
 			ht.EnsureBloomFilterInitialized();
 		}
-		auto prefix_range_state = ht.ShouldBuildPrefixRangeFilter() ? RegisterPrefixRangeState(ht) : nullptr;
-		ExecuteHashJoinFinalizeTask(sink, optional_idx(), prefix_range_state);
+		ExecuteHashJoinFinalizeTask(sink, optional_idx());
 		FinishTasks(false);
 	}
 
@@ -1266,10 +1297,6 @@ public:
 
 private:
 	void FinishTasks(bool build_dictionary_arrays) {
-		MergePrefixRangeStates(sink, prefix_range_states);
-		if (!prefix_range_states.empty()) {
-			sink.hash_table->CompletePrefixRangeFilterBuild();
-		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
 
 		// chains are final; materialize dict_arrays and overwrite NEXT_PTR with the dict index
@@ -1281,32 +1308,20 @@ private:
 		sink.hash_table->finalized = true;
 		sink.FinishFinalizeProfiling();
 	}
-
-	optional_ptr<PrefixRangeFilter::BuildState> RegisterPrefixRangeState(JoinHashTable &ht) {
-		auto telemetry = ht.GetPrefixRangeFilter()->GetTelemetry();
-		if (telemetry) {
-			if (prefix_range_states.empty()) {
-				telemetry->build_chunk_count.fetch_add(ht.GetDataCollection().ChunkCount(), std::memory_order_relaxed);
-			}
-			telemetry->build_task_count.fetch_add(1, std::memory_order_relaxed);
-		}
-		prefix_range_states.push_back(ht.InitializePrefixRangeBuildState());
-		return *prefix_range_states.back();
-	}
-
-	vector<unique_ptr<PrefixRangeFilter::BuildState>> prefix_range_states;
 };
 
 static void ScheduleHashJoinTableFinalize(Pipeline &pipeline, HashJoinGlobalSinkState &sink, Event &event) {
 	sink.hash_table->AllocatePointerTable();
 
-	auto new_init_event = make_shared_ptr<HashJoinTableInitEvent>(pipeline, sink);
 	if (FinalizeSingleThreaded(sink, false)) {
-		new_init_event->ExecuteDirectly();
-		auto new_finalize_event = make_shared_ptr<HashJoinFinalizeEvent>(pipeline, sink);
-		new_finalize_event->ExecuteDirectly();
+		// These events execute synchronously and never enter the scheduler's dependency graph.
+		HashJoinTableInitEvent init_event(pipeline, sink);
+		init_event.ExecuteDirectly();
+		HashJoinFinalizeEvent finalize_event(pipeline, sink);
+		finalize_event.ExecuteDirectly();
 		return;
 	}
+	auto new_init_event = make_shared_ptr<HashJoinTableInitEvent>(pipeline, sink);
 	event.InsertEvent(new_init_event);
 
 	auto new_finalize_event = make_shared_ptr<HashJoinFinalizeEvent>(pipeline, sink);
@@ -1319,10 +1334,10 @@ void HashJoinGlobalSinkState::ScheduleFinalize(Pipeline &pipeline, Event &event)
 		FinishFinalizeProfiling();
 		return;
 	}
-	if (hash_table->ShouldAnalyzePrefixRangeFilter()) {
-		// Decide whether Bloom is needed while the stored build hashes are still available.
-		auto filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(pipeline, *this, false, true);
-		event.InsertEvent(std::move(filter_event));
+	if (hash_table->ShouldBuildPrefixRangeFilter()) {
+		// Both PRF modes construct the same bitmap before postprocessing and HT finalization.
+		// Any Bloom fallback still uses the stored hashes during HT finalization.
+		SchedulePrefixRangeBuild(pipeline, *this, event, true);
 		return;
 	}
 	ScheduleHashJoinTableFinalize(pipeline, *this, event);
@@ -1702,6 +1717,7 @@ void JoinFilterPushdownInfo::RegisterPrefixRangeFilter(const JoinFilterPushdownF
 		Profiler build_timer;
 		if (profiler.IsEnabled()) {
 			telemetry = make_shared_ptr<PrefixRangeFilterTelemetry>();
+			telemetry->build_timer.Start();
 			telemetry->detailed = ClientConfig::GetConfig(context).enable_detailed_profiling;
 			if (telemetry->detailed) {
 				build_timer.Start();
@@ -2104,9 +2120,10 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	// In case of a large build side or duplicates, use regular hash join
 	if (!use_perfect_hash) {
 		sink.ScheduleFinalize(pipeline, event);
-	} else if (NeedsRuntimeJoinFilterBuild(ht)) {
-		const auto build_bloom_filter = !ht.ShouldBuildPrefixRangeFilter() && ht.ShouldBuildBloomFilter();
-		auto runtime_filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(pipeline, sink, build_bloom_filter);
+	} else if (ht.ShouldBuildPrefixRangeFilter()) {
+		SchedulePrefixRangeBuild(pipeline, sink, event, false);
+	} else if (ht.ShouldBuildBloomFilter()) {
+		auto runtime_filter_event = make_shared_ptr<HashJoinRuntimeFilterEvent>(pipeline, sink, true);
 		event.InsertEvent(std::move(runtime_filter_event));
 	} else {
 		sink.FinishFinalizeProfiling();

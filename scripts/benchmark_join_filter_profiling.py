@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare runtime filter preparation without changing the execution strategy.
+"""Compare runtime filter preparation and common PRF construction.
 
 Example:
   python3 scripts/benchmark_join_filter_profiling.py \
@@ -12,10 +12,18 @@ separate persistent process. Engine calls are timed inside that process, excludi
 IPC, result extraction and startup. Profiled runs use EXPLAIN ANALYZE; unprofiled
 runs execute the same SELECT with profiling disabled. Both include planning.
 
-The JSON join_filter metrics measure finalization (including hash-table work),
-not filter-only time. Paired differences from the 'none' configuration estimate
-incremental filter build overhead. Compression/analysis are reported separately;
-Bloom fallback remains in the build measurement. Negative differences are kept.
+The JSON join_filter.prf_build_elapsed_seconds directly measures PRF construction
+from initial bitmap allocation through merging and releasing local bitmaps. Both
+PRF modes use the same construction path; compression/analysis follow separately.
+It includes filter registration and scheduling, and excludes hash-table finalization.
+A single PRF builder fills the initial bitmap in place (zero local bitmap allocations);
+parallel builders allocate bounded local bitmaps and merge them before postprocessing.
+
+join_finalize_build_elapsed_seconds includes hash-table work and any Bloom build,
+including fallback. Bloom construction remains fused with ordinary hash-table
+finalization. Paired differences from the 'none' configuration estimate incremental
+filter build overhead; they are not direct Bloom-only measurements. Negative
+differences are kept. Direct PRF timings and these estimates have different scopes.
 Detailed profiling is opt-in via --detailed. Its worker times are not elapsed time.
 
 The old PRF build_phase_elapsed_seconds and compression_phase_elapsed_seconds
@@ -251,12 +259,37 @@ def describe(values):
     )
 
 
+def compare_runs(candidate, reference, rng):
+    ratios = [c / r for c, r in zip(candidate, reference)]
+    bootstrap = [statistics.median(rng.choices(ratios, k=len(ratios))) for _ in range(1000)]
+    return dict(
+        candidate_over_reference=statistics.median(ratios),
+        bootstrap_95_percent_interval=[percentile(bootstrap, 0.025), percentile(bootstrap, 0.975)],
+    )
+
+
+PRF_BUILD_RESOURCES = (
+    'build_chunk_count',
+    'build_task_count',
+    'local_bitmap_count',
+    'local_bitmap_bytes_allocated',
+    'local_bitmap_peak_bytes',
+)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--library', required=True, type=Path)
     parser.add_argument('--reference-library', type=Path)
     parser.add_argument('--rows', type=int, default=1300000)
     parser.add_argument('--threads', type=int, nargs='+', default=[1, 4])
+    parser.add_argument(
+        '--modes',
+        choices=['bloom', 'compressed', 'uncompressed'],
+        nargs='+',
+        default=['bloom', 'compressed', 'uncompressed'],
+        help='Filter modes to compare; the filters-disabled baseline is always included',
+    )
     parser.add_argument(
         '--workloads',
         choices=['small', 'exact', 'clustered', 'sparse'],
@@ -275,6 +308,7 @@ def main():
     if args.reference_library:
         libraries['reference'] = str(args.reference_library.resolve(strict=True))
     workers = {}
+    modes = ['none', *dict.fromkeys(args.modes)]
     samples = {}
     rng = random.Random(args.seed)
     try:
@@ -290,11 +324,9 @@ def main():
             for threads in args.threads:
                 plan = None
                 for iteration in range(-args.warmups, args.repetitions):
+                    prf_builds = {}
                     jobs = [
-                        (label, profiled, mode)
-                        for label in workers
-                        for profiled in (False, True)
-                        for mode in ('none', 'bloom', 'compressed', 'uncompressed')
+                        (label, profiled, mode) for label in workers for profiled in (False, True) for mode in modes
                     ]
                     rng.shuffle(jobs)
                     for label, profiled, mode in jobs:
@@ -322,9 +354,23 @@ def main():
                                     or metrics['bloom_build_count'] != int(bloom_expected)
                                 ):
                                     raise RuntimeError('Requested filter configuration was not executed')
+                                prf_seconds = metrics['prf_build_elapsed_seconds']
+                                if (prf_seconds > 0) != prf_expected or not (
+                                    0 <= prf_seconds <= metrics['join_finalize_build_elapsed_seconds']
+                                ):
+                                    raise RuntimeError('Invalid PRF construction interval')
+                                if prf_expected:
+                                    # Parallel sinking can fragment the same rows into different numbers of chunks.
+                                    prf_builds[mode] = {
+                                        m: result['prf'][m] for m in PRF_BUILD_RESOURCES if m != 'build_chunk_count'
+                                    }
                         if iteration >= 0:
                             key = (label, workload, threads, profiled, mode)
                             samples.setdefault(key, []).append(result)
+                    if len(prf_builds) == 2 and prf_builds['compressed'] != prf_builds['uncompressed']:
+                        raise RuntimeError(
+                            f'PRF modes used different initial build resources: {workload}, {threads}, {prf_builds}'
+                        )
     finally:
         for w in workers.values():
             w.close()
@@ -334,6 +380,7 @@ def main():
         'seed': args.seed,
         'detailed': args.detailed,
         'repetitions': args.repetitions,
+        'modes': modes,
         'measurements': [],
         'comparisons': [],
     }
@@ -351,7 +398,7 @@ def main():
             for metric in runs[0]['metrics']:
                 entry[metric] = describe([r['metrics'][metric] for r in runs])
             baseline = samples[(label, workload, threads, True, 'none')]
-            entry['filter_build_overhead_seconds'] = describe(
+            entry['estimated_filter_build_overhead_seconds'] = describe(
                 [
                     r['metrics']['join_finalize_build_elapsed_seconds']
                     - b['metrics']['join_finalize_build_elapsed_seconds']
@@ -359,21 +406,26 @@ def main():
                 ]
             )
             entry['bloom_fallback_selected'] = runs[0]['prf'].get('bloom_fallback_selected', 0)
+            if mode in ('compressed', 'uncompressed'):
+                entry['prf_build_resources'] = {
+                    metric: describe([r['prf'][metric] for r in runs]) for metric in PRF_BUILD_RESOURCES
+                }
         report['measurements'].append(entry)
         if label == 'candidate' and 'reference' in workers:
             reference = samples[('reference', workload, threads, profiled, mode)]
-            ratios = [r['query_seconds'] / b['query_seconds'] for r, b in zip(runs, reference)]
-            bootstrap = [statistics.median(rng.choices(ratios, k=len(ratios))) for _ in range(1000)]
-            report['comparisons'].append(
-                dict(
-                    workload=workload,
-                    threads=threads,
-                    profiled=profiled,
-                    mode=mode,
-                    candidate_over_reference=statistics.median(ratios),
-                    bootstrap_95_percent_interval=[percentile(bootstrap, 0.025), percentile(bootstrap, 0.975)],
-                )
+            comparison = dict(
+                workload=workload,
+                threads=threads,
+                profiled=profiled,
+                mode=mode,
+                **compare_runs([r['query_seconds'] for r in runs], [r['query_seconds'] for r in reference], rng),
             )
+            if profiled and runs[0]['metrics'] and reference[0]['metrics']:
+                for metric in ('join_finalize_elapsed_seconds', 'join_finalize_build_elapsed_seconds'):
+                    comparison[metric] = compare_runs(
+                        [r['metrics'][metric] for r in runs], [r['metrics'][metric] for r in reference], rng
+                    )
+            report['comparisons'].append(comparison)
     output = json.dumps(report, indent=2) + '\n'
     if args.output:
         args.output.write_text(output)

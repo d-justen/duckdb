@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/types/row/tuple_data_layout.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
@@ -172,6 +173,65 @@ TEST_CASE("Uncompressed prefix range filter retains the fixed-size initial bitma
 	REQUIRE(ContainsKey(*filter, 0));
 	REQUIRE(ContainsKey(*filter, 1 << 27));
 	REQUIRE(ContainsKey(*filter, 1 << 28));
+}
+
+TEST_CASE("Prefix range filter common build merges every bitmap bucket before postprocessing", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	vector<int32_t> keys {0, 63, 64, 65, 511, 512, 4095};
+	for (int32_t key = 100; key < 300; key++) {
+		keys.push_back(key);
+		keys.push_back(key); // Duplicates can be distributed across different local states.
+	}
+	TupleDataLayout layout;
+	layout.Initialize({LogicalType::INTEGER}, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+	vector<data_t> storage((keys.size() + 1) * layout.GetRowWidth(), 0);
+	vector<data_ptr_t> rows;
+	for (idx_t i = 0; i < keys.size(); i++) {
+		auto row = storage.data() + i * layout.GetRowWidth();
+		row[0] = 1; // The first column's validity bit in the tuple-data header.
+		Store<int32_t>(keys[i], row + layout.GetOffsets()[0]);
+		rows.push_back(row);
+	}
+	// A NULL row must not set the bucket of its otherwise valid payload.
+	auto null_row = storage.data() + keys.size() * layout.GetRowWidth();
+	Store<int32_t>(4000, null_row + layout.GetOffsets()[0]);
+	rows.push_back(null_row);
+	for (idx_t shift : {0, 3}) {
+		auto serial = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 4095, shift, 0.001, false);
+		for (idx_t tasks : {1, 4}) {
+			auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::INTEGER);
+			PrefixRangeFilter::Sizing sizing;
+			REQUIRE(PrefixRangeFilter::TryComputeSpan(Value::INTEGER(0), Value::INTEGER(4095), sizing.span));
+			sizing.shift = shift;
+			filter->Initialize(*con.context, keys.size(), Value::INTEGER(0), Value::INTEGER(4095), sizing);
+			vector<unique_ptr<PrefixRangeFilter::BuildState>> states;
+			for (idx_t task = 0; task < tasks; task++) {
+				auto state = filter->InitializeBuildState(*con.context, tasks == 1);
+				REQUIRE((state->bitmap_allocation_bytes == 0) == (tasks == 1));
+				vector<data_ptr_t> task_rows;
+				for (idx_t i = task; i < rows.size(); i += tasks) {
+					task_rows.push_back(rows[i]);
+				}
+				filter->InsertRows(task_rows.data(), task_rows.size(), layout, *state);
+				states.push_back(std::move(state));
+			}
+			for (auto &state : states) {
+				filter->MergeBuildState(*state);
+			}
+			// Neither compression nor analysis has run. Looking up every bucket compares the initial bitmaps.
+			for (int32_t key = 0; key <= 4095; key++) {
+				REQUIRE(ContainsKey(*filter, key) == ContainsKey(*serial, key));
+			}
+			const auto before = filter->GetCompressionInfo(false);
+			filter->Analyze();
+			const auto after = filter->GetCompressionInfo(false);
+			REQUIRE(before.mode == CompressionMode::BITMAP);
+			REQUIRE(after.mode == before.mode);
+			REQUIRE(after.shift == before.shift);
+			REQUIRE(after.bitmap_allocation_bytes == before.bitmap_allocation_bytes);
+		}
+	}
 }
 
 TEST_CASE("Prefix range filter direct compression uses one range for contiguous values", "[optimizer]") {
