@@ -375,7 +375,7 @@ private:
 class PrefixRangeFilterExecutor final : public ExpressionFilterExecutor {
 public:
 	PrefixRangeFilterExecutor(const PrefixRangeFunctionData &data, bool inside_selectivity_optional)
-	    : filter(data.filter), telemetry(data.filter ? data.filter->GetTelemetry() : nullptr) {
+	    : filter(data.filter), telemetry(data.filter ? data.filter->GetDetailedTelemetry() : nullptr) {
 		if (!inside_selectivity_optional && data.n_vectors_to_check != 0) {
 			stats = make_uniq<SelectivityOptionalFilterState::SelectivityStats>(data.n_vectors_to_check,
 			                                                                    data.selectivity_threshold);

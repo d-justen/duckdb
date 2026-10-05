@@ -263,17 +263,20 @@ public:
 		return make_uniq<ParallelBitmapCompressionState>(*this, context, max_false_positive_rate, max_tasks);
 	}
 
-	PrefixRangeFilter::CompressionInfo GetCompressionInfo() const {
+	PrefixRangeFilter::CompressionInfo GetCompressionInfo(bool collect_statistics = true) const {
 		PrefixRangeFilter::CompressionInfo info;
 		info.mode = mode == Mode::DIRECT_RANGES ? CompressionMode::DIRECT_RANGES : CompressionMode::BITMAP;
 		info.shift = shift;
 		info.range_count = range_count;
-		info.active_buckets = analysis_cached ? current_active_buckets : CountActiveBuckets();
-		info.run_count = analysis_cached && current_run_count_is_exact ? current_run_count : CountRuns();
 		info.logical_bucket_count = logical_bucket_count;
 		info.bitmap_allocation_bytes = mode == Mode::BITMAP ? buf_.GetSize() : 0;
 		info.range_index_count = homogeneous_word_runs.size();
 		info.range_index_bytes = homogeneous_word_runs.capacity() * sizeof(HomogeneousWordRun);
+		if (!collect_statistics) {
+			return info;
+		}
+		info.active_buckets = analysis_cached ? current_active_buckets : CountActiveBuckets();
+		info.run_count = analysis_cached && current_run_count_is_exact ? current_run_count : CountRuns();
 		info.false_positive_rate = analysis_cached
 		                               ? cached_false_positive_rate
 		                               : FalsePositiveRate(info.active_buckets, shift,
@@ -1365,8 +1368,8 @@ public:
 		return bitmap.InitializeParallelCompression(context, max_false_positive_rate, max_tasks);
 	}
 
-	CompressionInfo GetCompressionInfo() const override {
-		return bitmap.GetCompressionInfo();
+	CompressionInfo GetCompressionInfo(bool collect_statistics = true) const override {
+		return bitmap.GetCompressionInfo(collect_statistics);
 	}
 
 private:
@@ -1479,8 +1482,8 @@ public:
 		return bitmap.InitializeParallelCompression(context, max_false_positive_rate, max_tasks);
 	}
 
-	CompressionInfo GetCompressionInfo() const override {
-		return bitmap.GetCompressionInfo();
+	CompressionInfo GetCompressionInfo(bool collect_statistics = true) const override {
+		return bitmap.GetCompressionInfo(collect_statistics);
 	}
 
 private:
@@ -1745,7 +1748,7 @@ static idx_t PrefixRangeSelect(DataChunk &args, ExpressionState &state, optional
 		tracking_state->Update(0, 0);
 		return SetAllTrueSelection(count, sel, true_sel, false_sel);
 	}
-	auto telemetry = func_data.filter->GetTelemetry();
+	auto telemetry = func_data.filter->GetDetailedTelemetry();
 	Profiler timer;
 	if (telemetry) {
 		timer.Start();
@@ -1790,7 +1793,7 @@ FilterPropagateResult PrefixRangeScalarFun::FilterPrune(const FunctionStatistics
 	if (!data.filter || !data.filter->IsInitialized()) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
-	auto telemetry = data.filter->GetTelemetry();
+	auto telemetry = data.filter->GetDetailedTelemetry();
 	Profiler timer;
 	if (telemetry) {
 		timer.Start();

@@ -147,18 +147,17 @@ enum class CompressionMode : uint8_t { BITMAP, DIRECT_RANGES };
 
 //! Profiling-only counters shared by a PRF's build and probe pipelines.
 struct PrefixRangeFilterTelemetry {
+	//! Worker/probe instrumentation is only enabled by profiling_mode='detailed'.
+	bool detailed = false;
 	atomic<idx_t> build_worker_ns {0};
 	atomic<idx_t> build_initialization_ns {0};
 	atomic<idx_t> build_insertion_ns {0};
 	atomic<idx_t> build_merge_ns {0};
-	atomic<idx_t> build_phase_elapsed_ns {0};
 	atomic<idx_t> build_chunk_count {0};
 	atomic<idx_t> build_task_count {0};
 	atomic<idx_t> local_bitmap_count {0};
 	atomic<idx_t> local_bitmap_bytes_allocated {0};
-	atomic<idx_t> local_bitmap_live_bytes {0};
 	atomic<idx_t> local_bitmap_peak_bytes {0};
-	atomic<idx_t> compression_phase_elapsed_ns {0};
 	atomic<idx_t> compression_worker_ns {0};
 	atomic<idx_t> probe_worker_ns {0};
 	atomic<idx_t> prune_worker_ns {0};
@@ -171,39 +170,6 @@ struct PrefixRangeFilterTelemetry {
 	atomic<bool> final_prf_enabled {false};
 	atomic<bool> bloom_fallback_selected {false};
 	atomic<bool> final_state_recorded {false};
-	atomic<bool> compression_performed {false};
-
-	void StartBuildPhase() {
-		build_phase_start = steady_clock::now();
-	}
-
-	void FinishBuildPhase() {
-		const auto elapsed = duration_cast<nanoseconds>(steady_clock::now() - build_phase_start).count();
-		build_phase_elapsed_ns.fetch_add(UnsafeNumericCast<idx_t>(elapsed), std::memory_order_relaxed);
-	}
-
-	void StartCompressionPhase() {
-		compression_phase_start = steady_clock::now();
-	}
-
-	void FinishCompressionPhase() {
-		const auto elapsed = duration_cast<nanoseconds>(steady_clock::now() - compression_phase_start).count();
-		compression_phase_elapsed_ns.fetch_add(UnsafeNumericCast<idx_t>(elapsed), std::memory_order_relaxed);
-		compression_performed.store(true, std::memory_order_release);
-	}
-
-	void AddLocalBitmap(idx_t bytes) {
-		local_bitmap_count.fetch_add(1, std::memory_order_relaxed);
-		local_bitmap_bytes_allocated.fetch_add(bytes, std::memory_order_relaxed);
-		const auto live = local_bitmap_live_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
-		auto peak = local_bitmap_peak_bytes.load(std::memory_order_relaxed);
-		while (live > peak && !local_bitmap_peak_bytes.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
-		}
-	}
-
-private:
-	time_point<steady_clock> build_phase_start;
-	time_point<steady_clock> compression_phase_start;
 };
 
 //! Runtime prefix-range filter state used by join pushdown and internal tablefilter functions.
@@ -233,21 +199,10 @@ public:
 	};
 
 	struct BuildState {
-		virtual ~BuildState() {
-			if (profiling_telemetry) {
-				profiling_telemetry->local_bitmap_live_bytes.fetch_sub(bitmap_allocation_bytes,
-				                                                       std::memory_order_relaxed);
-			}
-		}
-		idx_t profiling_build_ns = 0;
+		virtual ~BuildState() = default;
+		idx_t profiling_initialization_ns = 0;
+		idx_t profiling_insertion_ns = 0;
 		idx_t bitmap_allocation_bytes = 0;
-
-		void TrackLocalBitmap(shared_ptr<PrefixRangeFilterTelemetry> telemetry) {
-			profiling_telemetry = std::move(telemetry);
-			if (profiling_telemetry) {
-				profiling_telemetry->AddLocalBitmap(bitmap_allocation_bytes);
-			}
-		}
 
 		template <class TARGET>
 
@@ -260,9 +215,6 @@ public:
 			DynamicCastCheck<TARGET>(this);
 			return reinterpret_cast<const TARGET &>(*this);
 		}
-
-	private:
-		shared_ptr<PrefixRangeFilterTelemetry> profiling_telemetry;
 	};
 
 	//! A compression pass may be executed by several tasks. FinishPass is called only after all tasks complete.
@@ -294,7 +246,8 @@ public:
 	virtual unique_ptr<ParallelCompressionState> InitializeParallelCompression(ClientContext &context,
 	                                                                           double max_false_positive_rate,
 	                                                                           idx_t max_tasks) = 0;
-	virtual CompressionInfo GetCompressionInfo() const = 0;
+	//! With collect_statistics=false, only return metadata; never scan the bitmap.
+	virtual CompressionInfo GetCompressionInfo(bool collect_statistics = true) const = 0;
 	static bool SupportedType(const LogicalType &type);
 	static unique_ptr<PrefixRangeFilter> CreatePrefixRangeFilter(const LogicalType &key_type);
 	static bool TryComputeSpan(const Value &lower_bound, const Value &upper_bound, uhugeint_t &result);
@@ -321,8 +274,8 @@ public:
 		return telemetry.get();
 	}
 
-	shared_ptr<PrefixRangeFilterTelemetry> GetTelemetryShared() const {
-		return telemetry;
+	optional_ptr<PrefixRangeFilterTelemetry> GetDetailedTelemetry() const {
+		return telemetry && telemetry->detailed ? telemetry.get() : nullptr;
 	}
 
 protected:

@@ -1,5 +1,5 @@
 # name: test/sql/join/inner/test_prefix_range_filter_telemetry.test
-# description: PRF build, compression, and probe metrics appear in JSON EXPLAIN ANALYZE
+# description: Join finalization and PRF postprocessing are elapsed timings; worker metrics are opt-in
 # group: [inner]
 
 statement ok
@@ -39,19 +39,19 @@ query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
 ----
-analyzed_plan	<REGEX>:.*"build_worker_seconds": [0-9].*
+analyzed_plan	<REGEX>:.*"join_finalize_build_elapsed_seconds": [0-9].*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
 ----
-analyzed_plan	<REGEX>:.*"compression_phase_elapsed_seconds": [0-9].*
+analyzed_plan	<REGEX>:.*"prf_compression_elapsed_seconds": [0-9].*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
 ----
-analyzed_plan	<REGEX>:.*"probe_worker_seconds": [0-9].*
+analyzed_plan	<!REGEX>:.*"probe_worker_seconds".*
 
 statement ok
 SET enable_prefix_range_filter_compression=false
@@ -60,7 +60,7 @@ query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
 ----
-analyzed_plan	<!REGEX>:.*"compression_phase_elapsed_seconds".*
+analyzed_plan	<REGEX>:.*"prf_compression_elapsed_seconds": 0.*
 
 query I
 SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
@@ -83,7 +83,7 @@ query II
 EXPLAIN (ANALYZE, FORMAT JSON)
 SELECT count(*) FROM prf_telemetry_small_probe p JOIN prf_telemetry_small_build b ON p.k=b.k
 ----
-analyzed_plan	<REGEX>:.*"compression_phase_elapsed_seconds": [0-9].*
+analyzed_plan	<REGEX>:.*"prf_compression_elapsed_seconds": [0-9].*
 
 query II
 EXPLAIN (ANALYZE, FORMAT JSON)
@@ -137,3 +137,22 @@ query I
 SELECT count(*) FROM prf_telemetry_many_chunks p JOIN prf_telemetry_many_chunks b ON p.k=b.k
 ----
 1300000
+
+# Detailed instrumentation is explicitly requested, including for EXPLAIN ANALYZE.
+statement ok
+SET profiling_mode='detailed'
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"build_worker_seconds": [0-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON)
+SELECT count(*) FROM prf_telemetry_probe p JOIN prf_telemetry_build b ON p.k=b.k
+----
+analyzed_plan	<REGEX>:.*"probe_worker_seconds": [0-9].*
+
+statement ok
+SET profiling_mode='standard'

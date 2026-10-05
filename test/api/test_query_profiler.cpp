@@ -1,10 +1,153 @@
 #include "catch.hpp"
 #include "test_helpers.hpp"
+#include "duckdb/main/profiling_node.hpp"
 
 #include <iostream>
 #include <thread>
 
 using namespace duckdb;
+
+namespace {
+
+optional_ptr<ProfilingNode> FindJoinFilterProfile(ProfilingNode &node) {
+	if (node.json_numeric_metrics.count("join_filter")) {
+		return node;
+	}
+	for (auto &child : node.children) {
+		auto result = FindJoinFilterProfile(*child);
+		if (result) {
+			return result;
+		}
+	}
+	return nullptr;
+}
+
+} // namespace
+
+TEST_CASE("Runtime join filter elapsed profiling preserves build paths", "[api][profiling]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='join_order,build_side_probe_side'"));
+	REQUIRE_NO_FAIL(con.Query("SET enable_perfect_hash_join_filter_pushdown=false"));
+	REQUIRE_NO_FAIL(con.Query("SET enable_join_min_max_filter_pushdown=false"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE exact_build AS SELECT (i*2)::INTEGER k FROM range(1300000) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE exact_probe AS SELECT i::INTEGER k FROM range(2600000) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE small_build AS SELECT (i*2)::INTEGER k FROM range(5000) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE small_probe AS SELECT i::INTEGER k FROM range(10000) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE shifted_build AS SELECT i::INTEGER k FROM range(50000) t(i) "
+	                          "UNION ALL SELECT (i+90000000)::INTEGER k FROM range(50000) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE shifted_probe AS SELECT k FROM shifted_build UNION ALL "
+	                          "SELECT k+500000 FROM shifted_build"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE sparse_build AS SELECT (i*2000000000)::BIGINT k FROM range(100000) t(i)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE sparse_probe AS SELECT (i*1000000000)::BIGINT k FROM range(200000) t(i)"));
+	con.EnableProfiling();
+	con.context->config.emit_profiler_output = false;
+
+	for (auto threads : {1, 4}) {
+		REQUIRE_NO_FAIL(con.Query("SET threads=" + to_string(threads)));
+		for (auto perfect : {false, true}) {
+			for (auto mode : {"none", "bloom", "compressed", "uncompressed"}) {
+				const string filter_mode(mode);
+				const bool prf = filter_mode == "compressed" || filter_mode == "uncompressed";
+				const bool compressed = filter_mode == "compressed";
+				REQUIRE_NO_FAIL(con.Query(string("SET enable_prefix_range_filter=") + (prf ? "true" : "false")));
+				REQUIRE_NO_FAIL(
+				    con.Query(string("SET enable_prefix_range_filter_compression=") + (compressed ? "true" : "false")));
+				REQUIRE_NO_FAIL(con.Query(string("SET enable_join_bloom_filter_pushdown=") +
+				                          (filter_mode == "none" ? "false" : "true")));
+				for (auto dataset : {"exact", "shifted", "sparse", "small"}) {
+					const string name(dataset);
+					if (perfect && name != "small") {
+						continue;
+					}
+					CAPTURE(threads, perfect, filter_mode, name);
+					// A second non-equality condition prevents perfect hash joins in the ordinary cases.
+					auto result = con.Query("SELECT count(*) FROM " + name + "_probe p JOIN " + name +
+					                        "_build b ON p.k=b.k" + string(perfect ? "" : " AND p.k%7>=b.k%7"));
+					REQUIRE_NO_FAIL(*result);
+					REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() ==
+					        (name == "exact" ? 1300000 : (name == "small" ? 5000 : 100000)));
+					auto root = con.GetProfilingTree();
+					REQUIRE(root);
+					auto node = FindJoinFilterProfile(*root);
+					REQUIRE(node);
+					auto &metrics = node->json_numeric_metrics.at("join_filter");
+					const auto total = metrics.at("join_finalize_elapsed_seconds");
+					const auto build = metrics.at("join_finalize_build_elapsed_seconds");
+					const auto compression = metrics.at("prf_compression_elapsed_seconds");
+					const auto analysis = metrics.at("prf_analysis_elapsed_seconds");
+					REQUIRE(build > 0);
+					REQUIRE(total == Approx(build + compression + analysis));
+					REQUIRE((compression > 0) == compressed);
+					REQUIRE((analysis > 0) ==
+					        (filter_mode == "uncompressed" && (name == "shifted" || name == "sparse")));
+					REQUIRE(metrics.at("finalize_count") == 1);
+					REQUIRE(metrics.at("prf_build_count") == (prf ? 1 : 0));
+					REQUIRE(metrics.at("bloom_build_count") ==
+					        (filter_mode == "bloom" || (prf && name == "sparse") ? 1 : 0));
+					REQUIRE(metrics.at("perfect_hash_join_count") == (perfect ? 1 : 0));
+					REQUIRE(metrics.at("external_finalize_count") == 0);
+					if (prf) {
+						auto &prf_metrics = node->json_numeric_metrics.at("prefix_range_filter");
+						REQUIRE(prf_metrics.count("build_worker_seconds") == 0);
+						REQUIRE(prf_metrics.count("probe_worker_seconds") == 0);
+						REQUIRE(prf_metrics.count("build_phase_elapsed_seconds") == 0);
+						const auto tasks = name == "exact" && threads == 4 ? (compressed ? 4 : 16) : 1;
+						REQUIRE(prf_metrics.at("build_task_count") == tasks);
+						REQUIRE(prf_metrics.at("local_bitmap_count") == tasks);
+						REQUIRE(prf_metrics.at("bloom_fallback_selected") == (name == "sparse" ? 1 : 0));
+					}
+				}
+			}
+		}
+	}
+	REQUIRE_NO_FAIL(con.Query("SET enable_prefix_range_filter=true; SET enable_join_bloom_filter_pushdown=false"));
+	REQUIRE_NO_FAIL(con.Query("SET profiling_mode='detailed'"));
+	for (auto compress : {false, true}) {
+		REQUIRE_NO_FAIL(
+		    con.Query(string("SET enable_prefix_range_filter_compression=") + (compress ? "true" : "false")));
+		REQUIRE_NO_FAIL(con.Query("SELECT count(*) FROM sparse_probe p JOIN sparse_build b ON p.k=b.k"));
+		auto node = FindJoinFilterProfile(*con.GetProfilingTree());
+		REQUIRE(node);
+		auto &metrics = node->json_numeric_metrics.at("join_filter");
+		auto &prf = node->json_numeric_metrics.at("prefix_range_filter");
+		REQUIRE(metrics.at("finalize_count") == 1);
+		REQUIRE(metrics.at("bloom_build_count") == 0);
+		REQUIRE(prf.at("final_prf_enabled") == 0);
+		REQUIRE(prf.at("bloom_fallback_selected") == 0);
+		REQUIRE(prf.at("build_worker_seconds") > 0);
+		REQUIRE(prf.at("build_worker_seconds") ==
+		        Approx(prf.at("build_initialization_seconds") + prf.at("build_insertion_seconds") +
+		               prf.at("build_merge_seconds")));
+		REQUIRE(prf.count("probe_worker_seconds") == 1);
+	}
+}
+
+TEST_CASE("Runtime join filter elapsed profiling counts repeated and reused builds", "[api][profiling]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("SET disabled_optimizers='join_order,build_side_probe_side'"));
+	con.EnableProfiling();
+	con.context->config.emit_profiler_output = false;
+	for (auto reuse : {false, true}) {
+		// A recursive RHS rebuilds four times (including its last empty build). A constant RHS is reused.
+		const string join = reuse ? "t JOIN range(3) s(k)" : "range(3) s(k) JOIN t";
+		auto result = con.Query("WITH RECURSIVE t(k) AS (SELECT 0::BIGINT UNION ALL SELECT t.k+1 FROM " + join +
+		                        " ON s.k=t.k WHERE t.k<3) SELECT max(k) FROM t");
+		REQUIRE_NO_FAIL(*result);
+		REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == 3);
+		auto node = FindJoinFilterProfile(*con.GetProfilingTree());
+		REQUIRE(node);
+		auto &metrics = node->json_numeric_metrics.at("join_filter");
+		REQUIRE(metrics.at("finalize_count") == (reuse ? 1 : 4));
+		REQUIRE(metrics.at("join_finalize_elapsed_seconds") > 0);
+		REQUIRE(metrics.at("join_finalize_elapsed_seconds") == metrics.at("join_finalize_build_elapsed_seconds"));
+		// Repeated snapshots must not add the same completed builds again.
+		con.GetProfilingInformation(ProfilerPrintFormat::JSON);
+		con.GetProfilingInformation(ProfilerPrintFormat::JSON);
+		REQUIRE(metrics.at("finalize_count") == (reuse ? 1 : 4));
+	}
+}
 
 TEST_CASE("Test query profiler", "[api]") {
 	duckdb::unique_ptr<QueryResult> result;
