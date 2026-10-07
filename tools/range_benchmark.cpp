@@ -111,6 +111,15 @@ Config ParseArguments(int argc, char *argv[]) {
 			config.diva_bits_per_key = stod(arg.substr(11));
 		} else if (StartsWith(arg, "--max-fpr=")) {
 			config.max_false_positive_rate = stod(arg.substr(10));
+		} else if (arg == "--list-filters") {
+			std::cout << "prf_uncompressed\nprf\n";
+#if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
+			std::cout << "grafite\n";
+#endif
+#if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
+			std::cout << "diva\n";
+#endif
+			std::exit(0);
 		} else if (StartsWith(arg, "--output=")) {
 			config.output_path = arg.substr(9);
 		} else if (arg == "--help") {
@@ -118,7 +127,7 @@ Config ParseArguments(int argc, char *argv[]) {
 			          << "  --domain-size=N --total-keys=N\n"
 			          << "  --min-clusters=N --max-clusters=N (powers of two)\n"
 			          << "  --queries-per-cluster-count=N --repetitions=N --seed=N\n"
-			          << "  --grafite-bpk=N --diva-bpk=N --max-fpr=N --output=PATH\n";
+			          << "  --grafite-bpk=N --diva-bpk=N --max-fpr=N --output=PATH --list-filters\n";
 			std::exit(0);
 		} else {
 			throw InvalidInputException("Unknown argument: %s", arg);
@@ -259,7 +268,7 @@ void WriteResult(std::ostream &out, idx_t repetition, idx_t cluster_count, const
                  const char *query_kind, const char *summary, const char *mode, double max_false_positive_rate,
                  idx_t query_count, idx_t bytes, const char *compression_mode, idx_t shift, idx_t range_count,
                  idx_t active_buckets, uint64_t post_processing_ns, idx_t range_index_count, idx_t range_index_bytes,
-                 uint64_t ns, idx_t possibly_overlapping, bool expected_overlap) {
+                 uint64_t ns, idx_t possibly_overlapping, bool expected_overlap, uint64_t seed) {
 	uint64_t min_width = NumericLimits<uint64_t>::Maximum();
 	uint64_t max_width = 0;
 	double total_width = 0;
@@ -272,10 +281,11 @@ void WriteResult(std::ostream &out, idx_t repetition, idx_t cluster_count, const
 	const auto throughput = ns == 0 ? 0.0 : static_cast<double>(query_count) * 1e9 / static_cast<double>(ns);
 	out << repetition << ',' << cluster_count << ',' << ranges.size() << ',' << query_kind << ',' << min_width << ','
 	    << max_width << ',' << std::fixed << std::setprecision(3) << mean_width << ',' << summary << ',' << mode << ','
-	    << max_false_positive_rate << ',' << query_count << ',' << ns << ',' << throughput << ','
-	    << possibly_overlapping << ',' << bytes << ',' << compression_mode << ',' << shift << ',' << range_count << ','
-	    << active_buckets << ',' << post_processing_ns << ',' << range_index_count << ',' << range_index_bytes << ','
-	    << (!expected_overlap || possibly_overlapping == query_count ? "true" : "false") << '\n';
+	    << std::defaultfloat << std::setprecision(17) << max_false_positive_rate << std::fixed << std::setprecision(3)
+	    << ',' << query_count << ',' << ns << ',' << throughput << ',' << possibly_overlapping << ',' << bytes << ','
+	    << compression_mode << ',' << shift << ',' << range_count << ',' << active_buckets << ',' << post_processing_ns
+	    << ',' << range_index_count << ',' << range_index_bytes << ','
+	    << (!expected_overlap || possibly_overlapping == query_count ? "true" : "false") << ',' << seed << '\n';
 }
 
 } // namespace
@@ -296,7 +306,7 @@ int main(int argc, char *argv[]) {
 		        "summary,mode,max_false_positive_rate,query_count,total_query_time_ns,queries_per_sec,possibly_"
 		        "overlapping,"
 		        "summary_bytes,compression_mode,shift,direct_range_count,active_buckets,post_processing_time_ns,"
-		        "range_index_count,range_index_bytes,correct_result\n";
+		        "range_index_count,range_index_bytes,correct_result,seed\n";
 
 		DuckDB db(nullptr);
 		Connection con(db);
@@ -324,7 +334,8 @@ int main(int argc, char *argv[]) {
 					WriteResult(*out, rep, cluster_count, *workload.ranges, workload.name, "prf", "uncompressed",
 					            config.max_false_positive_rate, config.queries_per_cluster_count, PRFBytes(info),
 					            "bitmap", info.shift, info.range_count, info.active_buckets, prf.post_processing_ns,
-					            info.range_index_count, info.range_index_bytes, ns, matches, workload.expected_overlap);
+					            info.range_index_count, info.range_index_bytes, ns, matches, workload.expected_overlap,
+					            config.seed + rep);
 
 					info = compressed_prf.filter->GetCompressionInfo();
 					ns = TimeQueries(*workload.ranges, config.queries_per_cluster_count, matches,
@@ -337,7 +348,8 @@ int main(int argc, char *argv[]) {
 					            config.max_false_positive_rate, config.queries_per_cluster_count, PRFBytes(info),
 					            info.mode == CompressionMode::DIRECT_RANGES ? "direct_ranges" : "bitmap", info.shift,
 					            info.range_count, info.active_buckets, compressed_prf.post_processing_ns,
-					            info.range_index_count, info.range_index_bytes, ns, matches, workload.expected_overlap);
+					            info.range_index_count, info.range_index_bytes, ns, matches, workload.expected_overlap,
+					            config.seed + rep);
 				}
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
@@ -350,7 +362,7 @@ int main(int argc, char *argv[]) {
 				WriteResult(*out, rep, cluster_count, layout.gaps, "empty", "grafite", "na",
 				            config.max_false_positive_rate, config.queries_per_cluster_count,
 				            UnsafeNumericCast<idx_t>(grafite.SizeBytes()), "na", 0, 0, 0, 0, 0, 0, grafite_ns,
-				            grafite_matches, false);
+				            grafite_matches, false, config.seed + rep);
 #endif
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
 				DivaBenchmarkFilter diva;
@@ -362,7 +374,7 @@ int main(int argc, char *argv[]) {
 				WriteResult(*out, rep, cluster_count, layout.gaps, "empty", "diva", "na",
 				            config.max_false_positive_rate, config.queries_per_cluster_count,
 				            UnsafeNumericCast<idx_t>(diva.SizeBytes()), "na", 0, 0, 0, 0, 0, 0, diva_ns, diva_matches,
-				            false);
+				            false, config.seed + rep);
 #endif
 			}
 		}

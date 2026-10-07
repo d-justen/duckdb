@@ -7,6 +7,7 @@
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
@@ -38,12 +39,13 @@ struct BenchmarkConfig {
 	idx_t total_keys = 100000;
 	idx_t probe_count = 1000000;
 	idx_t min_clusters = 2;
-	idx_t max_clusters = 100;
+	idx_t max_clusters = 128;
 	idx_t cluster_step = 1;
 	idx_t repetitions = 5;
 	uint64_t seed = 42;
 	double grafite_bits_per_key = 12.0;
 	double diva_bits_per_key = 16.0;
+	double max_false_positive_rate = 0.001;
 	string output_path;
 };
 
@@ -111,6 +113,7 @@ struct RepetitionContext {
 struct ResultRow {
 	idx_t cluster_count;
 	string line;
+	idx_t actual_negatives;
 };
 
 template <class FUNC>
@@ -166,6 +169,17 @@ BenchmarkConfig ParseArguments(int argc, char *argv[]) {
 			config.grafite_bits_per_key = stod(arg.substr(14));
 		} else if (StartsWith(arg, "--diva-bpk=")) {
 			config.diva_bits_per_key = stod(arg.substr(11));
+		} else if (StartsWith(arg, "--max-fpr=")) {
+			config.max_false_positive_rate = stod(arg.substr(10));
+		} else if (arg == "--list-filters") {
+			std::cout << "bloom\nprf_uncompressed\nprf\n";
+#if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
+			std::cout << "grafite\n";
+#endif
+#if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
+			std::cout << "diva\n";
+#endif
+			std::exit(0);
 		} else if (StartsWith(arg, "--output=")) {
 			config.output_path = arg.substr(9);
 		} else if (arg == "--help") {
@@ -180,6 +194,8 @@ BenchmarkConfig ParseArguments(int argc, char *argv[]) {
 			          << "  --seed=N\n"
 			          << "  --grafite-bpk=N\n"
 			          << "  --diva-bpk=N\n"
+			          << "  --max-fpr=N\n"
+			          << "  --list-filters\n"
 			          << "  --output=PATH\n";
 			std::exit(0);
 		} else {
@@ -200,6 +216,13 @@ BenchmarkConfig ParseArguments(int argc, char *argv[]) {
 	}
 	if (!IsPowerOfTwo(config.min_clusters) || !IsPowerOfTwo(config.max_clusters)) {
 		throw InvalidInputException("min-clusters and max-clusters must be powers of two");
+	}
+	if (config.max_clusters > config.total_keys || config.max_clusters - 1 > config.domain_size - config.total_keys) {
+		throw InvalidInputException("cluster range exceeds available keys or gaps");
+	}
+	if (!std::isfinite(config.max_false_positive_rate) || config.max_false_positive_rate < 0 ||
+	    config.max_false_positive_rate > 1) {
+		throw InvalidInputException("max-fpr must be between 0 and 1");
 	}
 	if (config.repetitions == 0) {
 		throw InvalidInputException("repetitions must be > 0");
@@ -367,7 +390,7 @@ BloomRunResult RunBloomFilterBenchmark(ClientContext &context, const vector<uint
 
 PRFRunResult RunPrefixRangeFilterBenchmark(ClientContext &context, const vector<uint64_t> &build_keys,
                                            const vector<uint64_t> &probe_keys, const MembershipInfo &membership,
-                                           bool enable_compression) {
+                                           bool enable_compression, double max_false_positive_rate) {
 	PRFRunResult result;
 	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::UBIGINT);
 	PrefixRangeFilter::Sizing sizing;
@@ -390,9 +413,8 @@ PRFRunResult RunPrefixRangeFilterBenchmark(ClientContext &context, const vector<
 		filter->MergeBuildState(*build_state);
 	});
 
-	static constexpr double PRF_FALSE_POSITIVE_RATE_THRESHOLD = 0.001;
 	if (enable_compression) {
-		result.compress_ns = TimeNs([&]() { filter->Compress(context, PRF_FALSE_POSITIVE_RATE_THRESHOLD); });
+		result.compress_ns = TimeNs([&]() { filter->Compress(context, max_false_positive_rate); });
 	}
 	PrefixRangeFilter::Analysis analysis;
 	result.analyze_ns = TimeNs([&]() { analysis = filter->Analyze(); });
@@ -459,7 +481,8 @@ DivaRunResult RunDivaBenchmark(const std::vector<uint64_t> &build_keys, const st
 
 void WriteHeader(std::ostream &out) {
 	out << "filter,cluster_count,build_time_ns,post_processing_time_ns,summary_bytes,probe_throughput_per_sec,"
-	       "false_positives,estimated_fpr,actual_fpr,mode,range_count,shift,active_buckets\n";
+	       "false_positives,estimated_fpr,actual_fpr,mode,range_count,shift,active_buckets,repetition,seed,actual_"
+	       "negatives,probe_count\n";
 }
 
 string FormatBloomRow(const BenchmarkConfig &config, idx_t cluster_count, const MembershipInfo &membership,
@@ -561,40 +584,50 @@ int main(int argc, char *argv[]) {
 			for (const auto cluster_count : repetition.cluster_counts) {
 				const auto layout = GenerateClusteredKeys(config.domain_size, config.total_keys, cluster_count);
 				const auto membership = ComputeMembership(config.domain_size, layout.keys, repetition.probes);
+				const auto actual_negatives = config.probe_count - membership.positives;
 
 				(void)RunBloomFilterBenchmark(context, layout.keys, repetition.probes, membership);
 				const auto bloom_result = RunBloomFilterBenchmark(context, layout.keys, repetition.probes, membership);
-				rows.push_back({cluster_count, FormatBloomRow(config, cluster_count, membership, bloom_result)});
+				rows.push_back(
+				    {cluster_count, FormatBloomRow(config, cluster_count, membership, bloom_result), actual_negatives});
 
-				(void)RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, false);
-				const auto prf_uncompressed_result =
-				    RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, false);
-				rows.push_back({cluster_count, FormatPRFRow("prf_uncompressed", config, cluster_count, membership,
-				                                            prf_uncompressed_result)});
+				(void)RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, false,
+				                                    config.max_false_positive_rate);
+				const auto prf_uncompressed_result = RunPrefixRangeFilterBenchmark(
+				    context, layout.keys, repetition.probes, membership, false, config.max_false_positive_rate);
+				rows.push_back(
+				    {cluster_count,
+				     FormatPRFRow("prf_uncompressed", config, cluster_count, membership, prf_uncompressed_result),
+				     actual_negatives});
 
-				(void)RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, true);
-				const auto prf_result =
-				    RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, true);
-				rows.push_back({cluster_count, FormatPRFRow("prf", config, cluster_count, membership, prf_result)});
+				(void)RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes, membership, true,
+				                                    config.max_false_positive_rate);
+				const auto prf_result = RunPrefixRangeFilterBenchmark(context, layout.keys, repetition.probes,
+				                                                      membership, true, config.max_false_positive_rate);
+				rows.push_back({cluster_count, FormatPRFRow("prf", config, cluster_count, membership, prf_result),
+				                actual_negatives});
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
 				(void)RunGrafiteBenchmark(layout.keys, repetition.probes, membership, config.grafite_bits_per_key);
 				const auto grafite_result =
 				    RunGrafiteBenchmark(layout.keys, repetition.probes, membership, config.grafite_bits_per_key);
-				rows.push_back({cluster_count, FormatGrafiteRow(config, cluster_count, membership, grafite_result)});
+				rows.push_back({cluster_count, FormatGrafiteRow(config, cluster_count, membership, grafite_result),
+				                actual_negatives});
 #endif
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
 				(void)RunDivaBenchmark(layout.keys, repetition.probes, membership, config.diva_bits_per_key);
 				const auto diva_result =
 				    RunDivaBenchmark(layout.keys, repetition.probes, membership, config.diva_bits_per_key);
-				rows.push_back({cluster_count, FormatDivaRow(config, cluster_count, membership, diva_result)});
+				rows.push_back(
+				    {cluster_count, FormatDivaRow(config, cluster_count, membership, diva_result), actual_negatives});
 #endif
 			}
 			std::sort(rows.begin(), rows.end(),
 			          [](const ResultRow &lhs, const ResultRow &rhs) { return lhs.cluster_count < rhs.cluster_count; });
 			for (const auto &row : rows) {
-				*out << row.line << '\n';
+				*out << row.line << ',' << rep << ',' << config.seed + rep << ',' << row.actual_negatives << ','
+				     << config.probe_count << '\n';
 			}
 		}
 
