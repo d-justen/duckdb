@@ -79,6 +79,22 @@ if(BUILD_SHELL)
   endif()
   duckdb_codesign_for_debugging(range_benchmark)
 
+  add_executable(join_pruning_benchmark join_pruning_benchmark.cpp)
+  target_link_libraries(join_pruning_benchmark duckdb_static
+                        ${DUCKDB_EXTRA_LINK_FLAGS})
+  link_extension_libraries(join_pruning_benchmark "")
+  if(DUCKDB_FILTER_BENCHMARK_GRAFITE_ENABLED)
+    target_link_libraries(join_pruning_benchmark duckdb_grafite_benchmark)
+    target_compile_definitions(join_pruning_benchmark
+                               PRIVATE DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE=1)
+  endif()
+  if(DUCKDB_FILTER_BENCHMARK_DIVA_ENABLED)
+    target_link_libraries(join_pruning_benchmark duckdb_diva_benchmark)
+    target_compile_definitions(join_pruning_benchmark
+                               PRIVATE DUCKDB_FILTER_BENCHMARK_HAS_DIVA=1)
+  endif()
+  duckdb_codesign_for_debugging(join_pruning_benchmark)
+
   add_executable(filter_benchmark_tests filter_benchmark_tests.cpp)
   target_link_libraries(filter_benchmark_tests duckdb_static
                         ${DUCKDB_EXTRA_LINK_FLAGS})
