@@ -901,8 +901,20 @@ JoinHashTable::InitializeParallelPrefixRangeCompression(idx_t max_tasks) {
 	if (!ShouldCompressPrefixRangeFilter()) {
 		return nullptr;
 	}
-	return prefix_range_filter->InitializeParallelCompression(context,
-	                                                          prefix_range_filter_false_positive_rate_threshold, max_tasks);
+	// Initialization can now prove that compression is unprofitable without scheduling tasks.
+	// Include that coordinator work in detailed compression CPU telemetry.
+	Profiler timer;
+	auto telemetry = prefix_range_filter->GetDetailedTelemetry();
+	if (telemetry) {
+		timer.Start();
+	}
+	auto state = prefix_range_filter->InitializeParallelCompression(
+	    context, prefix_range_filter_false_positive_rate_threshold, max_tasks);
+	if (telemetry) {
+		timer.End();
+		telemetry->compression_worker_ns.fetch_add(timer.ElapsedNanos(), std::memory_order_relaxed);
+	}
+	return state;
 }
 
 bool JoinHashTable::CompletePrefixRangeFilterAnalysis(const PrefixRangeFilter::Analysis &analysis) {

@@ -98,9 +98,15 @@ TEST_CASE("Parallel prefix range compression matches serial across task boundari
 	                                    {16777214, 16777215, 16777216, 16777217, 16777218, maximum},
 	                                    {0, 16777215, 16777217, 33554431, 33554433, 50331647, maximum}};
 	for (const auto &keys : key_sets) {
+		// Keep this fixture on the dense/parallel path even when the distinct key set is sparse.
+		vector<int32_t> build_keys;
+		for (idx_t repeat = 0; repeat < 2048; repeat++) {
+			build_keys.insert(build_keys.end(), keys.begin(), keys.end());
+		}
 		for (const auto threshold : {1.0, 0.001, 0.000001}) {
-			auto serial = BuildInt32PrefixRangeFilter(*con.context, keys, 0, maximum, 0, threshold);
-			auto parallel = BuildInt32PrefixRangeFilter(*con.context, keys, 0, maximum, 0, threshold, true, 1.0, 4);
+			auto serial = BuildInt32PrefixRangeFilter(*con.context, build_keys, 0, maximum, 0, threshold, true, 2048.0);
+			auto parallel =
+			    BuildInt32PrefixRangeFilter(*con.context, build_keys, 0, maximum, 0, threshold, true, 2048.0, 4);
 			const auto serial_info = serial->GetCompressionInfo();
 			const auto parallel_info = parallel->GetCompressionInfo();
 			REQUIRE(parallel_info.mode == serial_info.mode);
@@ -123,9 +129,12 @@ TEST_CASE("Parallel prefix range compression matches serial across task boundari
 			}
 		}
 	}
-	const vector<int32_t> duplicate_keys = {0, 0, 16, 16, 33554432, 33554432, maximum, maximum};
-	auto serial = BuildInt32PrefixRangeFilter(*con.context, duplicate_keys, 0, maximum, 1, 0.000001, true, 2.0);
-	auto parallel = BuildInt32PrefixRangeFilter(*con.context, duplicate_keys, 0, maximum, 1, 0.000001, true, 2.0, 4);
+	vector<int32_t> duplicate_keys;
+	for (idx_t repeat = 0; repeat < 2048; repeat++) {
+		duplicate_keys.insert(duplicate_keys.end(), {0, 16, 33554432, maximum});
+	}
+	auto serial = BuildInt32PrefixRangeFilter(*con.context, duplicate_keys, 0, maximum, 1, 0.000001, true, 2048.0);
+	auto parallel = BuildInt32PrefixRangeFilter(*con.context, duplicate_keys, 0, maximum, 1, 0.000001, true, 2048.0, 4);
 	REQUIRE(parallel->GetCompressionInfo().shift == serial->GetCompressionInfo().shift);
 	REQUIRE(parallel->GetCompressionInfo().false_positive_rate ==
 	        Approx(serial->GetCompressionInfo().false_positive_rate));
@@ -447,8 +456,9 @@ TEST_CASE("Prefix range filter right-sizes an accepted cache-sized bitmap", "[op
 	vector<int32_t> keys;
 	for (int32_t key = 0; key <= 262140; key += 6) {
 		keys.push_back(key);
+		keys.push_back(key + 1);
 	}
-	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 262140, 0, 1.0);
+	auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 262141, 0, 1.0);
 	auto info = filter->GetCompressionInfo();
 	const auto first_analysis = filter->Analyze();
 	const auto second_analysis = filter->Compress(*con.context, 1.0);
@@ -458,7 +468,7 @@ TEST_CASE("Prefix range filter right-sizes an accepted cache-sized bitmap", "[op
 	REQUIRE(info.shift == 1);
 	REQUIRE(info.logical_bucket_count == 131071);
 	REQUIRE(info.bitmap_allocation_bytes == 64 + 2048 * sizeof(uint64_t));
-	REQUIRE(info.run_count == keys.size());
+	REQUIRE(info.run_count == keys.size() / 2);
 	REQUIRE(first_analysis.active_buckets == info.active_buckets);
 	REQUIRE(first_analysis.false_positive_rate == Approx(info.false_positive_rate));
 	REQUIRE(second_analysis.active_buckets == first_analysis.active_buckets);
@@ -555,6 +565,162 @@ TEST_CASE("Prefix range filter direct ranges return always true for fully covere
 	REQUIRE(filter->LookupStatistics(Int32Statistics(0, 3)) == FilterPropagateResult::FILTER_ALWAYS_TRUE);
 	REQUIRE(filter->LookupStatistics(Int32Statistics(4, 7)) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
 	REQUIRE(filter->LookupStatistics(Int32Statistics(2, 9)) == FilterPropagateResult::NO_PRUNING_POSSIBLE);
+}
+
+TEST_CASE("Prefix range sparse compression agrees with dense compression and range pruning", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	const int32_t maximum = (1 << 26) - 59;
+	for (const vector<int32_t> keys : {vector<int32_t> {0, 1, 2, 63, 64, 8191, 8192, 16777215, 16777216, maximum},
+	                                   vector<int32_t> {0, 1, 2, 3, 100000, 100001, 100002, 100003}}) {
+		vector<int32_t> repeated;
+		for (idx_t i = 0; i < 1024; i++) {
+			repeated.insert(repeated.end(), keys.begin(), keys.end());
+		}
+		for (idx_t shift : {0, 1, 4}) {
+			for (double fpr : {0.0, 0.001, 1.0}) {
+				auto sparse = BuildInt32PrefixRangeFilter(*con.context, keys, 0, maximum, shift, fpr);
+				auto dense = BuildInt32PrefixRangeFilter(*con.context, repeated, 0, maximum, shift, fpr, true, 1024.0);
+				const auto a = sparse->GetCompressionInfo();
+				const auto b = dense->GetCompressionInfo();
+				REQUIRE(a.mode == b.mode);
+				REQUIRE(a.shift == b.shift);
+				REQUIRE(a.active_buckets == b.active_buckets);
+				REQUIRE(a.run_count == b.run_count);
+				REQUIRE(a.false_positive_rate == Approx(b.false_positive_rate));
+				REQUIRE(a.range_index_count == b.range_index_count);
+				for (const auto key : keys) {
+					REQUIRE(ContainsKey(*sparse, key));
+					for (int32_t offset : {-1, 0, 1}) {
+						REQUIRE(ContainsKey(*sparse, key + offset) == ContainsKey(*dense, key + offset));
+					}
+				}
+				for (int32_t begin = 0; begin < maximum - 300000; begin += 123457) {
+					const auto stats = Int32Statistics(begin, begin + 300000);
+					REQUIRE(sparse->LookupStatistics(stats) == dense->LookupStatistics(stats));
+				}
+			}
+		}
+	}
+}
+
+TEST_CASE("Prefix range compression limits expansion of highly selective bitmaps", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	vector<int32_t> keys;
+	for (int32_t key = 0; key < (1 << 22); key += 65535) {
+		keys.push_back(key);
+	}
+	for (idx_t repeats : {1, 128}) {
+		vector<int32_t> build;
+		for (idx_t i = 0; i < repeats; i++) {
+			build.insert(build.end(), keys.begin(), keys.end());
+		}
+		auto filter =
+		    BuildInt32PrefixRangeFilter(*con.context, build, 0, 1 << 22, 0, 0.001, true, static_cast<double>(repeats));
+		REQUIRE(filter->GetCompressionInfo().shift == 0);
+		REQUIRE(filter->Analyze().false_positive_rate == 0);
+		for (const auto key : keys) {
+			REQUIRE(ContainsKey(*filter, key));
+			REQUIRE(!ContainsKey(*filter, key + 1));
+		}
+	}
+}
+
+TEST_CASE("Prefix range compression preflight preserves partial words and exact analysis", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	const int32_t maximum = (1 << 26) - 2;
+	const vector<int32_t> keys = {0, 32, 64, 96, 128, 160, maximum};
+	vector<int32_t> repeated;
+	for (idx_t repeat = 0; repeat < 1024; repeat++) {
+		repeated.insert(repeated.end(), keys.begin(), keys.end());
+	}
+	for (idx_t shift : {0, 3}) {
+		for (double fpr : {0.0, 0.001}) {
+			for (bool parallel : {false, true}) {
+				auto filter =
+				    BuildInt32PrefixRangeFilter(*con.context, repeated, 0, maximum, shift, fpr, false, 1024.0);
+				const auto initial = filter->Analyze();
+				if (parallel) {
+					// The large bitmap is finalized by the preflight; the smaller one uses serial compression.
+					REQUIRE(!filter->InitializeParallelCompression(*con.context, fpr, 4));
+				}
+				const auto result = filter->Compress(*con.context, fpr);
+				const auto info = filter->GetCompressionInfo();
+				REQUIRE(info.shift == shift);
+				REQUIRE(info.run_count == keys.size());
+				REQUIRE(result.active_buckets == initial.active_buckets);
+				REQUIRE(result.false_positive_rate == Approx(initial.false_positive_rate));
+				for (const auto key : keys) {
+					REQUIRE(ContainsKey(*filter, key));
+				}
+				REQUIRE(!ContainsKey(*filter, 24));
+				REQUIRE(!ContainsKey(*filter, maximum - 8));
+				if (result.false_positive_rate <= fpr) {
+					REQUIRE(filter->LookupStatistics(Int32Statistics(1024, maximum - 1024)) ==
+					        FilterPropagateResult::FILTER_ALWAYS_FALSE);
+				}
+			}
+		}
+	}
+}
+
+TEST_CASE("Prefix range homogeneous blocks preserve exact boundary membership", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	vector<int32_t> keys;
+	for (int32_t key = 1; key < 32767; key++) {
+		keys.push_back(key);
+	}
+	for (int32_t key : {65535, 65536, 98305, 131071, 131100}) {
+		keys.push_back(key);
+	}
+	const auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, 131100, 0, 0.0);
+	REQUIRE(filter->GetCompressionInfo().active_buckets == keys.size());
+	idx_t pos = 0;
+	for (int32_t key = 0; key <= 131100; key++) {
+		const bool present = pos < keys.size() && keys[pos] == key;
+		REQUIRE(ContainsKey(*filter, key) == present);
+		pos += present;
+	}
+	REQUIRE(filter->LookupStatistics(Int32Statistics(64, 32703)) == FilterPropagateResult::FILTER_ALWAYS_TRUE);
+	REQUIRE(filter->LookupStatistics(Int32Statistics(32768, 65534)) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
+}
+
+TEST_CASE("Prefix range sparse and dense compression bound cumulative expansion", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	vector<int32_t> keys;
+	for (int32_t cluster = 0; cluster < 6; cluster++) {
+		for (int32_t i = 0; i < 33; i++) {
+			keys.push_back(cluster * 524288 + i);
+		}
+	}
+	// First reduction covers 34 values per cluster (3% expansion). The next would cover
+	// 36 values (9% cumulative expansion), even though its incremental expansion is <6.25%.
+	for (idx_t repeats : {1, 64}) {
+		vector<int32_t> build;
+		for (idx_t i = 0; i < repeats; i++) {
+			build.insert(build.end(), keys.begin(), keys.end());
+		}
+		auto filter =
+		    BuildInt32PrefixRangeFilter(*con.context, build, 0, 1 << 22, 0, 0.001, true, static_cast<double>(repeats));
+		const auto info = filter->GetCompressionInfo();
+		REQUIRE(info.mode == CompressionMode::BITMAP);
+		REQUIRE(info.shift == 1);
+		REQUIRE(info.active_buckets == 6 * 17);
+		REQUIRE(info.bitmap_allocation_bytes == 64 + (((1 << 21) + 1 + 63) / 64) * sizeof(uint64_t));
+		for (int32_t cluster = 0; cluster < 6; cluster++) {
+			const auto base = cluster * 524288;
+			for (int32_t i = 0; i <= 33; i++) {
+				REQUIRE(ContainsKey(*filter, base + i));
+			}
+			REQUIRE(!ContainsKey(*filter, base + 34));
+			REQUIRE(filter->LookupStatistics(Int32Statistics(base + 64, base + 500000)) ==
+			        FilterPropagateResult::FILTER_ALWAYS_FALSE);
+		}
+	}
 }
 
 TEST_CASE("Prefix range filter optional selectivity threshold is lower than min max", "[optimizer]") {
