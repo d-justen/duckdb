@@ -1,3 +1,4 @@
+#include "filter_benchmark_common.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -46,7 +47,7 @@ uint64_t UInt(const std::string &text) {
 
 struct Config {
 	std::string cases, output;
-	uint64_t repetitions = 5, warmups = 1, order_seed = 42;
+	uint64_t repetitions = 5, warmups = 1, order_seed = 42, construction_seed = 42;
 	double grafite_bpk = 12, diva_bpk = 16, max_fpr = 0.001;
 };
 
@@ -82,6 +83,8 @@ Config Parse(int argc, char **argv) {
 			config.repetitions = UInt(value);
 		else if (key == "--warmups")
 			config.warmups = UInt(value);
+		else if (key == "--construction-seed")
+			config.construction_seed = UInt(value);
 		else if (key == "--order-seed")
 			config.order_seed = UInt(value);
 		else if (key == "--grafite-bpk" || key == "--diva-bpk" || key == "--max-fpr") {
@@ -250,13 +253,15 @@ Truth BuildTruth(const Case &c, const std::vector<uint64_t> &build, const Probes
 class Summary {
 public:
 	virtual ~Summary() = default;
-	virtual void Build(ClientContext &context, const std::vector<uint64_t> &keys, const Config &config) = 0;
+	virtual void Build(ClientContext &context, const std::vector<uint64_t> &keys, const Config &config,
+	                   uint32_t build_seed) = 0;
 	virtual State Range(uint64_t lower, uint64_t upper) = 0;
 	virtual idx_t Points(Vector &keys, idx_t count, SelectionVector &selection) = 0;
 	virtual idx_t Bytes() const = 0;
 	virtual std::string Mode() const {
 		return "na";
 	}
+	BenchmarkBuildInfo build_info;
 	uint64_t finalization_ns = 0;
 };
 
@@ -264,7 +269,8 @@ class PRFSummary : public Summary {
 public:
 	explicit PRFSummary(bool compress) : compress(compress) {
 	}
-	void Build(ClientContext &context, const std::vector<uint64_t> &keys, const Config &config) override {
+	void Build(ClientContext &context, const std::vector<uint64_t> &keys, const Config &config,
+	           uint32_t build_seed) override {
 		filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::UBIGINT);
 		const auto lower = Value::UBIGINT(keys.front()), upper = Value::UBIGINT(keys.back());
 		PrefixRangeFilter::Sizing sizing;
@@ -309,8 +315,9 @@ private:
 template <class Adapter, bool GRAFITE>
 class RangeSummary : public Summary {
 public:
-	void Build(ClientContext &, const std::vector<uint64_t> &keys, const Config &config) override {
-		filter.Build(keys, GRAFITE ? config.grafite_bpk : config.diva_bpk);
+	void Build(ClientContext &, const std::vector<uint64_t> &keys, const Config &config, uint32_t build_seed) override {
+		filter.Build(keys, GRAFITE ? config.grafite_bpk : config.diva_bpk, build_seed);
+		build_info = filter.BuildInfo();
 	}
 	State Range(uint64_t lower, uint64_t upper) override {
 		return filter.RangeProbe(lower, upper) ? State::NO_PRUNING_POSSIBLE : State::FILTER_ALWAYS_FALSE;
@@ -326,6 +333,9 @@ public:
 	}
 	idx_t Bytes() const override {
 		return filter.SizeBytes();
+	}
+	std::string Mode() const override {
+		return build_info.representation;
 	}
 
 private:
@@ -354,10 +364,12 @@ struct Measurement {
 	uint64_t rows_rejected = 0, rows_accepted = 0, point_probes = 0, point_candidates = 0;
 	uint64_t candidates = 0, false_positives = 0, false_negatives = 0, range_false_positives = 0;
 	std::string mode;
+	BenchmarkBuildInfo build_info;
+	uint32_t build_seed = 0;
 };
 
 Measurement Run(ClientContext &context, const Config &config, const std::string &name,
-                const std::vector<uint64_t> &build, Probes &probes, const Truth &truth) {
+                const std::vector<uint64_t> &build, Probes &probes, const Truth &truth, uint32_t build_seed) {
 	Measurement m;
 	std::vector<State> states(probes.groups.size());
 	// Common output scratch allocation is outside measurement, like prepared probe inputs.
@@ -366,11 +378,13 @@ Measurement Run(ClientContext &context, const Config &config, const std::string 
 	std::unique_ptr<Summary> summary;
 	m.build_ns = Time([&] {
 		summary = MakeSummary(name);
-		summary->Build(context, build, config);
+		summary->Build(context, build, config, build_seed);
 	});
 	m.finalization_ns = summary->finalization_ns;
 	m.bytes = summary->Bytes();
 	m.mode = summary->Mode();
+	m.build_seed = build_seed;
+	m.build_info = summary->build_info;
 	m.range_ns = Time([&] {
 		for (idx_t i = 0; i < probes.groups.size(); i++) {
 			states[i] = summary->Range(probes.groups[i].lower, probes.groups[i].upper);
@@ -444,7 +458,8 @@ void Write(std::ostream &out, const Config &config, const Case &c, const std::st
 	    << m.candidates << ',' << truth.positives << ',' << m.false_positives << ',' << m.false_negatives << ','
 	    << truth.empty_count << ',' << m.range_false_positives << ',' << m.bytes << ',' << m.mode << ','
 	    << build_checksum << ',' << probes.checksum << ',' << std::setprecision(17) << config.grafite_bpk << ','
-	    << config.diva_bpk << ',' << config.max_fpr << ',' << double(m.bytes) * 8 / c.build_keys << '\n';
+	    << config.diva_bpk << ',' << config.max_fpr << ',' << double(m.bytes) * 8 / c.build_keys << ','
+	    << config.construction_seed << ',' << m.build_seed << ",sorted_distinct," << m.build_info.CSV() << '\n';
 	if (!out)
 		throw std::runtime_error("failed to write JPB measurements");
 }
@@ -466,7 +481,9 @@ int main(int argc, char **argv) {
 		       "build_time_ns,finalization_time_ns,range_time_ns,point_time_ns,total_time_ns,range_probes,"
 		       "groups_rejected,groups_accepted,groups_mixed,rows_rejected,rows_accepted,point_probes,point_candidates,"
 		       "candidate_rows,true_positives,false_positives,false_negatives,empty_ranges,range_false_positives,"
-		       "summary_bytes,representation,build_checksum,probe_checksum,grafite_bpk,diva_bpk,max_fpr,measured_bpk\n";
+		       "summary_bytes,representation,build_checksum,probe_checksum,grafite_bpk,diva_bpk,max_fpr,measured_bpk,"
+		       "construction_seed,build_seed,build_input_order,"
+		    << BenchmarkBuildInfo::Header() << "\n";
 		DuckDB db(nullptr);
 		Connection con(db);
 		auto settings = con.Query("SET threads=1");
@@ -485,13 +502,16 @@ int main(int argc, char **argv) {
 				previous = identity;
 			}
 			const auto keys = BuildKeys(con, c);
-			const auto build_checksum = Checksum(keys);
+			ValidateBenchmarkBuildKeys(keys);
+			const auto build_checksum = BenchmarkBuildChecksum(keys);
 			const auto truth = BuildTruth(c, keys, probes);
 			for (uint64_t rep = 0; rep < config.warmups + config.repetitions; rep++) {
 				auto filters = Filters();
 				std::shuffle(filters.begin(), filters.end(), order);
 				for (const auto &name : filters) {
-					const auto m = Run(*con.context, config, name, keys, probes, truth);
+					const auto measured_rep = rep < config.warmups ? 0 : rep - config.warmups;
+					const auto build_seed = BenchmarkBuildSeed(config.construction_seed, build_checksum, measured_rep);
+					const auto m = Run(*con.context, config, name, keys, probes, truth, build_seed);
 					if (rep >= config.warmups)
 						Write(out, config, c, name, rep - config.warmups, probes, truth, build_checksum, m);
 				}

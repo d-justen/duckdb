@@ -451,14 +451,19 @@ private:
      * @param end the iterator to the last element of the input range
      */
     template <class t_itr>
-    filter(const value_type _r, const t_itr begin, const t_itr end)
-            : ds(), a(distr(gen)), b(distr(gen)), r(_r), n_items(std::distance(begin, end)), first(), last()
+    filter(const value_type _r, const t_itr begin, const t_itr end,
+           uint64_t seed = 0, bool deterministic = false)
+            : ds(), a(), b(), r(_r), n_items(std::distance(begin, end)), first(), last()
     {
         if (begin == end)
             return;
 
-        while ((a == 0) || (a >= p)) { a = distr(gen); }
-        while (b >= p) { b = distr(gen);}
+        // A per-construction engine makes benchmark instances replayable. Mask
+        // and reject rather than relying on implementation-specific distributions.
+        std::mt19937_64 seeded(seed);
+        auto draw = [&]() { return deterministic ? (seeded() & p) : distr(gen); };
+        do { a = draw(); } while (a == 0 || a >= p);
+        do { b = draw(); } while (b >= p);
         a %= r, b %= r;
 
         std::vector<value_type> temp(n_items);
@@ -475,6 +480,12 @@ private:
         if (max_input_key < this->r) /* equivalent to bpk > 2 + log2(u/n) */
             throw std::runtime_error("error, the requested bpk is higher than a lossless compressed encoding of the input data");
 
+        // Hashing need not preserve sortedness. Only skip sorting after proving
+        // sortedness, or proving that the output is a rotation of a sorted run.
+        auto split = std::is_sorted_until(temp.begin(), temp.end());
+        if (split != temp.end() && std::is_sorted(split, temp.end()) && temp.back() <= temp.front()) {
+            std::rotate(temp.begin(), split, temp.end());
+        } else if (split != temp.end()) {
 #if defined(USE_LIBRARY_BOOST_PARALLEL)
         /*
          * The following code uses the Boost library to sort the elements in parallel. The number of threads is set to
@@ -501,6 +512,8 @@ private:
 #else
         std::sort(temp.begin(), temp.end());
 #endif
+
+        }
 
         first = temp.front(), last = temp.back();
         ds = RangeEmptinessDS{temp.begin(), temp.end()};
@@ -548,6 +561,15 @@ public:
     filter(const t_itr begin, const t_itr end, const double bpk)
             : filter(std::ceil(std::distance(begin, end) * std::exp2(bpk - default_bpk_overhead)), begin, end) {}
 
+
+    // Explicit reduced universe avoids a second floating-point budget conversion.
+    template <class t_itr>
+    filter(const t_itr begin, const t_itr end, uint64_t reduced_universe, uint64_t seed)
+            : filter(reduced_universe, begin, end, seed, true) {}
+
+    uint64_t hash_a() const { return a; }
+    uint64_t hash_b() const { return b; }
+    uint64_t reduced_universe() const { return r; }
 
     filter (filter &&rf) noexcept
     {

@@ -1,3 +1,4 @@
+#include "filter_benchmark_common.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/chrono.hpp"
 #include "duckdb/common/types/selection_vector.hpp"
@@ -43,6 +44,7 @@ struct BenchmarkConfig {
 	idx_t cluster_step = 1;
 	idx_t repetitions = 5;
 	uint64_t seed = 42;
+	uint64_t construction_seed = 42;
 	double grafite_bits_per_key = 12.0;
 	double diva_bits_per_key = 16.0;
 	double max_false_positive_rate = 0.001;
@@ -83,6 +85,7 @@ struct PRFRunResult {
 };
 
 struct DivaRunResult {
+	BenchmarkBuildInfo info;
 	uint64_t build_ns = 0;
 	uint64_t probe_ns = 0;
 	idx_t matched_count = 0;
@@ -92,6 +95,7 @@ struct DivaRunResult {
 };
 
 struct GrafiteRunResult {
+	BenchmarkBuildInfo info;
 	uint64_t build_ns = 0;
 	uint64_t probe_ns = 0;
 	idx_t matched_count = 0;
@@ -114,6 +118,8 @@ struct ResultRow {
 	idx_t cluster_count;
 	string line;
 	idx_t actual_negatives;
+	uint64_t build_checksum = 0;
+	BenchmarkBuildInfo info;
 };
 
 template <class FUNC>
@@ -163,6 +169,8 @@ BenchmarkConfig ParseArguments(int argc, char *argv[]) {
 			config.cluster_step = UnsafeNumericCast<idx_t>(ParseUnsigned(arg.substr(15), "cluster-step"));
 		} else if (StartsWith(arg, "--repetitions=")) {
 			config.repetitions = UnsafeNumericCast<idx_t>(ParseUnsigned(arg.substr(14), "repetitions"));
+		} else if (StartsWith(arg, "--construction-seed=")) {
+			config.construction_seed = ParseUnsigned(arg.substr(20), "construction-seed");
 		} else if (StartsWith(arg, "--seed=")) {
 			config.seed = ParseUnsigned(arg.substr(7), "seed");
 		} else if (StartsWith(arg, "--grafite-bpk=")) {
@@ -191,7 +199,7 @@ BenchmarkConfig ParseArguments(int argc, char *argv[]) {
 			          << "  --max-clusters=N\n"
 			          << "  --cluster-step=N (accepted for compatibility, ignored; cluster counts use powers of two)\n"
 			          << "  --repetitions=N\n"
-			          << "  --seed=N\n"
+			          << "  --construction-seed=N --seed=N\n"
 			          << "  --grafite-bpk=N\n"
 			          << "  --diva-bpk=N\n"
 			          << "  --max-fpr=N\n"
@@ -359,22 +367,16 @@ BloomRunResult RunBloomFilterBenchmark(ClientContext &context, const vector<uint
 	FillUBigIntVector(build_vector, build_keys);
 	FillUBigIntVector(probe_vector, probe_keys);
 
-	Vector build_hashes(LogicalType::HASH, build_keys.size());
 	Vector probe_hashes(LogicalType::HASH, probe_keys.size());
 
+	BloomFilter filter;
 	result.build_core_ns = TimeNs([&]() {
+		Vector build_hashes(LogicalType::HASH, build_keys.size());
 		VectorOperations::Hash(build_vector, build_hashes, build_keys.size());
 		build_hashes.Flatten();
-		BloomFilter filter;
 		filter.Initialize(context, build_keys.size());
 		filter.InsertHashes(build_hashes, build_keys.size());
 	});
-
-	BloomFilter filter;
-	VectorOperations::Hash(build_vector, build_hashes, build_keys.size());
-	build_hashes.Flatten();
-	filter.Initialize(context, build_keys.size());
-	filter.InsertHashes(build_hashes, build_keys.size());
 
 	SelectionVector sel(probe_keys.size());
 	result.probe_ns = TimeNs([&]() {
@@ -392,23 +394,25 @@ PRFRunResult RunPrefixRangeFilterBenchmark(ClientContext &context, const vector<
                                            const vector<uint64_t> &probe_keys, const MembershipInfo &membership,
                                            bool enable_compression, double max_false_positive_rate) {
 	PRFRunResult result;
-	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::UBIGINT);
-	PrefixRangeFilter::Sizing sizing;
-	const auto min_key = build_keys.front();
-	const auto max_key = build_keys.back();
-	if (!PrefixRangeFilter::TryComputeSizing(Value::UBIGINT(min_key), Value::UBIGINT(max_key), build_keys.size(),
-	                                         sizing)) {
-		throw InternalException("Failed to compute PRF sizing");
-	}
-	filter->Initialize(context, build_keys.size(), Value::UBIGINT(min_key), Value::UBIGINT(max_key), sizing);
+	unique_ptr<PrefixRangeFilter> filter;
 
 	Vector build_vector(LogicalType::UBIGINT, build_keys.size());
 	Vector probe_vector(LogicalType::UBIGINT, probe_keys.size());
 	FillUBigIntVector(build_vector, build_keys);
 	FillUBigIntVector(probe_vector, probe_keys);
 
-	auto build_state = filter->InitializeBuildState(context);
 	result.build_core_ns = TimeNs([&]() {
+		filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::UBIGINT);
+		PrefixRangeFilter::Sizing sizing;
+		const auto min_key = build_keys.front();
+		const auto max_key = build_keys.back();
+		if (!PrefixRangeFilter::TryComputeSizing(Value::UBIGINT(min_key), Value::UBIGINT(max_key), build_keys.size(),
+		                                         sizing, max_false_positive_rate)) {
+			throw InternalException("Failed to compute PRF sizing");
+		}
+		filter->Initialize(context, build_keys.size(), Value::UBIGINT(min_key), Value::UBIGINT(max_key), sizing);
+
+		auto build_state = filter->InitializeBuildState(context);
 		filter->InsertKeys(build_vector, build_keys.size(), *build_state);
 		filter->MergeBuildState(*build_state);
 	});
@@ -439,42 +443,54 @@ PRFRunResult RunPrefixRangeFilterBenchmark(ClientContext &context, const vector<
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
 GrafiteRunResult RunGrafiteBenchmark(const std::vector<uint64_t> &build_keys, const std::vector<uint64_t> &probe_keys,
-                                     const MembershipInfo &membership, double bits_per_key) {
+                                     const MembershipInfo &membership, double bits_per_key, uint32_t build_seed) {
 	GrafiteRunResult result;
 
 	GrafiteBenchmarkFilter filter;
-	result.build_ns = TimeNs([&]() { filter.Build(build_keys, bits_per_key); });
+	result.build_ns = TimeNs([&]() { filter.Build(build_keys, bits_per_key, build_seed); });
 
+	SelectionVector sel(probe_keys.size());
 	result.probe_ns = TimeNs([&]() {
 		for (idx_t i = 0; i < probe_keys.size(); i++) {
-			const auto matched = filter.Probe(probe_keys[i]);
-			result.matched_count += matched ? 1 : 0;
-			result.true_positive_count += matched && membership.flags[i] ? 1 : 0;
+			if (filter.Probe(probe_keys[i])) {
+				sel.set_index(result.matched_count++, i);
+			}
 		}
 	});
+	result.true_positive_count = CountMatchedPositives(sel, result.matched_count, membership);
+	if (result.true_positive_count != membership.positives) {
+		throw std::runtime_error("range summary reported a point false negative");
+	}
 	result.false_positive_count = result.matched_count - result.true_positive_count;
 	result.bytes = UnsafeNumericCast<idx_t>(filter.SizeBytes());
+	result.info = filter.BuildInfo();
 	return result;
 }
 #endif
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
 DivaRunResult RunDivaBenchmark(const std::vector<uint64_t> &build_keys, const std::vector<uint64_t> &probe_keys,
-                               const MembershipInfo &membership, double bits_per_key) {
+                               const MembershipInfo &membership, double bits_per_key, uint32_t build_seed) {
 	DivaRunResult result;
 
 	DivaBenchmarkFilter filter;
-	result.build_ns = TimeNs([&]() { filter.Build(build_keys, bits_per_key); });
+	result.build_ns = TimeNs([&]() { filter.Build(build_keys, bits_per_key, build_seed); });
 
+	SelectionVector sel(probe_keys.size());
 	result.probe_ns = TimeNs([&]() {
 		for (idx_t i = 0; i < probe_keys.size(); i++) {
-			const auto matched = filter.Probe(probe_keys[i]);
-			result.matched_count += matched ? 1 : 0;
-			result.true_positive_count += matched && membership.flags[i] ? 1 : 0;
+			if (filter.Probe(probe_keys[i])) {
+				sel.set_index(result.matched_count++, i);
+			}
 		}
 	});
+	result.true_positive_count = CountMatchedPositives(sel, result.matched_count, membership);
+	if (result.true_positive_count != membership.positives) {
+		throw std::runtime_error("range summary reported a point false negative");
+	}
 	result.false_positive_count = result.matched_count - result.true_positive_count;
 	result.bytes = UnsafeNumericCast<idx_t>(filter.SizeBytes());
+	result.info = filter.BuildInfo();
 	return result;
 }
 #endif
@@ -482,7 +498,8 @@ DivaRunResult RunDivaBenchmark(const std::vector<uint64_t> &build_keys, const st
 void WriteHeader(std::ostream &out) {
 	out << "filter,cluster_count,build_time_ns,post_processing_time_ns,summary_bytes,probe_throughput_per_sec,"
 	       "false_positives,estimated_fpr,actual_fpr,mode,range_count,shift,active_buckets,repetition,seed,actual_"
-	       "negatives,probe_count\n";
+	       "negatives,probe_count,construction_seed,build_seed,build_checksum,build_input_order,"
+	    << BenchmarkBuildInfo::Header() << "\n";
 }
 
 string FormatBloomRow(const BenchmarkConfig &config, idx_t cluster_count, const MembershipInfo &membership,
@@ -583,6 +600,10 @@ int main(int argc, char *argv[]) {
 			rows.reserve(repetition.cluster_counts.size() * 5);
 			for (const auto cluster_count : repetition.cluster_counts) {
 				const auto layout = GenerateClusteredKeys(config.domain_size, config.total_keys, cluster_count);
+				ValidateBenchmarkBuildKeys(layout.keys);
+				const auto checksum = BenchmarkBuildChecksum(layout.keys);
+				const auto build_seed = BenchmarkBuildSeed(config.construction_seed, checksum, rep);
+				const auto first_row = rows.size();
 				const auto membership = ComputeMembership(config.domain_size, layout.keys, repetition.probes);
 				const auto actual_negatives = config.probe_count - membership.positives;
 
@@ -608,26 +629,33 @@ int main(int argc, char *argv[]) {
 				                actual_negatives});
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
-				(void)RunGrafiteBenchmark(layout.keys, repetition.probes, membership, config.grafite_bits_per_key);
-				const auto grafite_result =
-				    RunGrafiteBenchmark(layout.keys, repetition.probes, membership, config.grafite_bits_per_key);
+				(void)RunGrafiteBenchmark(layout.keys, repetition.probes, membership, config.grafite_bits_per_key,
+				                          build_seed);
+				const auto grafite_result = RunGrafiteBenchmark(layout.keys, repetition.probes, membership,
+				                                                config.grafite_bits_per_key, build_seed);
 				rows.push_back({cluster_count, FormatGrafiteRow(config, cluster_count, membership, grafite_result),
-				                actual_negatives});
+				                actual_negatives, checksum, grafite_result.info});
 #endif
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
-				(void)RunDivaBenchmark(layout.keys, repetition.probes, membership, config.diva_bits_per_key);
+				(void)RunDivaBenchmark(layout.keys, repetition.probes, membership, config.diva_bits_per_key,
+				                       build_seed);
 				const auto diva_result =
-				    RunDivaBenchmark(layout.keys, repetition.probes, membership, config.diva_bits_per_key);
-				rows.push_back(
-				    {cluster_count, FormatDivaRow(config, cluster_count, membership, diva_result), actual_negatives});
+				    RunDivaBenchmark(layout.keys, repetition.probes, membership, config.diva_bits_per_key, build_seed);
+				rows.push_back({cluster_count, FormatDivaRow(config, cluster_count, membership, diva_result),
+				                actual_negatives, checksum, diva_result.info});
 #endif
+				for (auto i = first_row; i < rows.size(); i++) {
+					rows[i].build_checksum = checksum;
+				}
 			}
 			std::sort(rows.begin(), rows.end(),
 			          [](const ResultRow &lhs, const ResultRow &rhs) { return lhs.cluster_count < rhs.cluster_count; });
 			for (const auto &row : rows) {
 				*out << row.line << ',' << rep << ',' << config.seed + rep << ',' << row.actual_negatives << ','
-				     << config.probe_count << '\n';
+				     << config.probe_count << ',' << config.construction_seed << ','
+				     << BenchmarkBuildSeed(config.construction_seed, row.build_checksum, rep) << ','
+				     << row.build_checksum << ",sorted_distinct," << row.info.CSV() << '\n';
 			}
 		}
 

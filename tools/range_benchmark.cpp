@@ -1,3 +1,4 @@
+#include "filter_benchmark_common.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -36,6 +37,7 @@ struct Config {
 	idx_t queries_per_cluster_count = 100000;
 	idx_t repetitions = 5;
 	uint64_t seed = 42;
+	uint64_t construction_seed = 42;
 	double grafite_bits_per_key = 12.0;
 	double diva_bits_per_key = 16.0;
 	double max_false_positive_rate = 0.001;
@@ -103,6 +105,8 @@ Config ParseArguments(int argc, char *argv[]) {
 			    UnsafeNumericCast<idx_t>(ParseUnsigned(arg.substr(28), "queries-per-cluster-count"));
 		} else if (StartsWith(arg, "--repetitions=")) {
 			config.repetitions = UnsafeNumericCast<idx_t>(ParseUnsigned(arg.substr(14), "repetitions"));
+		} else if (StartsWith(arg, "--construction-seed=")) {
+			config.construction_seed = ParseUnsigned(arg.substr(20), "construction-seed");
 		} else if (StartsWith(arg, "--seed=")) {
 			config.seed = ParseUnsigned(arg.substr(7), "seed");
 		} else if (StartsWith(arg, "--grafite-bpk=")) {
@@ -126,7 +130,7 @@ Config ParseArguments(int argc, char *argv[]) {
 			std::cout << "Usage: range_benchmark [options]\n"
 			          << "  --domain-size=N --total-keys=N\n"
 			          << "  --min-clusters=N --max-clusters=N (powers of two)\n"
-			          << "  --queries-per-cluster-count=N --repetitions=N --seed=N\n"
+			          << "  --queries-per-cluster-count=N --repetitions=N --construction-seed=N --seed=N\n"
 			          << "  --grafite-bpk=N --diva-bpk=N --max-fpr=N --output=PATH --list-filters\n";
 			std::exit(0);
 		} else {
@@ -223,7 +227,7 @@ PRFBuildResult BuildPRF(ClientContext &context, const vector<uint64_t> &keys, bo
 	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::UBIGINT);
 	PrefixRangeFilter::Sizing sizing;
 	if (!PrefixRangeFilter::TryComputeSizing(Value::UBIGINT(keys.front()), Value::UBIGINT(keys.back()), keys.size(),
-	                                         sizing)) {
+	                                         sizing, max_false_positive_rate)) {
 		throw InternalException("Failed to compute PRF sizing");
 	}
 	filter->Initialize(context, keys.size(), Value::UBIGINT(keys.front()), Value::UBIGINT(keys.back()), sizing);
@@ -268,7 +272,9 @@ void WriteResult(std::ostream &out, idx_t repetition, idx_t cluster_count, const
                  const char *query_kind, const char *summary, const char *mode, double max_false_positive_rate,
                  idx_t query_count, idx_t bytes, const char *compression_mode, idx_t shift, idx_t range_count,
                  idx_t active_buckets, uint64_t post_processing_ns, idx_t range_index_count, idx_t range_index_bytes,
-                 uint64_t ns, idx_t possibly_overlapping, bool expected_overlap, uint64_t seed) {
+                 uint64_t ns, idx_t possibly_overlapping, bool expected_overlap, uint64_t seed,
+                 uint64_t construction_seed, uint64_t checksum,
+                 const BenchmarkBuildInfo &build_info = BenchmarkBuildInfo()) {
 	uint64_t min_width = NumericLimits<uint64_t>::Maximum();
 	uint64_t max_width = 0;
 	double total_width = 0;
@@ -285,7 +291,9 @@ void WriteResult(std::ostream &out, idx_t repetition, idx_t cluster_count, const
 	    << ',' << query_count << ',' << ns << ',' << throughput << ',' << possibly_overlapping << ',' << bytes << ','
 	    << compression_mode << ',' << shift << ',' << range_count << ',' << active_buckets << ',' << post_processing_ns
 	    << ',' << range_index_count << ',' << range_index_bytes << ','
-	    << (!expected_overlap || possibly_overlapping == query_count ? "true" : "false") << ',' << seed << '\n';
+	    << (!expected_overlap || possibly_overlapping == query_count ? "true" : "false") << ',' << seed << ','
+	    << construction_seed << ',' << BenchmarkBuildSeed(construction_seed, checksum, repetition) << ',' << checksum
+	    << ",sorted_distinct," << build_info.CSV() << '\n';
 }
 
 } // namespace
@@ -306,7 +314,9 @@ int main(int argc, char *argv[]) {
 		        "summary,mode,max_false_positive_rate,query_count,total_query_time_ns,queries_per_sec,possibly_"
 		        "overlapping,"
 		        "summary_bytes,compression_mode,shift,direct_range_count,active_buckets,post_processing_time_ns,"
-		        "range_index_count,range_index_bytes,correct_result,seed\n";
+		        "range_index_count,range_index_bytes,correct_result,seed,construction_seed,build_seed,build_checksum,"
+		        "build_input_order,"
+		     << BenchmarkBuildInfo::Header() << "\n";
 
 		DuckDB db(nullptr);
 		Connection con(db);
@@ -316,6 +326,9 @@ int main(int argc, char *argv[]) {
 			std::shuffle(cluster_counts.begin(), cluster_counts.end(), rng);
 			for (const auto cluster_count : cluster_counts) {
 				const auto layout = GenerateClusterLayout(config.domain_size, config.total_keys, cluster_count);
+				ValidateBenchmarkBuildKeys(layout.keys);
+				const auto checksum = BenchmarkBuildChecksum(layout.keys);
+				const auto build_seed = BenchmarkBuildSeed(config.construction_seed, checksum, rep);
 				auto prf = BuildPRF(*con.context, layout.keys, false, config.max_false_positive_rate);
 				auto compressed_prf = BuildPRF(*con.context, layout.keys, true, config.max_false_positive_rate);
 				const vector<QueryWorkload> workloads {{"empty", &layout.gaps, false},
@@ -335,7 +348,7 @@ int main(int argc, char *argv[]) {
 					            config.max_false_positive_rate, config.queries_per_cluster_count, PRFBytes(info),
 					            "bitmap", info.shift, info.range_count, info.active_buckets, prf.post_processing_ns,
 					            info.range_index_count, info.range_index_bytes, ns, matches, workload.expected_overlap,
-					            config.seed + rep);
+					            config.seed + rep, config.construction_seed, checksum);
 
 					info = compressed_prf.filter->GetCompressionInfo();
 					ns = TimeQueries(*workload.ranges, config.queries_per_cluster_count, matches,
@@ -349,12 +362,12 @@ int main(int argc, char *argv[]) {
 					            info.mode == CompressionMode::DIRECT_RANGES ? "direct_ranges" : "bitmap", info.shift,
 					            info.range_count, info.active_buckets, compressed_prf.post_processing_ns,
 					            info.range_index_count, info.range_index_bytes, ns, matches, workload.expected_overlap,
-					            config.seed + rep);
+					            config.seed + rep, config.construction_seed, checksum);
 				}
 
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE)
 				GrafiteBenchmarkFilter grafite;
-				grafite.Build(layout.keys, config.grafite_bits_per_key);
+				grafite.Build(layout.keys, config.grafite_bits_per_key, build_seed);
 				idx_t grafite_matches;
 				auto grafite_ns =
 				    TimeQueries(layout.gaps, config.queries_per_cluster_count, grafite_matches,
@@ -362,11 +375,12 @@ int main(int argc, char *argv[]) {
 				WriteResult(*out, rep, cluster_count, layout.gaps, "empty", "grafite", "na",
 				            config.max_false_positive_rate, config.queries_per_cluster_count,
 				            UnsafeNumericCast<idx_t>(grafite.SizeBytes()), "na", 0, 0, 0, 0, 0, 0, grafite_ns,
-				            grafite_matches, false, config.seed + rep);
+				            grafite_matches, false, config.seed + rep, config.construction_seed, checksum,
+				            grafite.BuildInfo());
 #endif
 #if defined(DUCKDB_FILTER_BENCHMARK_HAS_DIVA)
 				DivaBenchmarkFilter diva;
-				diva.Build(layout.keys, config.diva_bits_per_key);
+				diva.Build(layout.keys, config.diva_bits_per_key, build_seed);
 				idx_t diva_matches;
 				auto diva_ns =
 				    TimeQueries(layout.gaps, config.queries_per_cluster_count, diva_matches,
@@ -374,7 +388,7 @@ int main(int argc, char *argv[]) {
 				WriteResult(*out, rep, cluster_count, layout.gaps, "empty", "diva", "na",
 				            config.max_false_positive_rate, config.queries_per_cluster_count,
 				            UnsafeNumericCast<idx_t>(diva.SizeBytes()), "na", 0, 0, 0, 0, 0, 0, diva_ns, diva_matches,
-				            false, config.seed + rep);
+				            false, config.seed + rep, config.construction_seed, checksum, diva.BuildInfo());
 #endif
 			}
 		}

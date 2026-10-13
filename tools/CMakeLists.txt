@@ -36,7 +36,7 @@ if(BUILD_SHELL)
 
   set(DUCKDB_FILTER_BENCHMARK_GRAFITE_ENABLED FALSE)
   if(BUILD_GRAFITE_BENCHMARK AND CMAKE_SYSTEM_PROCESSOR MATCHES
-                                 "^(x86_64|amd64|AMD64)$")
+                                 "^(x86_64|amd64|AMD64|aarch64|arm64)$")
     add_library(duckdb_grafite_benchmark STATIC grafite_benchmark_adapter.cpp)
     target_compile_definitions(duckdb_grafite_benchmark PUBLIC SUCCINCT_LIB_SUX)
     target_include_directories(
@@ -110,4 +110,14 @@ if(BUILD_SHELL)
                                PRIVATE DUCKDB_FILTER_BENCHMARK_HAS_DIVA=1)
   endif()
   duckdb_codesign_for_debugging(filter_benchmark_tests)
+  # Adapter-only validation also runs without rebuilding DuckDB itself.
+  add_executable(range_filter_adapter_tests range_filter_adapter_tests.cpp)
+  if(DUCKDB_FILTER_BENCHMARK_GRAFITE_ENABLED)
+    target_link_libraries(range_filter_adapter_tests duckdb_grafite_benchmark)
+    target_compile_definitions(range_filter_adapter_tests PRIVATE DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE=1)
+  endif()
+  if(DUCKDB_FILTER_BENCHMARK_DIVA_ENABLED)
+    target_link_libraries(range_filter_adapter_tests duckdb_diva_benchmark)
+    target_compile_definitions(range_filter_adapter_tests PRIVATE DUCKDB_FILTER_BENCHMARK_HAS_DIVA=1)
+  endif()
 endif()
