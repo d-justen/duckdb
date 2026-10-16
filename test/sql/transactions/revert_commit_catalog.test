@@ -1,0 +1,149 @@
+# name: test/sql/transactions/revert_commit_catalog.test
+# description: Revert a failed commit containing catalog changes and mixed DML
+# group: [transactions]
+
+require skip_reload
+
+statement ok
+CREATE TABLE t(id INTEGER, value VARCHAR)
+
+statement ok
+INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')
+
+statement ok
+CREATE TABLE renamed(id INTEGER)
+
+statement ok
+INSERT INTO renamed VALUES (10)
+
+statement ok
+CREATE TABLE dropped(id INTEGER)
+
+statement ok
+INSERT INTO dropped VALUES (20)
+
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE created(id INTEGER)
+
+statement ok
+INSERT INTO created VALUES (30)
+
+statement ok
+UPDATE t SET value = 'changed' WHERE id = 1
+
+statement ok
+DELETE FROM t WHERE id = 2
+
+statement ok
+INSERT INTO t VALUES (4, 'four')
+
+statement ok
+ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 42
+
+statement ok
+ALTER TABLE t RENAME COLUMN value TO new_value
+
+statement ok
+ALTER TABLE renamed RENAME TO new_name
+
+statement ok
+DROP TABLE dropped
+
+statement ok
+SET GLOBAL debug_force_commit_failure = true
+
+statement error
+COMMIT
+----
+Forced commit failure
+
+statement ok
+SET GLOBAL debug_force_commit_failure = false
+
+# Both sides of the rename and the other catalog changes must be restored.
+query T
+SELECT table_name FROM duckdb_tables()
+WHERE database_name = current_database() AND schema_name = current_schema() AND NOT internal
+ORDER BY table_name
+----
+dropped
+renamed
+t
+
+query TT
+SELECT name, type FROM pragma_table_info('t') ORDER BY cid
+----
+id	INTEGER
+value	VARCHAR
+
+query IT
+SELECT id, value FROM t ORDER BY id
+----
+1	one
+2	two
+3	three
+
+query I
+SELECT * FROM renamed
+----
+10
+
+query I
+SELECT * FROM dropped
+----
+20
+
+# Reuse the catalog names and storage after recovery in a successful transaction.
+statement ok
+BEGIN
+
+statement ok
+CREATE TABLE created(id INTEGER)
+
+statement ok
+INSERT INTO created VALUES (30)
+
+statement ok
+ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 42
+
+statement ok
+ALTER TABLE t RENAME COLUMN value TO new_value
+
+statement ok
+ALTER TABLE renamed RENAME TO new_name
+
+statement ok
+DROP TABLE dropped
+
+statement ok
+UPDATE t SET new_value = 'updated' WHERE id = 1
+
+statement ok
+COMMIT
+
+query ITI
+SELECT * FROM t ORDER BY id
+----
+1	updated	42
+2	two	42
+3	three	42
+
+query I
+SELECT * FROM created
+----
+30
+
+query I
+SELECT * FROM new_name
+----
+10
+
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = current_database() AND schema_name = current_schema()
+AND table_name IN ('dropped', 'renamed')
+----
+0

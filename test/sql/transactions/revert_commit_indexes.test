@@ -1,0 +1,264 @@
+# name: test/sql/transactions/revert_commit_indexes.test
+# description: Revert indexed deletes and replacement rows with and without an active reader
+# group: [transactions]
+
+require skip_reload
+
+statement ok
+SET index_scan_percentage = 1.0
+
+# No other transaction is active during commit or reversion.
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER UNIQUE)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM t WHERE id IN (1, 2)
+
+statement ok
+INSERT INTO t VALUES (2, 200), (4, 40)
+
+statement ok
+UPDATE t SET value = 300 WHERE id = 3
+
+statement ok
+SET GLOBAL debug_force_commit_failure = true
+
+statement error
+COMMIT
+----
+Forced commit failure
+
+statement ok
+SET GLOBAL debug_force_commit_failure = false
+
+query II
+SELECT * FROM t ORDER BY id
+----
+1	10
+2	20
+3	30
+
+# Check restored rows through both the primary and unique indexes.
+query II
+EXPLAIN ANALYZE SELECT value FROM t WHERE id = 1
+----
+analyzed_plan	<REGEX>:.*Index Scan.*
+
+query I
+SELECT value FROM t WHERE id = 1
+----
+10
+
+query II
+EXPLAIN ANALYZE SELECT id FROM t WHERE value = 20
+----
+analyzed_plan	<REGEX>:.*Index Scan.*
+
+query I
+SELECT id FROM t WHERE value = 20
+----
+2
+
+query I
+SELECT count(*) FROM t WHERE id = 4 OR value IN (200, 300)
+----
+0
+
+foreach id 1 2 3
+
+query I
+SELECT value = {id} * 10 FROM t WHERE id = {id}
+----
+true
+
+query I
+SELECT id = {id} FROM t WHERE value = {id} * 10
+----
+true
+
+statement error
+INSERT INTO t VALUES ({id}, 1000)
+----
+Duplicate key
+
+statement error
+INSERT INTO t VALUES (1000, {id} * 10)
+----
+Duplicate key
+
+endloop
+
+# Keys introduced by the failed transaction must be available for later commits.
+statement ok
+INSERT INTO t VALUES (4, 40), (5, 200), (6, 300)
+
+query II
+SELECT * FROM t ORDER BY id
+----
+1	10
+2	20
+3	30
+4	40
+5	200
+6	300
+
+statement ok
+DROP TABLE t
+
+# Repeat with an established concurrent reader to exercise retained index versions.
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER UNIQUE)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok reader
+SET index_scan_percentage = 1.0
+
+statement ok reader
+BEGIN
+
+# Establish a snapshot before the writer changes any rows.
+query II reader
+SELECT * FROM t ORDER BY id
+----
+1	10
+2	20
+3	30
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM t WHERE id IN (1, 2)
+
+statement ok
+INSERT INTO t VALUES (2, 200), (4, 40)
+
+statement ok
+UPDATE t SET value = 300 WHERE id = 3
+
+statement ok
+SET GLOBAL debug_force_commit_failure = true
+
+statement error
+COMMIT
+----
+Forced commit failure
+
+statement ok
+SET GLOBAL debug_force_commit_failure = false
+
+query II
+SELECT * FROM t ORDER BY id
+----
+1	10
+2	20
+3	30
+
+# Check restored rows through both the primary and unique indexes.
+query II
+EXPLAIN ANALYZE SELECT value FROM t WHERE id = 1
+----
+analyzed_plan	<REGEX>:.*Index Scan.*
+
+query I
+SELECT value FROM t WHERE id = 1
+----
+10
+
+query II
+EXPLAIN ANALYZE SELECT id FROM t WHERE value = 20
+----
+analyzed_plan	<REGEX>:.*Index Scan.*
+
+query I
+SELECT id FROM t WHERE value = 20
+----
+2
+
+query I
+SELECT count(*) FROM t WHERE id = 4 OR value IN (200, 300)
+----
+0
+
+foreach id 1 2 3
+
+query I
+SELECT value = {id} * 10 FROM t WHERE id = {id}
+----
+true
+
+query I
+SELECT id = {id} FROM t WHERE value = {id} * 10
+----
+true
+
+statement error
+INSERT INTO t VALUES ({id}, 1000)
+----
+Duplicate key
+
+statement error
+INSERT INTO t VALUES (1000, {id} * 10)
+----
+Duplicate key
+
+endloop
+
+# Keys introduced by the failed transaction must be available for later commits.
+statement ok
+INSERT INTO t VALUES (4, 40), (5, 200), (6, 300)
+
+query II
+SELECT * FROM t ORDER BY id
+----
+1	10
+2	20
+3	30
+4	40
+5	200
+6	300
+
+# The established reader retains its snapshot across the failed and successful commits.
+query II reader
+SELECT * FROM t ORDER BY id
+----
+1	10
+2	20
+3	30
+
+query II reader
+EXPLAIN ANALYZE SELECT value FROM t WHERE id = 2
+----
+analyzed_plan	<REGEX>:.*Index Scan.*
+
+query I reader
+SELECT value FROM t WHERE id = 2
+----
+20
+
+query I reader
+SELECT count(*) FROM t WHERE id = 4
+----
+0
+
+statement ok reader
+COMMIT
+
+# After releasing the old snapshot, the same connection sees the later commit.
+query II reader
+SELECT * FROM t ORDER BY id
+----
+1	10
+2	20
+3	30
+4	40
+5	200
+6	300
