@@ -3,6 +3,9 @@
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/types/row/tuple_data_layout.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/planner/filter/prefix_range_intervals.hpp"
+#include <random>
+#include <thread>
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 
@@ -11,15 +14,15 @@ using namespace duckdb;
 namespace {
 
 unique_ptr<PrefixRangeFilter> BuildInt32PrefixRangeFilter(ClientContext &context, const vector<int32_t> &keys,
-	                                                      int32_t min, int32_t max, idx_t shift,
-	                                                      double max_false_positive_rate, bool compress = true,
-	                                                      double estimated_multiplicity = 1.0, idx_t parallel_tasks = 0) {
+                                                          int32_t min, int32_t max, idx_t shift,
+                                                          double max_false_positive_rate, bool compress = true,
+                                                          double estimated_multiplicity = 1.0,
+                                                          idx_t parallel_tasks = 0) {
 	auto filter = PrefixRangeFilter::CreatePrefixRangeFilter(LogicalType::INTEGER);
 	PrefixRangeFilter::Sizing sizing;
 	REQUIRE(PrefixRangeFilter::TryComputeSpan(Value::INTEGER(min), Value::INTEGER(max), sizing.span));
 	sizing.shift = shift;
-	filter->Initialize(context, keys.size(), Value::INTEGER(min), Value::INTEGER(max), sizing,
-	                   estimated_multiplicity);
+	filter->Initialize(context, keys.size(), Value::INTEGER(min), Value::INTEGER(max), sizing, estimated_multiplicity);
 
 	auto state = filter->InitializeBuildState(context);
 	Vector key_vector(LogicalType::INTEGER, keys.size());
@@ -35,8 +38,12 @@ unique_ptr<PrefixRangeFilter> BuildInt32PrefixRangeFilter(ClientContext &context
 			auto compression = filter->InitializeParallelCompression(context, max_false_positive_rate, parallel_tasks);
 			REQUIRE(compression);
 			do {
+				vector<std::thread> workers;
 				for (idx_t task_idx = 0; task_idx < compression->TaskCount(); task_idx++) {
-					compression->ExecuteTask(task_idx);
+					workers.emplace_back([&compression, task_idx]() { compression->ExecuteTask(task_idx); });
+				}
+				for (auto &worker : workers) {
+					worker.join();
 				}
 			} while (compression->FinishPass());
 		} else {
@@ -168,12 +175,12 @@ TEST_CASE("Uncompressed prefix range filter retains the fixed-size initial bitma
 
 	static constexpr idx_t MAX_BUCKET_COUNT = 1 << 26;
 	PrefixRangeFilter::Sizing sizing;
-	REQUIRE(PrefixRangeFilter::TryComputeFixedSizeSizing(Value::INTEGER(0), Value::INTEGER(1 << 28),
-	                                                    MAX_BUCKET_COUNT, sizing));
+	REQUIRE(PrefixRangeFilter::TryComputeFixedSizeSizing(Value::INTEGER(0), Value::INTEGER(1 << 28), MAX_BUCKET_COUNT,
+	                                                     sizing));
 	REQUIRE(sizing.shift > 0);
 
-	auto filter = BuildInt32PrefixRangeFilter(*con.context, {0, 1 << 27, 1 << 28}, 0, 1 << 28, sizing.shift, 0.001,
-	                                          false);
+	auto filter =
+	    BuildInt32PrefixRangeFilter(*con.context, {0, 1 << 27, 1 << 28}, 0, 1 << 28, sizing.shift, 0.001, false);
 	const auto info = filter->GetCompressionInfo();
 	REQUIRE(info.mode == CompressionMode::BITMAP);
 	REQUIRE(info.shift == sizing.shift);
@@ -792,4 +799,127 @@ TEST_CASE("String prefix range statistics handle null bytes and invalid UTF-8", 
 	auto invalid_stats = StringStatistics(invalid_utf8, StringStatsType::TRUNCATED_STATS, invalid_utf8,
 	                                      StringStatsType::TRUNCATED_STATS);
 	REQUIRE(filter->LookupStatistics(invalid_stats) == FilterPropagateResult::FILTER_ALWAYS_FALSE);
+}
+
+TEST_CASE("Interval scratch reduction materializes the exact dyadic bitmap", "[optimizer][prf]") {
+	std::mt19937_64 random(42);
+	for (idx_t buckets : {idx_t(1), idx_t(63), idx_t(64), idx_t(65), idx_t(8193), idx_t(262147)}) {
+		for (idx_t pattern = 0; pattern < 5; pattern++) {
+			vector<uint64_t> source((buckets + 63) / 64, 0);
+			for (idx_t bit = 0; bit < buckets; bit++) {
+				const bool set = pattern == 0 || (pattern == 1 && (bit / 131) % 3 == 0) ||
+				                 (pattern == 2 && bit % 257 == 0) || (pattern == 3 && random() % 7 == 0);
+				if (set) {
+					source[bit / 64] |= uint64_t(1) << (bit % 64);
+				}
+			}
+			for (bool blocked : {false, true}) {
+				vector<PrefixRangeInterval> intervals;
+				REQUIRE((blocked
+				             ? PrefixRangeIntervals::Collect<true>(source.data(), buckets, 0, source.size(),
+				                                                   PrefixRangeIntervals::MAX_INTERVALS, intervals)
+				             : PrefixRangeIntervals::Collect<false>(source.data(), buckets, 0, source.size(),
+				                                                    PrefixRangeIntervals::MAX_INTERVALS, intervals)));
+				auto reference = source;
+				auto logical = buckets;
+				for (idx_t level = 0; level < 8; level++) {
+					vector<uint64_t> materialized(reference.size(), ~uint64_t(0));
+					// Split through runs and at non-block boundaries; each task owns entire words.
+					for (idx_t begin = 0; begin < reference.size(); begin += 37) {
+						PrefixRangeIntervals::Materialize(intervals, materialized.data(), begin,
+						                                  MinValue<idx_t>(begin + 37, reference.size()));
+					}
+					REQUIRE(materialized == reference);
+					if (logical == 1) {
+						break;
+					}
+					vector<PrefixRangeInterval> reduced;
+					PrefixRangeIntervals::Reduce(intervals, reduced);
+					intervals.swap(reduced);
+					vector<uint64_t> next(((logical + 1) / 2 + 63) / 64, 0);
+					for (idx_t bit = 0; bit < logical; bit++) {
+						if ((reference[bit / 64] >> (bit % 64)) & 1) {
+							next[(bit / 2) / 64] |= uint64_t(1) << ((bit / 2) % 64);
+						}
+					}
+					reference.swap(next);
+					logical = (logical + 1) / 2;
+				}
+			}
+		}
+	}
+}
+
+TEST_CASE("Interval collection bounds memory and masks unused tail bits", "[optimizer][prf]") {
+	vector<uint64_t> source(4097, 0x5555555555555555ULL);
+	const auto original = source;
+	for (bool blocked : {false, true}) {
+		vector<PrefixRangeInterval> intervals;
+		const auto complete = blocked ? PrefixRangeIntervals::Collect<true>(source.data(), source.size() * 64, 0,
+		                                                                    source.size(), 65536, intervals)
+		                              : PrefixRangeIntervals::Collect<false>(source.data(), source.size() * 64, 0,
+		                                                                     source.size(), 65536, intervals);
+		REQUIRE_FALSE(complete);
+		REQUIRE(intervals.size() == 65536);
+		REQUIRE(intervals.capacity() <= 65536);
+		REQUIRE(source == original);
+	}
+	vector<uint64_t> tail(129, ~uint64_t(0));
+	vector<PrefixRangeInterval> intervals;
+	REQUIRE(PrefixRangeIntervals::Collect<true>(tail.data(), 8193, 0, tail.size(), 65536, intervals));
+	REQUIRE(intervals.size() == 1);
+	REQUIRE(intervals[0].lower == 0);
+	REQUIRE(intervals[0].upper == 8192);
+}
+
+TEST_CASE("Parallel interval overflow preserves the bitmap and falls back", "[optimizer][prf]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	vector<int32_t> keys;
+	for (int32_t key = 0; key < 10000; key++) {
+		keys.push_back(key);
+	}
+	// More intervals than the global budget, concentrated in the first partition.
+	for (int32_t i = 0; i < 70000; i++) {
+		keys.push_back(16384 + i * 64);
+	}
+	const int32_t maximum = (1 << 26) - 7;
+	auto serial = BuildInt32PrefixRangeFilter(*con.context, keys, 0, maximum, 0, 0.0);
+	auto parallel = BuildInt32PrefixRangeFilter(*con.context, keys, 0, maximum, 0, 0.0, true, 1.0, 8);
+	REQUIRE(serial->GetCompressionInfo().shift == 0);
+	REQUIRE(parallel->GetCompressionInfo().shift == 0);
+	REQUIRE(parallel->Analyze().active_buckets == keys.size());
+	for (auto key : keys) {
+		REQUIRE(ContainsKey(*parallel, key));
+		if (key >= 16384) {
+			REQUIRE_FALSE(ContainsKey(*parallel, key + 1));
+		}
+	}
+}
+
+TEST_CASE("Interval reductions match every covered bucket", "[optimizer]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	const int32_t maximum = 262147;
+	for (idx_t clusters : {idx_t(5), idx_t(16), idx_t(256), idx_t(4096)}) {
+		vector<int32_t> keys;
+		for (idx_t c = 0; c < clusters; c++) {
+			const auto begin = c * 262100 / clusters;
+			const auto length = MaxValue<idx_t>(1, 8192 / clusters);
+			for (idx_t i = 0; i < length; i++) {
+				keys.push_back(begin + i);
+			}
+		}
+		for (double threshold : {0.0, 0.001, 1.0}) {
+			auto filter = BuildInt32PrefixRangeFilter(*con.context, keys, 0, maximum, 0, threshold);
+			const auto info = filter->GetCompressionInfo();
+			vector<bool> buckets((maximum >> info.shift) + 1, false);
+			for (auto key : keys) {
+				buckets[key >> info.shift] = true;
+			}
+			for (int32_t key = 0; key <= maximum; key++) {
+				REQUIRE(ContainsKey(*filter, key) == buckets[key >> info.shift]);
+			}
+		}
+	}
 }

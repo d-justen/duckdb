@@ -63,3 +63,41 @@ query I
 SELECT count(*) FROM prf_parallel_probe p JOIN prf_parallel_build b ON p.k=b.k
 ----
 100000
+
+# Many short runs retain a bitmap and exercise parallel materialization.
+statement ok
+SET enable_prefix_range_filter_compression=true
+
+statement ok
+CREATE TABLE prf_interval_build AS
+SELECT (cluster * 3000 + i)::INTEGER k FROM range(32768) c(cluster), range(32) t(i)
+
+statement ok
+CREATE TABLE prf_interval_probe AS
+SELECT k FROM prf_interval_build
+UNION ALL
+SELECT k + 100 FROM prf_interval_build
+
+statement ok
+SET threads=1
+
+query I
+SELECT count(*) FROM prf_interval_probe p JOIN prf_interval_build b ON p.k=b.k
+----
+1048576
+
+statement ok
+SET threads=8
+
+query I
+SELECT count(*) FROM prf_interval_probe p JOIN prf_interval_build b ON p.k=b.k
+----
+1048576
+
+statement ok
+SET enable_prefix_range_filter_compression=false
+
+query I
+SELECT count(*) FROM prf_interval_probe p JOIN prf_interval_build b ON p.k=b.k
+----
+1048576

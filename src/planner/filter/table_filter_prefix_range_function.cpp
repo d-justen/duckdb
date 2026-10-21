@@ -8,6 +8,7 @@
 
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/filter/table_filter_function_helpers.hpp"
+#include "duckdb/planner/filter/prefix_range_intervals.hpp"
 
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -293,7 +294,7 @@ public:
 		if (TrySkipCompression(max_false_positive_rate)) {
 			return nullptr;
 		}
-		return make_uniq<ParallelBitmapCompressionState>(*this, context, max_false_positive_rate, max_tasks);
+		return make_uniq<ParallelIntervalCompressionState>(*this, context, max_false_positive_rate, max_tasks);
 	}
 
 	PrefixRangeFilter::CompressionInfo GetCompressionInfo(bool collect_statistics = true) const {
@@ -310,10 +311,10 @@ public:
 		}
 		info.active_buckets = analysis_cached ? current_active_buckets : CountActiveBuckets();
 		info.run_count = analysis_cached && current_run_count_is_exact ? current_run_count : CountRuns();
-		info.false_positive_rate = analysis_cached
-		                               ? cached_false_positive_rate
-		                               : FalsePositiveRate(info.active_buckets, shift,
-		                                                   PositiveCountEstimate(info.active_buckets, shift));
+		info.false_positive_rate =
+		    analysis_cached
+		        ? cached_false_positive_rate
+		        : FalsePositiveRate(info.active_buckets, shift, PositiveCountEstimate(info.active_buckets, shift));
 		return info;
 	}
 
@@ -810,6 +811,16 @@ private:
 				return;
 			}
 		}
+		// Retain the large homogeneous-block shortcut, but subdivide mixed blocks.
+		if (destination_word_end - destination_word_begin > 8) {
+			for (idx_t begin = destination_word_begin; begin < destination_word_end; begin += 8) {
+				AnalyzeAndReduceBlock<ANALYZE_SOURCE, ANALYZE_SOURCE_RUNS, ANALYZE_DESTINATION_RUNS>(
+				    source, source_word_count, source_logical_bucket_count, destination,
+				    destination_logical_bucket_count, begin, MinValue<idx_t>(begin + 8, destination_word_end),
+				    source_builder, destination_builder);
+			}
+			return;
+		}
 		for (idx_t destination_word_idx = destination_word_begin; destination_word_idx < destination_word_end;
 		     destination_word_idx++) {
 			const auto first_source_word_idx = destination_word_idx * 2;
@@ -1051,7 +1062,7 @@ private:
 		// destination. This is a proof, not a sample-based estimate of the bitmap's FPR.
 		// Clustered filters usually fail this cheap gate and proceed directly to compression.
 		const auto full_words = logical_bucket_count >> WORD_SHIFT;
-		const auto prefix_words = MinValue(full_words, METRICS_BLOCK_WORDS);
+		const auto prefix_words = MinValue<idx_t>(full_words, 128);
 		idx_t source_active = 0;
 		idx_t reduced_active = 0;
 		idx_t reduced_runs = 0;
@@ -1223,7 +1234,102 @@ private:
 		compression_finalized = true;
 	}
 
+	static BitmapMetrics IntervalMetrics(const vector<PrefixRangeInterval> &intervals,
+	                                     idx_t active = DConstants::INVALID_INDEX) {
+		BitmapMetrics result;
+		result.run_count = intervals.size();
+		if (active == DConstants::INVALID_INDEX) {
+			active = 0;
+			for (const auto &interval : intervals) {
+				active += interval.upper - interval.lower + 1;
+			}
+		}
+		result.active_buckets = active;
+		for (idx_t i = 0; i < MinValue<idx_t>(intervals.size(), MAX_DIRECT_RANGES); i++) {
+			result.run_starts[i] = intervals[i].lower;
+			result.run_ends[i] = intervals[i].upper;
+			result.recorded_starts++;
+			result.recorded_ends++;
+		}
+		return result;
+	}
+
+	// Returns true only when a new bitmap needs to be materialized. All reduction
+	// decisions use the same exact metrics and acceptance policy as bitmap reduction.
+	bool PrepareIntervalCompression(vector<PrefixRangeInterval> &intervals, double max_false_positive_rate) {
+		auto metrics = IntervalMetrics(intervals);
+		const auto positive_count = PositiveCountEstimate(metrics.active_buckets, shift);
+		const auto initial_fpr = FalsePositiveRate(metrics.active_buckets, shift, positive_count);
+		const auto initial_coverage = CoveredValues(metrics.active_buckets, shift);
+		SetCachedAnalysis(metrics, initial_fpr);
+		if (initial_fpr > max_false_positive_rate) {
+			compression_finalized = true;
+			return false;
+		}
+		const auto original_shift = shift;
+		vector<PrefixRangeInterval> candidate_intervals;
+		while (!metrics.HasExactRanges() && !intervals.empty() && logical_bucket_count > 1) {
+			const auto active = PrefixRangeIntervals::Reduce(intervals, candidate_intervals);
+			const auto candidate = IntervalMetrics(candidate_intervals, active);
+			const auto candidate_fpr = FalsePositiveRate(candidate.active_buckets, shift + 1, positive_count);
+			if (!ShouldAcceptDyadicLevel(word_count, candidate, shift + 1, candidate_fpr,
+			                             CoveredValues(metrics.active_buckets, shift), max_false_positive_rate,
+			                             initial_coverage)) {
+				break;
+			}
+			intervals.swap(candidate_intervals);
+			metrics = candidate;
+			shift++;
+			logical_bucket_count = (logical_bucket_count + 1) >> 1;
+			word_count = (logical_bucket_count + 63) >> WORD_SHIFT;
+			SetCachedAnalysis(metrics, candidate_fpr);
+		}
+		if (metrics.HasExactRanges()) {
+			BitmapStorage unused;
+			SetDirectRanges(metrics, unused);
+			compression_finalized = true;
+			return false;
+		}
+		if (shift == original_shift) {
+			BuildHomogeneousWordRunIndex();
+			compression_finalized = true;
+			return false;
+		}
+		return true;
+	}
+
+	void InstallIntervalBitmap(BitmapStorage &replacement) {
+		buf_ = std::move(replacement.data);
+		bitmap = replacement.bitmap;
+		BuildHomogeneousWordRunIndex();
+		compression_finalized = true;
+	}
+
+	bool CollectIntervals(idx_t begin, idx_t end, idx_t limit, bool blocked,
+	                      vector<PrefixRangeInterval> &intervals) const {
+		return blocked
+		           ? PrefixRangeIntervals::Collect<true>(bitmap, logical_bucket_count, begin, end, limit, intervals)
+		           : PrefixRangeIntervals::Collect<false>(bitmap, logical_bucket_count, begin, end, limit, intervals);
+	}
+
+	bool TryCompressIntervals(ClientContext &context, double max_false_positive_rate) {
+		vector<PrefixRangeInterval> intervals;
+		if (!CollectIntervals(0, word_count, PrefixRangeIntervals::MAX_INTERVALS,
+		                      PrefixRangeIntervals::PreferBlocked(bitmap, word_count), intervals)) {
+			return false;
+		}
+		if (PrepareIntervalCompression(intervals, max_false_positive_rate)) {
+			auto replacement = AllocateBitmapStorage(context, word_count);
+			PrefixRangeIntervals::Materialize(intervals, replacement.bitmap, 0, word_count);
+			InstallIntervalBitmap(replacement);
+		}
+		return true;
+	}
+
 	void CompressBitmap(ClientContext &context, double max_false_positive_rate) {
+		if (TryCompressIntervals(context, max_false_positive_rate)) {
+			return;
+		}
 		BitmapStorage current;
 		current.data = std::move(buf_);
 		current.bitmap = bitmap;
@@ -1329,13 +1435,118 @@ private:
 		compression_finalized = true;
 	}
 
+	class ParallelIntervalCompressionState final : public PrefixRangeFilter::ParallelCompressionState {
+	public:
+		ParallelIntervalCompressionState(PrefixRangeBitmap &owner_p, ClientContext &context_p,
+		                                 double max_false_positive_rate_p, idx_t max_tasks_p)
+		    : owner(owner_p), context(context_p), max_false_positive_rate(max_false_positive_rate_p),
+		      max_tasks(max_tasks_p), blocked(PrefixRangeIntervals::PreferBlocked(owner.bitmap, owner.word_count)) {
+			Partition(owner.word_count);
+			parts.resize(task_count);
+		}
+
+		idx_t TaskCount() const override {
+			return fallback ? fallback->TaskCount() : task_count;
+		}
+
+		void ExecuteTask(idx_t task_idx) override {
+			if (fallback) {
+				fallback->ExecuteTask(task_idx);
+				return;
+			}
+			D_ASSERT(task_idx < task_count);
+			const auto begin = task_idx * words_per_task;
+			const auto end = MinValue(begin + words_per_task, owner.word_count);
+			if (materializing) {
+				PrefixRangeIntervals::Materialize(intervals, replacement.bitmap, begin, end);
+			} else {
+				auto &part = parts[task_idx];
+				part.complete = owner.CollectIntervals(begin, end, PrefixRangeIntervals::MAX_INTERVALS / task_count,
+				                                       blocked, part.intervals);
+			}
+		}
+
+		bool FinishPass() override {
+			if (fallback) {
+				return fallback->FinishPass();
+			}
+			if (materializing) {
+				owner.InstallIntervalBitmap(replacement);
+				return false;
+			}
+			for (const auto &part : parts) {
+				if (!part.complete) {
+					// Collection did not mutate the bitmap or compression metadata.
+					vector<Part>().swap(parts);
+					fallback =
+					    make_uniq<ParallelBitmapCompressionState>(owner, context, max_false_positive_rate, max_tasks);
+					return true;
+				}
+			}
+			idx_t interval_count = 0;
+			for (const auto &part : parts) {
+				interval_count += part.intervals.size();
+			}
+			intervals.reserve(interval_count);
+			for (const auto &part : parts) {
+				for (const auto &interval : part.intervals) {
+					const auto appended = PrefixRangeIntervals::Append(intervals, interval.lower, interval.upper,
+					                                                   PrefixRangeIntervals::MAX_INTERVALS);
+					D_ASSERT(appended); // The sum of all partition budgets is bounded globally.
+					(void)appended;
+				}
+			}
+			vector<Part>().swap(parts);
+			if (!owner.PrepareIntervalCompression(intervals, max_false_positive_rate)) {
+				return false;
+			}
+			replacement = owner.AllocateBitmapStorage(context, owner.word_count);
+			Partition(owner.word_count);
+			materializing = true;
+			return true;
+		}
+
+		PrefixRangeFilter::Analysis GetAnalysis() const override {
+			D_ASSERT(owner.compression_finalized);
+			return owner.Analyze();
+		}
+
+	private:
+		struct Part {
+			vector<PrefixRangeInterval> intervals;
+			bool complete = false;
+		};
+
+		void Partition(idx_t words) {
+			const auto ideal = (words + max_tasks - 1) / max_tasks;
+			words_per_task =
+			    MaxValue<idx_t>(PARALLEL_TASK_DESTINATION_WORDS,
+			                    ((ideal + PrefixRangeIntervals::BLOCK_WORDS - 1) / PrefixRangeIntervals::BLOCK_WORDS) *
+			                        PrefixRangeIntervals::BLOCK_WORDS);
+			task_count = (words + words_per_task - 1) / words_per_task;
+		}
+
+		PrefixRangeBitmap &owner;
+		ClientContext &context;
+		double max_false_positive_rate;
+		idx_t max_tasks;
+		bool blocked;
+		bool materializing = false;
+		idx_t task_count;
+		idx_t words_per_task;
+		vector<Part> parts;
+		vector<PrefixRangeInterval> intervals;
+		BitmapStorage replacement;
+		unique_ptr<PrefixRangeFilter::ParallelCompressionState> fallback;
+	};
+
 	class ParallelBitmapCompressionState final : public PrefixRangeFilter::ParallelCompressionState {
 	public:
 		ParallelBitmapCompressionState(PrefixRangeBitmap &owner_p, ClientContext &context_p,
 		                               double max_false_positive_rate_p, idx_t max_tasks_p)
-		    : owner(owner_p), context(context_p), max_false_positive_rate(max_false_positive_rate_p), max_tasks(max_tasks_p),
-		      current_words(owner.word_count), current_logical_buckets(owner.logical_bucket_count),
-		      current_shift(owner.shift) {
+		    : owner(owner_p), context(context_p), max_false_positive_rate(max_false_positive_rate_p),
+		      max_tasks(max_tasks_p), current_words(owner.word_count),
+		      current_logical_buckets(owner.logical_bucket_count), current_shift(owner.shift) {
 			current.data = std::move(owner.buf_);
 			current.bitmap = owner.bitmap;
 			current.word_capacity = current_words;
@@ -1644,9 +1855,8 @@ public:
 		return bitmap.Compress(context, max_false_positive_rate);
 	}
 
-	unique_ptr<ParallelCompressionState> InitializeParallelCompression(ClientContext &context,
-	                                                                   double max_false_positive_rate,
-	                                                                   idx_t max_tasks) override {
+	unique_ptr<ParallelCompressionState>
+	InitializeParallelCompression(ClientContext &context, double max_false_positive_rate, idx_t max_tasks) override {
 		return bitmap.InitializeParallelCompression(context, max_false_positive_rate, max_tasks);
 	}
 
@@ -1763,9 +1973,8 @@ public:
 		return bitmap.Compress(context, max_false_positive_rate);
 	}
 
-	unique_ptr<ParallelCompressionState> InitializeParallelCompression(ClientContext &context,
-	                                                                   double max_false_positive_rate,
-	                                                                   idx_t max_tasks) override {
+	unique_ptr<ParallelCompressionState>
+	InitializeParallelCompression(ClientContext &context, double max_false_positive_rate, idx_t max_tasks) override {
 		return bitmap.InitializeParallelCompression(context, max_false_positive_rate, max_tasks);
 	}
 
