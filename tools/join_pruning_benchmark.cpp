@@ -48,6 +48,7 @@ uint64_t UInt(const std::string &text) {
 struct Config {
 	std::string cases, output;
 	uint64_t repetitions = 5, warmups = 1, order_seed = 42, construction_seed = 42;
+	uint64_t case_index = UINT64_MAX;
 	double grafite_bpk = 12, diva_bpk = 16, max_fpr = 0.001;
 };
 
@@ -83,6 +84,8 @@ Config Parse(int argc, char **argv) {
 			config.repetitions = UInt(value);
 		else if (key == "--warmups")
 			config.warmups = UInt(value);
+		else if (key == "--case-index")
+			config.case_index = UInt(value);
 		else if (key == "--construction-seed")
 			config.construction_seed = UInt(value);
 		else if (key == "--order-seed")
@@ -474,6 +477,8 @@ int main(int argc, char **argv) {
 		}
 		const auto config = Parse(argc, argv);
 		const auto cases = ReadCases(config.cases);
+		if (config.case_index != UINT64_MAX && config.case_index >= cases.size())
+			throw std::invalid_argument("case-index is outside the supplied cases");
 		std::ofstream out(config.output);
 		if (!out)
 			throw std::runtime_error("cannot write benchmark output");
@@ -492,7 +497,17 @@ int main(int argc, char **argv) {
 		Probes probes;
 		std::string previous;
 		std::mt19937_64 order(config.order_seed);
-		for (const auto &c : cases) {
+		for (size_t case_index = 0; case_index < cases.size(); case_index++) {
+			const auto &c = cases[case_index];
+			if (config.case_index != UINT64_MAX && case_index != config.case_index) {
+				// Advance the original ordering RNG even for skipped cases, so
+				// checkpointed execution uses the identical per-case filter order.
+				for (uint64_t rep = 0; rep < config.warmups + config.repetitions; rep++) {
+					auto filters = Filters();
+					std::shuffle(filters.begin(), filters.end(), order);
+				}
+				continue;
+			}
 			const auto identity = std::to_string(c.domain) + ":" + std::to_string(c.rows) + ":" +
 			                      std::to_string(c.group_size) + ":" + std::to_string(c.seed) + ":" + c.layout;
 			if (identity != previous) {
