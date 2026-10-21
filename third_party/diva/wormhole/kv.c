@@ -3,7 +3,9 @@
  *
  * All rights reserved. No warranty, explicit or implicit, provided.
  */
+#if defined(__x86_64__)
 #include <x86intrin.h>
+#endif
 #define _GNU_SOURCE
 
 // headers {{{
@@ -645,8 +647,8 @@ kref_kv_compare(const struct kref * const kref, const struct kv * const k)
   debug_assert(kref);
   debug_assert(k);
   if (kref->len == 8 && k->klen == 8) {
-      const u64 a = _bswap64(*((s64 *) kref->ptr));
-      const u64 b = _bswap64(*((s64 *) k->kv));
+      const u64 a = __builtin_bswap64(*((s64 *) kref->ptr));
+      const u64 b = __builtin_bswap64(*((s64 *) k->kv));
       if (a == b)
           return 0;
       return a < b ? -1 : 1;

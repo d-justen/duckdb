@@ -14,7 +14,9 @@
 #include "lib.h"
 #include "ctypes.h"
 #include "wh_int.h"
+#if defined(__x86_64__)
 #include <x86intrin.h>
+#endif
 // }}} headers
 
 // def {{{
@@ -127,7 +129,7 @@ struct wormhole_int {
   inline static int 
 compare_int_isp(u64 a, u8 alen, const struct int_store_pair * const b) 
 {
-    const u64 bkey = _bswap64(b->key);
+    const u64 bkey = __builtin_bswap64(b->key);
     if (a != bkey)
         return a < bkey ? -1 : 1;
     if (alen == b->key_size)
@@ -145,8 +147,8 @@ isp_key_lcp(const struct int_store_pair * const key1, const struct int_store_pai
   inline static int 
 compare_isp_isp(const struct int_store_pair * const a, const struct int_store_pair * const b) 
 {
-    const u64 akey = _bswap64(a->key);
-    const u64 bkey = _bswap64(b->key);
+    const u64 akey = __builtin_bswap64(a->key);
+    const u64 bkey = __builtin_bswap64(b->key);
     if (akey != bkey)
         return akey < bkey ? -1 : 1;
     if (a->key_size == b->key_size)
@@ -1426,7 +1428,7 @@ wormleaf_kv_at_is1(const struct wormleaf_int * const leaf, const u32 i, const u3
   static u32
 wormleaf_int_search_eq(const struct wormleaf_int * const leaf, const struct kref * const key)
 {
-  const u64 search_key = _bswap64((*((u64 *) key->ptr)) & BITMASK(key->len * 8));
+  const u64 search_key = __builtin_bswap64((*((u64 *) key->ptr)) & BITMASK(key->len * 8));
   u32 lo = -1;
   u32 hi = leaf->nr_sorted;
   while (hi - lo > 1) {
@@ -1448,7 +1450,7 @@ wormleaf_int_search(const struct wormleaf_int * const leaf, const struct kref * 
 {
   if (key->ptr == NULL)
     return 0;
-  u64 search_key = _bswap64((*((u64 *) key->ptr)) & BITMASK(key->len * 8));
+  u64 search_key = __builtin_bswap64((*((u64 *) key->ptr)) & BITMASK(key->len * 8));
   int lo = -1;
   int hi = leaf->nr_sorted;
   while (hi - lo > 1) {
@@ -1472,7 +1474,7 @@ wormleaf_int_seek(const struct wormleaf_int * const leaf, const struct kref * co
   static u32
 wormleaf_int_seek_end(const struct wormleaf_int * const leaf, const struct kref * const key)
 {
-  u64 search_key = _bswap64((*((u64 *) key->ptr)) & BITMASK(key->len * 8));
+  u64 search_key = __builtin_bswap64((*((u64 *) key->ptr)) & BITMASK(key->len * 8));
   debug_assert(leaf->nr_keys == leaf->nr_sorted);
   if (leaf->nr_sorted) {
     const int cmp = compare_int_isp(search_key, key->len, leaf->kvs + leaf->nr_sorted - 1);

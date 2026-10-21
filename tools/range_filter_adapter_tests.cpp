@@ -98,6 +98,42 @@ int main() {
 		for (uint32_t seed : {1, 42, 1024}) {
 			CheckQueries<DivaBenchmarkFilter>({0, 1, 2, 97, 98, 99, 255, 300}, 16, seed, false);
 		}
+		// Exercise multi-block infix stores and the top bit of uint64 keys.
+		std::mt19937_64 random(42);
+		for (uint64_t count : {1, 2, 1023, 1024, 1025, 2049}) {
+			std::vector<uint64_t> keys;
+			for (uint64_t i = 0; i < count; ++i) {
+				keys.push_back(i * 1009);
+			}
+			DivaBenchmarkFilter filter;
+			filter.Build(keys, 16, 42);
+			for (auto key : keys) {
+				Require(filter.Probe(key), "Diva boundary-size false negative");
+			}
+		}
+		for (bool clustered : {false, true}) {
+			std::vector<uint64_t> keys {0, std::numeric_limits<uint64_t>::max()};
+			for (uint64_t i = 0; i < 65536; ++i) {
+				keys.push_back(clustered ? (i / 64) * 1000003 + (i % 64) : random());
+			}
+			std::sort(keys.begin(), keys.end());
+			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+			DivaBenchmarkFilter filter;
+			filter.Build(keys, 16, 42);
+			for (auto key : keys) {
+				Require(filter.Probe(key), "Diva point false negative");
+				Require(filter.RangeProbe(key, key), "Diva singleton false negative");
+			}
+			for (unsigned i = 0; i < 2000; ++i) {
+				auto lower = random(), upper = random();
+				if (lower > upper) {
+					std::swap(lower, upper);
+				}
+				auto found = std::lower_bound(keys.begin(), keys.end(), lower);
+				Require(found == keys.end() || *found > upper || filter.RangeProbe(lower, upper),
+				        "Diva range false negative");
+			}
+		}
 #endif
 		std::cout << "range_filter_adapter_tests passed\n";
 		return 0;

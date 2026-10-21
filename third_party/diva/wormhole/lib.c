@@ -541,6 +541,8 @@ debug_perf_init(void)
   char tmp[256] = {};
   sprintf(tmp, "/proc/%d/cmdline", ppid);
   FILE * const fc = fopen(tmp, "r");
+  if (!fc) // Parent may be outside the container PID namespace.
+    return;
   const size_t nr = fread(tmp, 1, sizeof(tmp) - 1, fc);
   fclose(fc);
   // look for "perf record"

@@ -5,8 +5,9 @@ endif()
 if(BUILD_SHELL)
   option(
     BUILD_DIVA_BENCHMARK
-    "Build Diva support for filter_benchmark on supported Linux x86_64 platforms"
+    "Build Diva support on Linux x86_64 and AArch64"
     ON)
+  option(BUILD_DIVA_SVE2_BENCHMARK "Also build ARM SVE2 bit-permutation benchmarks" ON)
   option(BUILD_GRAFITE_BENCHMARK "Build Grafite support for filter_benchmark"
          ON)
 
@@ -18,19 +19,31 @@ if(BUILD_SHELL)
   set(DUCKDB_FILTER_BENCHMARK_DIVA_ENABLED FALSE)
   if(BUILD_DIVA_BENCHMARK
      AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
-     AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
-    add_library(
-      duckdb_diva_benchmark STATIC
-      diva_benchmark_adapter.cpp ../third_party/diva/wormhole/kv.c
-      ../third_party/diva/wormhole/lib.c ../third_party/diva/wormhole/wh.c
-      ../third_party/diva/wormhole/wh_int.c)
-    target_include_directories(duckdb_diva_benchmark PUBLIC ../third_party/diva)
-    target_compile_options(
-      duckdb_diva_benchmark
-      PRIVATE -march=native -pthread -fno-stack-protector -fno-builtin-memcpy
-              -fno-builtin-memmove -fno-builtin-memcmp)
-    target_link_libraries(duckdb_diva_benchmark PRIVATE Threads::Threads)
-    set_target_properties(duckdb_diva_benchmark PROPERTIES LINKER_LANGUAGE CXX)
+     AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|aarch64|arm64)$")
+    function(configure_diva target architecture)
+      add_library(
+        ${target} STATIC
+        diva_benchmark_adapter.cpp ../third_party/diva/wormhole/kv.c
+        ../third_party/diva/wormhole/lib.c ../third_party/diva/wormhole/wh.c
+        ../third_party/diva/wormhole/wh_int.c)
+      target_include_directories(${target} PUBLIC ../third_party/diva)
+      target_compile_options(
+        ${target}
+        PRIVATE ${architecture} -pthread -fno-stack-protector -fno-builtin-memcpy
+                -fno-builtin-memmove -fno-builtin-memcmp)
+      # Fatal errors must reach the runner, not Wormhole's interactive GDB wait.
+      target_compile_definitions(${target} PRIVATE NOSIGNAL)
+      target_link_libraries(${target} PRIVATE Threads::Threads)
+      set_target_properties(${target} PROPERTIES LINKER_LANGUAGE CXX)
+    endfunction()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+      configure_diva(duckdb_diva_benchmark -march=armv8.2-a+crc)
+      if(BUILD_DIVA_SVE2_BENCHMARK)
+        configure_diva(duckdb_diva_benchmark_sve2 -march=armv8.2-a+sve2-bitperm+crc)
+      endif()
+    else()
+      configure_diva(duckdb_diva_benchmark -march=native)
+    endif()
     set(DUCKDB_FILTER_BENCHMARK_DIVA_ENABLED TRUE)
   endif()
 
@@ -119,5 +132,30 @@ if(BUILD_SHELL)
   if(DUCKDB_FILTER_BENCHMARK_DIVA_ENABLED)
     target_link_libraries(range_filter_adapter_tests duckdb_diva_benchmark)
     target_compile_definitions(range_filter_adapter_tests PRIVATE DUCKDB_FILTER_BENCHMARK_HAS_DIVA=1)
+    add_executable(diva_bit_tests diva_bit_tests.cpp)
+    target_include_directories(diva_bit_tests PRIVATE ../third_party/diva)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+      target_compile_options(diva_bit_tests PRIVATE -march=native)
+    endif()
+  endif()
+  if(TARGET duckdb_diva_benchmark_sve2)
+    # Only Diva's adapter/dependency use SVE. The benchmark driver, PRF, Grafite
+    # and DuckDB have exactly the same compilation options in both executables.
+    foreach(base filter_benchmark range_benchmark join_pruning_benchmark range_filter_adapter_tests)
+      add_executable(${base}_sve2 ${base}.cpp)
+      if(NOT base STREQUAL "range_filter_adapter_tests")
+        target_link_libraries(${base}_sve2 duckdb_static ${DUCKDB_EXTRA_LINK_FLAGS})
+        link_extension_libraries(${base}_sve2 "")
+      endif()
+      target_link_libraries(${base}_sve2 duckdb_diva_benchmark_sve2)
+      target_compile_definitions(${base}_sve2 PRIVATE DUCKDB_FILTER_BENCHMARK_HAS_DIVA=1)
+      if(DUCKDB_FILTER_BENCHMARK_GRAFITE_ENABLED)
+        target_link_libraries(${base}_sve2 duckdb_grafite_benchmark)
+        target_compile_definitions(${base}_sve2 PRIVATE DUCKDB_FILTER_BENCHMARK_HAS_GRAFITE=1)
+      endif()
+    endforeach()
+    add_executable(diva_bit_tests_sve2 diva_bit_tests.cpp)
+    target_include_directories(diva_bit_tests_sve2 PRIVATE ../third_party/diva)
+    target_compile_options(diva_bit_tests_sve2 PRIVATE -march=armv8.2-a+sve2-bitperm+crc)
   endif()
 endif()

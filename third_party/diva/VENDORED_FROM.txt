@@ -2,5 +2,15 @@ Upstream repository: https://github.com/n3slami/Diva
 Vendored commit: d0f85b25a90e00e3aeff4391e2f280d11cacb2af
 
 This directory contains the minimal subset of the upstream Diva repository
-needed to build the integer-optimized benchmark adapter on supported Linux
-x86_64 platforms.
+needed to build the integer-optimized benchmark adapter on Linux x86_64 and
+AArch64 platforms.
+
+Local portability changes: guard x86 headers; preserve zero semantics in
+leading/trailing-zero helpers; use compiler byte swaps; add SVE2 BDEP select;
+handle a missing parent /proc entry. x86 BMI2 selection is retained. ARM
+portable builds use the upstream broadword select and Wormhole NEON/CRC code.
+The SVE2 executable is selected only after checking Linux hardware capabilities.
+No filter layout, bulk-loading algorithm, load factor or hash seed is changed.
+An additional boundary-case fix skips the empty bulk-load tail for 1024*k+1
+keys (including a singleton); upstream otherwise compares equal boundaries
+forever. The ordinary bulk-load and probe paths retain their algorithms.

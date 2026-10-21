@@ -2,7 +2,31 @@
 
 #include <algorithm>
 #include <cstdint>
+#if defined(__x86_64__)
 #include <immintrin.h>
+#endif
+
+// Keep the original x86 instructions, including their defined zero result.
+// GCC/Clang clz/ctz builtins alone are undefined for zero on other targets.
+static inline uint32_t diva_clz64(uint64_t value) {
+#if defined(__x86_64__)
+    return __builtin_ia32_lzcnt_u64(value);
+#else
+    return value ? __builtin_clzll(value) : 64;
+#endif
+}
+
+static inline uint32_t diva_ctz64(uint64_t value) {
+#if defined(__x86_64__)
+    return __builtin_ia32_tzcnt_u64(value);
+#else
+    return value ? __builtin_ctzll(value) : 64;
+#endif
+}
+
+#if defined(__ARM_FEATURE_SVE2_BITPERM)
+#include <arm_sve.h>
+#endif
 
 #define MAX_VALUE(nbits) ((1ULL << (nbits)) - 1)
 #define BITMASK(nbits)                                    \
@@ -143,9 +167,15 @@ static inline uint32_t bit_select(uint64_t val, uint32_t i) {
 #ifdef __BMI2__
     uint64_t tmp = 1ULL << i;
     tmp = _pdep_u64(tmp, val);
-    return __builtin_ia32_tzcnt_u64(tmp);
+    return diva_ctz64(tmp);
 #endif
+#if defined(__ARM_FEATURE_SVE2_BITPERM)
+    // All lanes contain the same scalar value; this is vector-length agnostic.
+    const auto deposited = svbdep_u64(svdup_u64(1ULL << i), svdup_u64(val));
+    return diva_ctz64(svlastb_u64(svptrue_b64(), deposited));
+#else
     return _select64(val, i);
+#endif
 }
 
 
@@ -157,13 +187,13 @@ static inline uint32_t bit_rank(uint64_t val, uint32_t i) {
 
 __attribute__((always_inline))
 static inline int32_t lowbit_pos(uint64_t val) {
-    return __builtin_ia32_tzcnt_u64(val);
+    return diva_ctz64(val);
 }
 
 
 __attribute__((always_inline))
 static inline int32_t highbit_pos(uint64_t val) {
-    return 8 * sizeof(val) - __builtin_ia32_lzcnt_u64(val) - 1;
+    return 63 - static_cast<int32_t>(diva_clz64(val));
 }
 
 

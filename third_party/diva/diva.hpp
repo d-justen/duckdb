@@ -16,7 +16,9 @@
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
+#if defined(__x86_64__)
 #include <x86intrin.h>
+#endif
 
 #include "wormhole/wh.h"
 #include "util.hpp"
@@ -1028,7 +1030,7 @@ Diva<int_optimized>::GetSharedIgnoreImplicitLengths(const InfiniteByteString key
     do {
         const uint64_t read_1 = key_1.WordAt(ind * sizeof(uint64_t));
         const uint64_t read_2 = key_2.WordAt(ind * sizeof(uint64_t));
-        delta = __builtin_ia32_lzcnt_u64(read_1 ^ read_2);
+        delta = diva_clz64(read_1 ^ read_2);
         share += delta;
         ind++;
     } while (delta == 64);
@@ -1038,7 +1040,7 @@ Diva<int_optimized>::GetSharedIgnoreImplicitLengths(const InfiniteByteString key
         const uint64_t read_1 = key_1.WordAt(ind * sizeof(uint64_t));
         const uint64_t read_2 = key_2.WordAt(ind * sizeof(uint64_t));
         const uint32_t offset = (ind > share / 64 ? 0 : share % 64 + 1);
-        delta = __builtin_ia32_lzcnt_u64(((~read_1) | read_2) & BITMASK(64 - offset));
+        delta = diva_clz64(((~read_1) | read_2) & BITMASK(64 - offset));
         ignore += delta - offset;
         ind++;
     } while (delta == 64);
@@ -1787,6 +1789,14 @@ inline void Diva<int_optimized>::BulkLoadFixedLength(const t_itr begin, const t_
     else
         right_key = {reinterpret_cast<const uint8_t *>(&(*key_it)), key_len};
     const bool add_last_key = key_it != last_key_it;
+
+    // A singleton, or 1024*k+1 keys, ends exactly on a boundary. There is
+    // no tail to encode. Comparing that boundary with itself would loop
+    // forever in GetSharedIgnoreImplicitLengths (all following words are 0).
+    if (!add_last_key) {
+        AddTreeKey(right_key.str, right_key.length);
+        return;
+    }
 
     auto [shared, ignore, implicit_size] = GetSharedIgnoreImplicitLengths(left_key, right_key);
     const uint64_t prev_implicit = ExtractPartialKey(left_key, shared, ignore, implicit_size, 0) >> infix_size_;
