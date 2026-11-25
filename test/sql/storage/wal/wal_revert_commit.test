@@ -4,7 +4,10 @@
 
 require skip_reload
 
-load {TEST_DIR}/wal_revert_commit.db
+# The small update stays in the WAL write buffer. The large update requires truncating the file.
+foreach payload_bytes 1 65536
+
+load {TEST_DIR}/wal_revert_commit_{payload_bytes}.db
 
 statement ok
 PRAGMA disable_checkpoint_on_shutdown
@@ -41,13 +44,13 @@ statement ok
 COMMIT
 
 statement ok
-SET VARIABLE committed_wal_size = (SELECT size FROM read_blob('{TEST_DIR}/wal_revert_commit.db.wal'))
+SET VARIABLE committed_wal_size = (SELECT size FROM read_blob('{TEST_DIR}/wal_revert_commit_{payload_bytes}.db.wal'))
 
 statement ok
 BEGIN
 
 statement ok
-UPDATE t SET value = 'failed B' WHERE id = 1
+UPDATE t SET value = repeat('B', {payload_bytes}) WHERE id = 1
 
 statement ok
 DELETE FROM t WHERE id = 2
@@ -80,7 +83,7 @@ SET GLOBAL debug_force_commit_failure = false
 
 # Reversion must truncate only B's WAL records.
 query I
-SELECT size = getvariable('committed_wal_size') FROM read_blob('{TEST_DIR}/wal_revert_commit.db.wal')
+SELECT size = getvariable('committed_wal_size') FROM read_blob('{TEST_DIR}/wal_revert_commit_{payload_bytes}.db.wal')
 ----
 true
 
@@ -119,7 +122,7 @@ COMMIT
 
 # The earlier and later commits must be recovered from the WAL, without a checkpoint.
 query I
-SELECT count(*) FROM glob('{TEST_DIR}/wal_revert_commit.db.wal')
+SELECT count(*) FROM glob('{TEST_DIR}/wal_revert_commit_{payload_bytes}.db.wal')
 ----
 1
 
@@ -165,3 +168,5 @@ SELECT * FROM t ORDER BY id
 3	commit A
 4	commit C
 5	after replay
+
+endloop
