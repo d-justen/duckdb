@@ -356,7 +356,12 @@ bool CatalogSet::AlterEntry(CatalogTransaction transaction, const Identifier &na
 
 	// fetch the entry again before doing the modification
 	// this will catch any write-write conflicts between transactions
+	auto original_entry = entry.get();
 	entry = GetEntryInternal(transaction, name);
+	if (!entry || entry.get() != original_entry) {
+		// a connection that shares the transaction changed the entry in the meantime
+		throw TransactionException("Catalog write-write conflict on alter with %s", name);
+	}
 
 	// Mark this entry as being created by this transaction
 	value->timestamp = transaction.GetTransactionId();
@@ -375,9 +380,11 @@ bool CatalogSet::AlterEntry(CatalogTransaction transaction, const Identifier &na
 	// push the old entry in the undo buffer for this transaction
 	unique_ptr<CatalogEntry> entry_to_destroy;
 	if (transaction.transaction) {
-		// serialize the AlterInfo into a temporary buffer
+		// Preserve the full AlterInfo in the undo buffer. WriteAlter applies the destination's storage version.
 		MemoryStream stream(Allocator::Get(transaction.db));
-		BinarySerializer serializer(stream);
+		SerializationOptions options;
+		options.storage_compatibility = StorageCompatibility::Latest();
+		BinarySerializer serializer(stream, options);
 		serializer.Begin();
 		serializer.WriteProperty(100, "column_name", alter_info.GetColumnName());
 		serializer.WriteProperty(101, "alter_info", &alter_info);
